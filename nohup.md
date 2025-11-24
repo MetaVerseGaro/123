@@ -18,5 +18,6 @@
 - 上述两条命令可直接复制粘贴使用，日志会自动清理（保留 7 天）；如需关闭清理，将 `LOG_RETENTION_DAYS` 设为 0 或负数。
 
 - ```bash
-  tail -f botA.out
+  tail -f botA.out # 查看日志
+  ps aux | grep python # 查看进程
   ```
