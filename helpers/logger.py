@@ -5,7 +5,7 @@ Trading logger with structured output and error handling.
 import os
 import csv
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta
 import pytz
 from decimal import Decimal
 
@@ -16,23 +16,32 @@ class TradingLogger:
     def __init__(self, exchange: str, ticker: str, log_to_console: bool = False):
         self.exchange = exchange
         self.ticker = ticker
-        # Ensure logs directory exists at the project root
+        # Ensure logs directory exists (configurable via LOG_DIR, otherwise default to project_root/logs)
         project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
-        logs_dir = os.path.join(project_root, 'logs')
+        logs_dir = os.getenv('LOG_DIR')
+        if logs_dir:
+            logs_dir = os.path.abspath(logs_dir)
+        else:
+            logs_dir = os.path.join(project_root, 'logs')
         os.makedirs(logs_dir, exist_ok=True)
 
-        order_file_name = f"{exchange}_{ticker}_orders.csv"
-        debug_log_file_name = f"{exchange}_{ticker}_activity.log"
+        # Automatically clean up old log files based on retention policy
+        self.timezone = pytz.timezone(os.getenv('TIMEZONE', 'Asia/Shanghai'))
+        self._cleanup_old_logs(logs_dir)
+
+        prefix = os.getenv('LOG_FILE_PREFIX', '')
+
+        order_file_name = f"{prefix}{exchange}_{ticker}_orders.csv"
+        debug_log_file_name = f"{prefix}{exchange}_{ticker}_activity.log"
 
         account_name = os.getenv('ACCOUNT_NAME')
         if account_name:
-            order_file_name = f"{exchange}_{ticker}_{account_name}_orders.csv"
-            debug_log_file_name = f"{exchange}_{ticker}_{account_name}_activity.log"
+            order_file_name = f"{prefix}{exchange}_{ticker}_{account_name}_orders.csv"
+            debug_log_file_name = f"{prefix}{exchange}_{ticker}_{account_name}_activity.log"
 
         # Log file paths inside logs directory
         self.log_file = os.path.join(logs_dir, order_file_name)
         self.debug_log_file = os.path.join(logs_dir, debug_log_file_name)
-        self.timezone = pytz.timezone(os.getenv('TIMEZONE', 'Asia/Shanghai'))
         self.logger = self._setup_logger(log_to_console)
 
     def _setup_logger(self, log_to_console: bool) -> logging.Logger:
@@ -58,33 +67,7 @@ class TradingLogger:
                     return dt.strftime(datefmt)
                 return dt.isoformat()
 
-        formatter = TimeZoneFormatter(
-            "%(asctime)s.%(msecs)03d - %(levelname)s - %(message)s",
-            datefmt="%Y-%m-%d %H:%M:%S",
-            tz=self.timezone
-        )
-
-        # File handler
-        file_handler = logging.FileHandler(self.debug_log_file)
-        file_handler.setLevel(logging.DEBUG)
-        file_handler.setFormatter(formatter)
-        logger.addHandler(file_handler)
-
-        # Console handler if requested
-        if log_to_console:
-            console_handler = logging.StreamHandler()
-            console_handler.setLevel(logging.INFO)
-            console_handler.setFormatter(formatter)
-            logger.addHandler(console_handler)
-
-        return logger
-
-    def log(self, message: str, level: str = "INFO"):
-        """Log a message with the specified level."""
-        formatted_message = f"[{self.exchange.upper()}_{self.ticker.upper()}] {message}"
-        if level.upper() == "DEBUG":
-            self.logger.debug(formatted_message)
-        elif level.upper() == "INFO":
+@@ -88,25 +97,46 @@ class TradingLogger:
             self.logger.info(formatted_message)
         elif level.upper() == "WARNING":
             self.logger.warning(formatted_message)
@@ -111,5 +94,23 @@ class TradingLogger:
         except Exception as e:
             self.log(f"Failed to log transaction: {e}", "ERROR")
 
-        except Exception as e:
-            self.log(f"Failed to log transaction: {e}", "ERROR")
+    def _cleanup_old_logs(self, logs_dir: str):
+        """Remove log files older than the retention window."""
+        retention_days = int(os.getenv('LOG_RETENTION_DAYS', '7'))
+        if retention_days <= 0:
+            return
+
+        cutoff = datetime.now(self.timezone) - timedelta(days=retention_days)
+
+        try:
+            for filename in os.listdir(logs_dir):
+                file_path = os.path.join(logs_dir, filename)
+                if not os.path.isfile(file_path):
+                    continue
+
+                modified_time = datetime.fromtimestamp(os.path.getmtime(file_path), tz=self.timezone)
+                if modified_time < cutoff:
+                    os.remove(file_path)
+        except Exception:
+            # Avoid interrupting logger setup due to cleanup issues
+            pass
