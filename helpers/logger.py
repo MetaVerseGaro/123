@@ -110,3 +110,6 @@ class TradingLogger:
 
         except Exception as e:
             self.log(f"Failed to log transaction: {e}", "ERROR")
+
+        except Exception as e:
+            self.log(f"Failed to log transaction: {e}", "ERROR")
