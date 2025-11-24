@@ -1,0 +1,1 @@
+LOG_RETENTION_DAYS=7 TIMEZONE=Asia/Shanghai nohup python runbot.py --exchange lighter --ticker ETH --quantity 0.01 --take-profit 0.03  --max-orders 40 --wait-time 450 --grid-step -100 --stop-price -1  --stop-loss-price 2617 --direction buy --env-file acc1.env
