@@ -44,6 +44,9 @@ def parse_arguments():
     parser.add_argument('--stop-price', type=Decimal, default=-1,
                         help='Price to stop trading and exit. Buy: exits if price >= stop-price.'
                         'Sell: exits if price <= stop-price. (default: -1, no stop)')
+    parser.add_argument('--stop-loss-price', type=Decimal, default=-1,
+                        help='Fixed price stop-loss. Buy: close all if price <= stop-loss-price. '
+                        'Sell: close all if price >= stop-loss-price. (default: -1, disabled)')
     parser.add_argument('--pause-price', type=Decimal, default=-1,
                         help='Pause trading and wait. Buy: pause if price >= pause-price.'
                         'Sell: pause if price <= pause-price. (default: -1, no pause)')
@@ -115,6 +118,7 @@ async def main():
         exchange=args.exchange.lower(),
         grid_step=Decimal(args.grid_step),
         stop_price=Decimal(args.stop_price),
+        stop_loss_price=Decimal(args.stop_loss_price),
         pause_price=Decimal(args.pause_price),
         boost_mode=args.boost
     )
