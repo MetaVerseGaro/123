@@ -27,9 +27,9 @@ class TradingLogger:
 
         # Automatically clean up old log files based on retention policy
         self.timezone = pytz.timezone(os.getenv('TIMEZONE', 'Asia/Shanghai'))
-        self._cleanup_old_logs(logs_dir)
-
         prefix = os.getenv('LOG_FILE_PREFIX', '')
+        self.log_prefix = prefix
+        self._cleanup_old_logs(logs_dir, self.log_prefix)
 
         order_file_name = f"{prefix}{exchange}_{ticker}_orders.csv"
         debug_log_file_name = f"{prefix}{exchange}_{ticker}_activity.log"
@@ -67,11 +67,32 @@ class TradingLogger:
                     return dt.strftime(datefmt)
                 return dt.isoformat()
 
-@@ -88,25 +97,46 @@ class TradingLogger:
+        formatter = TimeZoneFormatter(fmt="%(asctime)s | %(levelname)s | %(message)s",
+                                      datefmt="%Y-%m-%d %H:%M:%S",
+                                      tz=self.timezone)
+
+        # File handler for detailed activity logs
+        file_handler = logging.FileHandler(self.debug_log_file, encoding='utf-8')
+        file_handler.setFormatter(formatter)
+        logger.addHandler(file_handler)
+
+        # Optional console logging for real-time visibility
+        if log_to_console:
+            console_handler = logging.StreamHandler()
+            console_handler.setFormatter(formatter)
+            logger.addHandler(console_handler)
+
+        return logger
+
+    def log(self, message: str, level: str = "INFO"):
+        """Write a formatted log line to the debug log (and console if enabled)."""
+        formatted_message = f"[{self.exchange.upper()}][{self.ticker}] {message}"
+        level = level.upper()
+        if level == "INFO":
             self.logger.info(formatted_message)
-        elif level.upper() == "WARNING":
+        elif level == "WARNING":
             self.logger.warning(formatted_message)
-        elif level.upper() == "ERROR":
+        elif level == "ERROR":
             self.logger.error(formatted_message)
         else:
             self.logger.info(formatted_message)
@@ -94,8 +115,8 @@ class TradingLogger:
         except Exception as e:
             self.log(f"Failed to log transaction: {e}", "ERROR")
 
-    def _cleanup_old_logs(self, logs_dir: str):
-        """Remove log files older than the retention window."""
+    def _cleanup_old_logs(self, logs_dir: str, prefix: str):
+        """Remove log files older than the retention window. Respects prefix if provided."""
         retention_days = int(os.getenv('LOG_RETENTION_DAYS', '7'))
         if retention_days <= 0:
             return
@@ -106,6 +127,9 @@ class TradingLogger:
             for filename in os.listdir(logs_dir):
                 file_path = os.path.join(logs_dir, filename)
                 if not os.path.isfile(file_path):
+                    continue
+
+                if prefix and not filename.startswith(prefix):
                     continue
 
                 modified_time = datetime.fromtimestamp(os.path.getmtime(file_path), tz=self.timezone)
