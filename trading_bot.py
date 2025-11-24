@@ -30,6 +30,7 @@ class TradingConfig:
     exchange: str
     grid_step: Decimal
     stop_price: Decimal
+    stop_loss_price: Decimal
     pause_price: Decimal
     boost_mode: bool
 
@@ -81,6 +82,7 @@ class TradingBot:
         self.order_canceled_event = asyncio.Event()
         self.shutdown_requested = False
         self.loop = None
+        self.stop_loss_triggered = False
 
         # Register order callback
         self._setup_websocket_handlers()
@@ -447,16 +449,25 @@ class TradingBot:
         else:
             return True
 
-    async def _check_price_condition(self) -> bool:
+    async def _check_price_condition(self):
         stop_trading = False
         pause_trading = False
+        stop_loss_triggered = False
+        best_bid = None
+        best_ask = None
 
-        if self.config.pause_price == self.config.stop_price == -1:
-            return stop_trading, pause_trading
+        if self.config.pause_price == self.config.stop_price == self.config.stop_loss_price == -1:
+            return stop_trading, pause_trading, stop_loss_triggered, best_bid, best_ask
 
         best_bid, best_ask = await self.exchange_client.fetch_bbo_prices(self.config.contract_id)
         if best_bid <= 0 or best_ask <= 0 or best_bid >= best_ask:
             raise ValueError("No bid/ask data available")
+
+        if (self.config.stop_loss_price != -1) and (not self.stop_loss_triggered):
+            if self.config.direction == "buy" and best_bid <= self.config.stop_loss_price:
+                stop_loss_triggered = True
+            elif self.config.direction == "sell" and best_ask >= self.config.stop_loss_price:
+                stop_loss_triggered = True
 
         if self.config.stop_price != -1:
             if self.config.direction == "buy":
@@ -474,7 +485,64 @@ class TradingBot:
                 if best_bid <= self.config.pause_price:
                     pause_trading = True
 
-        return stop_trading, pause_trading
+        return stop_trading, pause_trading, stop_loss_triggered, best_bid, best_ask
+
+    async def _execute_stop_loss(self, best_bid: Decimal, best_ask: Decimal):
+        """Cancel open orders and close position when fixed stop-loss hits."""
+        if self.stop_loss_triggered:
+            return
+
+        self.stop_loss_triggered = True
+        msg = f"\n\nWARNING: [{self.config.exchange.upper()}_{self.config.ticker.upper()}]\n"
+        msg += "Fixed stop-loss triggered. Cancelling open orders and closing position.\n"
+        msg += "触发固定价格止损，正在撤单并平掉当前仓位。\n"
+        await self.send_notification(msg.lstrip())
+
+        try:
+            active_orders = await self.exchange_client.get_active_orders(self.config.contract_id)
+            for order in active_orders:
+                try:
+                    await self.exchange_client.cancel_order(order.order_id)
+                except Exception as cancel_err:
+                    self.logger.log(f"Failed to cancel order {order.order_id}: {cancel_err}", "WARNING")
+        except Exception as e:
+            self.logger.log(f"Error fetching active orders during stop-loss: {e}", "ERROR")
+
+        try:
+            position_size = abs(await self.exchange_client.get_account_positions())
+        except Exception as e:
+            self.logger.log(f"Error fetching position during stop-loss: {e}", "ERROR")
+            position_size = Decimal(0)
+
+        if position_size > 0:
+            close_side = self.config.close_order_side
+            market_close_result = None
+
+            if hasattr(self.exchange_client, "place_market_order"):
+                try:
+                    market_close_result = await self.exchange_client.place_market_order(
+                        self.config.contract_id,
+                        position_size,
+                        close_side
+                    )
+                except Exception as market_err:
+                    self.logger.log(f"Market stop-loss order failed: {market_err}", "ERROR")
+
+            if (not market_close_result) or (not getattr(market_close_result, "success", False)):
+                # Fallback: place an aggressive limit order toward best bid/ask
+                fallback_price = best_bid if close_side == "sell" else best_ask
+                try:
+                    await self.exchange_client.place_close_order(
+                        self.config.contract_id,
+                        position_size,
+                        fallback_price,
+                        close_side
+                    )
+                except Exception as fallback_err:
+                    self.logger.log(f"Stop-loss fallback order failed: {fallback_err}", "ERROR")
+
+        self.shutdown_requested = True
+        await self.graceful_shutdown("Fixed stop-loss executed")
 
     async def send_notification(self, message: str):
         lark_token = os.getenv("LARK_TOKEN")
@@ -505,6 +573,7 @@ class TradingBot:
             self.logger.log(f"Exchange: {self.config.exchange}", "INFO")
             self.logger.log(f"Grid Step: {self.config.grid_step}%", "INFO")
             self.logger.log(f"Stop Price: {self.config.stop_price}", "INFO")
+            self.logger.log(f"Stop Loss Price: {self.config.stop_loss_price}", "INFO")
             self.logger.log(f"Pause Price: {self.config.pause_price}", "INFO")
             self.logger.log(f"Boost Mode: {self.config.boost_mode}", "INFO")
             self.logger.log("=============================", "INFO")
@@ -535,7 +604,11 @@ class TradingBot:
                 # Periodic logging
                 mismatch_detected = await self._log_status_periodically()
 
-                stop_trading, pause_trading = await self._check_price_condition()
+                stop_trading, pause_trading, stop_loss_triggered, best_bid, best_ask = await self._check_price_condition()
+                if stop_loss_triggered:
+                    await self._execute_stop_loss(best_bid, best_ask)
+                    continue
+
                 if stop_trading:
                     msg = f"\n\nWARNING: [{self.config.exchange.upper()}_{self.config.ticker.upper()}] \n"
                     msg += "Stopped trading due to stop price triggered\n"
