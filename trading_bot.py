@@ -192,6 +192,25 @@ class TradingBot:
         else:
             return 1
 
+    async def _get_adaptive_close_price(self, filled_price: Decimal, close_side: str) -> Decimal:
+        """Determine a close price that honors take-profit minimum but uses better current prices when available."""
+        if close_side == 'sell':
+            target_price = filled_price * (1 + self.config.take_profit/100)
+        else:
+            target_price = filled_price * (1 - self.config.take_profit/100)
+
+        if self.config.exchange != "lighter":
+            return target_price
+
+        try:
+            best_bid, best_ask = await self.exchange_client.fetch_bbo_prices(self.config.contract_id)
+            if close_side == 'sell':
+                return max(target_price, best_ask)
+            else:
+                return min(target_price, best_bid)
+        except Exception:
+            return target_price
+
     async def _place_and_monitor_open_order(self) -> bool:
         """Place an order and monitor its execution."""
         try:
@@ -242,10 +261,7 @@ class TradingBot:
                 self.last_open_order_time = time.time()
                 # Place close order
                 close_side = self.config.close_order_side
-                if close_side == 'sell':
-                    close_price = filled_price * (1 + self.config.take_profit/100)
-                else:
-                    close_price = filled_price * (1 - self.config.take_profit/100)
+                close_price = await self._get_adaptive_close_price(filled_price, close_side)
 
                 close_order_result = await self.exchange_client.place_close_order(
                     self.config.contract_id,
@@ -340,10 +356,7 @@ class TradingBot:
                         close_side
                     )
                 else:
-                    if close_side == 'sell':
-                        close_price = filled_price * (1 + self.config.take_profit/100)
-                    else:
-                        close_price = filled_price * (1 - self.config.take_profit/100)
+                    close_price = await self._get_adaptive_close_price(filled_price, close_side)
 
                     close_order_result = await self.exchange_client.place_close_order(
                         self.config.contract_id,
@@ -395,24 +408,44 @@ class TradingBot:
                                 f"Order quantity: {len(self.active_close_orders)}")
                 self.last_log_time = time.time()
                 # Check for position mismatch
-                if abs(position_amt - active_close_amount) > (2 * self.config.quantity):
-                    error_message = f"\n\nERROR: [{self.config.exchange.upper()}_{self.config.ticker.upper()}] "
-                    error_message += "Position mismatch detected\n"
-                    error_message += "###### ERROR ###### ERROR ###### ERROR ###### ERROR #####\n"
-                    error_message += "Please manually rebalance your position and take-profit orders\n"
-                    error_message += "请手动平衡当前仓位和正在关闭的仓位\n"
-                    error_message += f"current position: {position_amt} | active closing amount: {active_close_amount} | "f"Order quantity: {len(self.active_close_orders)}\n"
-                    error_message += "###### ERROR ###### ERROR ###### ERROR ###### ERROR #####\n"
-                    self.logger.log(error_message, "ERROR")
-
-                    await self.send_notification(error_message.lstrip())
-
-                    if not self.shutdown_requested:
-                        self.shutdown_requested = True
-
-                    mismatch_detected = True
-                else:
-                    mismatch_detected = False
+                mismatch_detected = False
+                mismatch = position_amt - active_close_amount
+                if abs(mismatch) > (2 * self.config.quantity):
+                    try:
+                        if mismatch > 0:
+                            # Position larger than active close orders: place reduce-only close to trim the excess
+                            if self.config.exchange == "lighter":
+                                close_qty = mismatch
+                                close_side = self.config.close_order_side
+                                self.logger.log(f"Auto-closing excess position {close_qty} via reduce-only post-only", "WARNING")
+                                await self.exchange_client.place_reduce_only_close_order(close_qty, close_side)
+                            else:
+                                self.logger.log("Position > active close; auto-fix not implemented for this exchange", "WARNING")
+                        else:
+                            # Active close orders exceed position: cancel extra close orders
+                            excess = abs(mismatch)
+                            cancelled = Decimal(0)
+                            # Cancel from the end of the list
+                            for order in list(self.active_close_orders):
+                                if cancelled >= excess:
+                                    break
+                                await self.exchange_client.cancel_order(order['id'])
+                                cancelled += Decimal(order.get('size', 0))
+                                self.logger.log(f"Canceled excess close order {order['id']} size {order.get('size')}", "WARNING")
+                    except Exception as fix_err:
+                        self.logger.log(f"Auto-fix for position mismatch failed: {fix_err}", "ERROR")
+                        error_message = f"\n\nERROR: [{self.config.exchange.upper()}_{self.config.ticker.upper()}] "
+                        error_message += "Position mismatch detected\n"
+                        error_message += "###### ERROR ###### ERROR ###### ERROR ###### ERROR #####\n"
+                        error_message += "Please manually rebalance your position and take-profit orders\n"
+                        error_message += "请手动平衡当前仓位和正在关闭的仓位\n"
+                        error_message += f"current position: {position_amt} | active closing amount: {active_close_amount} | "f"Order quantity: {len(self.active_close_orders)}\n"
+                        error_message += "###### ERROR ###### ERROR ###### ERROR ###### ERROR #####\n"
+                        self.logger.log(error_message, "ERROR")
+                        await self.send_notification(error_message.lstrip())
+                        if not self.shutdown_requested:
+                            self.shutdown_requested = True
+                        mismatch_detected = True
 
                 return mismatch_detected
 
