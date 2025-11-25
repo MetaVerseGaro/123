@@ -90,6 +90,13 @@ class TradingBot:
             "deviation_pct": Decimal(os.getenv("ZIGZAG_DEVIATION", "5")),
             "backstep": int(os.getenv("ZIGZAG_BACKSTEP", "2")),
         }
+        self.dynamic_stop_price: Optional[Decimal] = None
+        self.current_direction: Optional[str] = self.config.direction.lower()
+        self.reversing = False
+        self.last_confirmed_low: Optional[Decimal] = None
+        self.last_confirmed_high: Optional[Decimal] = None
+        self.enable_auto_reverse = str(os.getenv("ENABLE_AUTO_REVERSE", "true")).lower() == "true"
+        self.enable_dynamic_sl = str(os.getenv("ENABLE_DYNAMIC_SL", "true")).lower() == "true"
 
         # Register order callback
         self._setup_websocket_handlers()
@@ -524,6 +531,7 @@ class TradingBot:
                 event = self.zigzag.update(Decimal(best_ask), Decimal(best_bid))
                 if event:
                     self.logger.log(f"[ZIGZAG] {event.label} @ {event.price} dir={event.direction}", "INFO")
+                    await self._handle_zigzag_event(event)
             except Exception as e:
                 self.logger.log(f"[ZIGZAG] update failed: {e}", "WARNING")
         if best_bid <= 0 or best_ask <= 0 or best_bid >= best_ask:
