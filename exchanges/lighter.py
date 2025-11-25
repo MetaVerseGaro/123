@@ -335,10 +335,9 @@ class LighterClient(BaseExchangeClient):
                 'price': int(maker_price * self.price_multiplier),
                 'is_ask': is_ask,
                 'order_type': self.lighter_client.ORDER_TYPE_LIMIT,
-                'time_in_force': self.lighter_client.ORDER_TIME_IN_FORCE_GOOD_TILL_TIME,
+                'time_in_force': self.lighter_client.ORDER_TIME_IN_FORCE_POST_ONLY,
                 'reduce_only': False,
                 'trigger_price': 0,
-                'post_only': True,
             }
 
             order_result = await self._submit_order_with_retry(order_params)
