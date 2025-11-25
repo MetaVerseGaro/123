@@ -8,6 +8,8 @@ import asyncio
 import logging
 from pathlib import Path
 import sys
+import json
+import os
 import dotenv
 from decimal import Decimal
 from trading_bot import TradingBot, TradingConfig
@@ -17,6 +19,11 @@ from exchanges import ExchangeFactory
 def parse_arguments():
     """Parse command line arguments."""
     parser = argparse.ArgumentParser(description='Modular Trading Bot - Supports multiple exchanges')
+
+    parser.add_argument('config', nargs='?', default=None,
+                        help='Path to JSON config file (overrides CLI args)')
+    parser.add_argument('--config', dest='config_flag', default=None,
+                        help='Path to JSON config file (overrides CLI args)')
 
     # Exchange selection
     parser.add_argument('--exchange', type=str, default='edgex',
@@ -56,6 +63,47 @@ def parse_arguments():
     return parser.parse_args()
 
 
+def load_config(config_path: str) -> dict:
+    """Load JSON config from file."""
+    try:
+        with open(config_path, 'r', encoding='utf-8') as f:
+            return json.load(f)
+    except Exception as e:
+        print(f"Failed to load config file {config_path}: {e}")
+        sys.exit(1)
+
+
+def merge_config(args, cfg: dict):
+    """Merge JSON config into argparse args."""
+    if not cfg:
+        return args
+
+    # Optional env vars to set before running (e.g., LOG_FILE_PREFIX)
+    for key, val in cfg.get("env", {}).items():
+        os.environ[str(key)] = str(val)
+
+    def set_if_present(field, transform=lambda x: x):
+        if field in cfg and cfg[field] is not None:
+            setattr(args, field.replace('-', '_'), transform(cfg[field]))
+
+    set_if_present("exchange", str)
+    set_if_present("ticker", str)
+    set_if_present("quantity", Decimal)
+    set_if_present("take_profit", Decimal)
+    set_if_present("direction", str)
+    set_if_present("max_orders", int)
+    set_if_present("wait_time", int)
+    set_if_present("env_file", str)
+    set_if_present("grid_step", Decimal)
+    set_if_present("stop_price", Decimal)
+    set_if_present("stop_loss_price", Decimal)
+    set_if_present("pause_price", Decimal)
+    if cfg.get("boost") is not None:
+        setattr(args, "boost", bool(cfg["boost"]))
+
+    return args
+
+
 def setup_logging(log_level: str):
     """Setup global logging configuration."""
     # Convert string level to logging constant
@@ -89,6 +137,13 @@ def setup_logging(log_level: str):
 async def main():
     """Main entry point."""
     args = parse_arguments()
+
+    # Handle config file (positional or --config)
+    config_path = args.config_flag or args.config
+    cfg = None
+    if config_path:
+        cfg = load_config(config_path)
+        args = merge_config(args, cfg)
 
     # Setup logging first
     setup_logging("WARNING")
