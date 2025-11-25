@@ -97,6 +97,10 @@ class TradingBot:
         self.last_confirmed_high: Optional[Decimal] = None
         self.enable_auto_reverse = str(os.getenv("ENABLE_AUTO_REVERSE", "true")).lower() == "true"
         self.enable_dynamic_sl = str(os.getenv("ENABLE_DYNAMIC_SL", "true")).lower() == "true"
+        self.current_sl_order_id: Optional[str] = None
+        self.zigzag_current_direction: int = 0
+        self.break_buffer_ticks = Decimal(os.getenv("ZIGZAG_BREAK_BUFFER_TICKS", "10"))
+        self.zigzag_current_direction: int = 0
 
         # Register order callback
         self._setup_websocket_handlers()
@@ -263,6 +267,198 @@ class TradingBot:
                 self.logger.log(f"[CLOSE] Timeout cancel failed: {e}", "WARNING")
             self.logger.log("[CLOSE] Reposting take-profit due to timeout at better-than-target price", "WARNING")
 
+    async def _place_stop_loss_native(self, quantity: Decimal, trigger_price: Decimal, side: str):
+        """Place native stop-loss via exchange client if supported."""
+        if hasattr(self.exchange_client, "place_stop_loss_order"):
+            # Cancel previous SL
+            if self.current_sl_order_id:
+                try:
+                    await self.exchange_client.cancel_order(self.current_sl_order_id)
+                except Exception as e:
+                    self.logger.log(f"Cancel previous SL failed: {e}", "WARNING")
+            sl_result = await self.exchange_client.place_stop_loss_order(quantity, trigger_price, side)
+            if sl_result.success:
+                self.current_sl_order_id = sl_result.order_id
+                self.logger.log(f"[SL] Placed native stop-loss {side} qty={quantity} trig={trigger_price}", "INFO")
+            else:
+                self.logger.log(f"[SL] Failed to place native stop-loss: {sl_result.error_message}", "ERROR")
+        else:
+            self.logger.log("[SL] Exchange does not support native stop-loss", "WARNING")
+
+    async def _close_all_positions_and_orders(self):
+        """Cancel all orders and close any open position reduce-only."""
+        try:
+            if hasattr(self.exchange_client, "cancel_all_orders"):
+                await self.exchange_client.cancel_all_orders()
+        except Exception as e:
+            self.logger.log(f"Error cancelling all orders: {e}", "ERROR")
+
+        try:
+            pos_signed = await self.exchange_client.get_account_positions()
+        except Exception as e:
+            self.logger.log(f"Error fetching position during cleanup: {e}", "ERROR")
+            pos_signed = Decimal(0)
+
+        pos_abs = abs(pos_signed)
+        if pos_abs > 0:
+            close_side = 'sell' if pos_signed > 0 else 'buy'
+            try:
+                await self.exchange_client.reduce_only_close_with_retry(pos_abs, close_side)
+            except Exception as e:
+                self.logger.log(f"Error closing position during cleanup: {e}", "ERROR")
+
+        # Cancel SL
+        if self.current_sl_order_id:
+            try:
+                await self.exchange_client.cancel_order(self.current_sl_order_id)
+            except Exception:
+                pass
+        self.current_sl_order_id = None
+
+    def _update_confirmed_pivots(self, event: ZigZagEvent):
+        """Update confirmed high/low based on ZigZag event."""
+        if event.label in ("HH", "LH"):
+            self.last_confirmed_high = event.price
+        if event.label in ("LL", "HL"):
+            self.last_confirmed_low = event.price
+
+    def _compute_dynamic_stop(self, direction: str) -> Optional[Decimal]:
+        """Compute dynamic stop based on confirmed pivots and tick buffer (10 ticks)."""
+        tick = self.config.tick_size
+        buffer_ticks = Decimal("10") * tick
+        if direction == "buy" and self.last_confirmed_low is not None:
+            return self.last_confirmed_low - buffer_ticks
+        if direction == "sell" and self.last_confirmed_high is not None:
+            return self.last_confirmed_high + buffer_ticks
+        return None
+
+    async def _refresh_stop_loss(self, force: bool = False):
+        """Refresh native stop-loss according to current position and dynamic SL."""
+        if not self.enable_dynamic_sl:
+            return
+        try:
+            pos_signed = await self.exchange_client.get_account_positions()
+        except Exception as e:
+            self.logger.log(f"[SL] Failed to fetch position for refresh: {e}", "WARNING")
+            return
+
+        pos_abs = abs(pos_signed)
+        if pos_abs == 0:
+            if self.current_sl_order_id:
+                try:
+                    await self.exchange_client.cancel_order(self.current_sl_order_id)
+                except Exception:
+                    pass
+                self.current_sl_order_id = None
+            return
+
+        direction = "buy" if pos_signed > 0 else "sell"
+        dyn_stop = self._compute_dynamic_stop(direction)
+        if dyn_stop is None:
+            return
+
+        if (not force) and self.dynamic_stop_price is not None:
+            if abs(dyn_stop - self.dynamic_stop_price) < self.config.tick_size:
+                # No meaningful change
+                return
+
+        self.dynamic_stop_price = dyn_stop
+        await self._place_stop_loss_native(pos_abs, dyn_stop, 'sell' if direction == "buy" else 'buy')
+
+    async def _handle_zigzag_event(self, event: ZigZagEvent):
+        """Handle ZigZag pivot events: update pivots, dynamic SL, and optional auto-reverse."""
+        self._update_confirmed_pivots(event)
+
+        # Reverse conditions: short -> HH triggers long; long -> LL triggers short
+        current_dir = self.config.direction.lower()
+        if self.enable_auto_reverse:
+            if current_dir == "buy" and event.label == "LL":
+                await self._reverse_position("sell", event.price)
+                return
+            if current_dir == "sell" and event.label == "HH":
+                await self._reverse_position("buy", event.price)
+                return
+
+        # If not reversing, just refresh stop-loss if needed
+        if self.enable_dynamic_sl:
+            await self._refresh_stop_loss(force=True)
+
+    async def _reverse_position(self, new_direction: str, pivot_price: Decimal):
+        """Reverse position based on ZigZag signal: cancel orders, close current position, set direction, and re-enter."""
+        if self.reversing:
+            return
+        self.reversing = True
+        self.logger.log(f"[REV] Trigger reverse to {new_direction.upper()} via ZigZag at {pivot_price}", "WARNING")
+        # Cancel all existing orders on this contract
+        if hasattr(self.exchange_client, "cancel_all_orders"):
+            try:
+                await self.exchange_client.cancel_all_orders()
+            except Exception as e:
+                self.logger.log(f"[REV] Cancel all orders failed: {e}", "ERROR")
+
+        # Close existing position
+        try:
+            pos_signed = await self.exchange_client.get_account_positions()
+        except Exception as e:
+            self.logger.log(f"[REV] Failed to fetch position: {e}", "ERROR")
+            pos_signed = Decimal(0)
+
+        pos_abs = abs(pos_signed)
+        if pos_abs > 0:
+            close_side = 'sell' if pos_signed > 0 else 'buy'
+            try:
+                await self.exchange_client.reduce_only_close_with_retry(pos_abs, close_side)
+            except Exception as e:
+                self.logger.log(f"[REV] Failed to close existing position: {e}", "ERROR")
+                self.reversing = False
+                return
+
+        # Update direction and reset timers
+        self.config.direction = new_direction
+        self.last_open_order_time = 0
+
+        # Refresh stop loss for new direction
+        if self.enable_dynamic_sl:
+            await self._refresh_stop_loss(force=True)
+
+        # Immediately place a new open order in new direction
+        await self._place_and_monitor_open_order()
+        self.reversing = False
+
+    async def _reverse_position(self, new_direction: str, pivot_price: Decimal):
+        """Reverse position based on ZigZag signal: cancel orders, close current position, set direction."""
+        if not self.enable_auto_reverse:
+            return
+
+        self.logger.log(f"[REV] Trigger reverse to {new_direction.upper()} via ZigZag at {pivot_price}", "WARNING")
+        # Cancel all existing orders on this contract
+        if hasattr(self.exchange_client, "cancel_all_orders"):
+            try:
+                await self.exchange_client.cancel_all_orders()
+            except Exception as e:
+                self.logger.log(f"[REV] Cancel all orders failed: {e}", "ERROR")
+
+        # Close existing position
+        try:
+            position_size = abs(await self.exchange_client.get_account_positions())
+        except Exception as e:
+            self.logger.log(f"[REV] Failed to fetch position: {e}", "ERROR")
+            position_size = Decimal(0)
+
+        if position_size > 0:
+            close_side = 'sell' if new_direction == "buy" else 'buy'
+            try:
+                await self.exchange_client.reduce_only_close_with_retry(position_size, close_side)
+            except Exception as e:
+                self.logger.log(f"[REV] Failed to close existing position: {e}", "ERROR")
+                return
+
+        # Update direction
+        self.config.direction = new_direction
+        # Place new stop-loss after direction change
+        if self.enable_dynamic_sl:
+            await self._refresh_stop_loss(force=True)
+
     async def _place_and_monitor_open_order(self) -> bool:
         """Place an order and monitor its execution."""
         try:
@@ -290,17 +486,21 @@ class TradingBot:
                     pass
 
             # Handle order result
-            return await self._handle_order_result(order_result)
+            handled = await self._handle_order_result(order_result)
+            if handled and self.enable_dynamic_sl:
+                await self._refresh_stop_loss()
+            return handled
 
         except Exception as e:
             self.logger.log(f"Error placing order: {e}", "ERROR")
             self.logger.log(f"Traceback: {traceback.format_exc()}", "ERROR")
-            return False
+        return False
 
     async def _handle_order_result(self, order_result) -> bool:
         """Handle the result of an order placement."""
         order_id = order_result.order_id
         filled_price = order_result.price
+        self.config.direction = self.config.direction.lower()
 
         if self.order_filled_event.is_set() or order_result.status == 'FILLED':
             if self.config.boost_mode:
@@ -531,17 +731,34 @@ class TradingBot:
                 event = self.zigzag.update(Decimal(best_ask), Decimal(best_bid))
                 if event:
                     self.logger.log(f"[ZIGZAG] {event.label} @ {event.price} dir={event.direction}", "INFO")
+                    self.zigzag_current_direction = event.direction
                     await self._handle_zigzag_event(event)
             except Exception as e:
                 self.logger.log(f"[ZIGZAG] update failed: {e}", "WARNING")
         if best_bid <= 0 or best_ask <= 0 or best_bid >= best_ask:
             raise ValueError("No bid/ask data available")
 
-        if (self.config.stop_loss_price != -1) and (not self.stop_loss_triggered):
+        if self.enable_dynamic_sl and self.dynamic_stop_price is not None and (not self.stop_loss_triggered):
+            if self.config.direction == "buy" and best_bid <= self.dynamic_stop_price:
+                stop_loss_triggered = True
+            elif self.config.direction == "sell" and best_ask >= self.dynamic_stop_price:
+                stop_loss_triggered = True
+        elif (self.config.stop_loss_price != -1) and (not self.stop_loss_triggered):
             if self.config.direction == "buy" and best_bid <= self.config.stop_loss_price:
                 stop_loss_triggered = True
             elif self.config.direction == "sell" and best_ask >= self.config.stop_loss_price:
                 stop_loss_triggered = True
+        # Immediate reverse on break of confirmed high/low (± buffer ticks)
+        if self.enable_auto_reverse:
+            buffer = self.break_buffer_ticks * self.config.tick_size
+            if self.last_confirmed_high is not None and best_ask >= (self.last_confirmed_high + buffer):
+                if self.config.direction == "sell":
+                    await self._reverse_position("buy", Decimal(best_ask))
+                    return stop_trading, pause_trading, stop_loss_triggered, best_bid, best_ask
+            if self.last_confirmed_low is not None and best_bid <= (self.last_confirmed_low - buffer):
+                if self.config.direction == "buy":
+                    await self._reverse_position("sell", Decimal(best_bid))
+                    return stop_trading, pause_trading, stop_loss_triggered, best_bid, best_ask
 
         if self.config.stop_price != -1:
             if self.config.direction == "buy":
@@ -640,6 +857,21 @@ class TradingBot:
                 deviation_pct=self.zigzag_params["deviation_pct"],
                 backstep=self.zigzag_params["backstep"],
             )
+            # Warmup ZigZag with history candles (lighter only)
+            if self.config.exchange == "lighter" and hasattr(self.exchange_client, "fetch_history_candles"):
+                try:
+                    candles = await self.exchange_client.fetch_history_candles(limit=200, timeframe="1m")
+                    for c in candles:
+                        high = Decimal(str(c.high))
+                        low = Decimal(str(c.low))
+                        evt = self.zigzag.update(high, low, ts=getattr(c, "open_time", None))
+                        if evt:
+                            self._update_confirmed_pivots(evt)
+                    # After warmup, dynamic stop price based on confirmed pivots
+                    if self.enable_dynamic_sl:
+                        await self._refresh_stop_loss(force=True)
+                except Exception as e:
+                    self.logger.log(f"[ZIGZAG] Warmup failed: {e}", "WARNING")
 
             # Log current TradingConfig
             self.logger.log("=== Trading Configuration ===", "INFO")
