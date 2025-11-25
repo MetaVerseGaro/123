@@ -306,7 +306,7 @@ class LighterClient(BaseExchangeClient):
         return price
 
     async def place_limit_order(self, contract_id: str, quantity: Decimal, price: Decimal,
-                                side: str) -> OrderResult:
+                                side: str, reduce_only: bool = False) -> OrderResult:
         """Place a post-only order with retry until it is accepted as maker."""
         if self.lighter_client is None:
             await self._initialize_lighter_client()
@@ -336,7 +336,7 @@ class LighterClient(BaseExchangeClient):
                 'is_ask': is_ask,
                 'order_type': self.lighter_client.ORDER_TYPE_LIMIT,
                 'time_in_force': self.lighter_client.ORDER_TIME_IN_FORCE_POST_ONLY,
-                'reduce_only': False,
+                'reduce_only': reduce_only,
                 'trigger_price': 0,
             }
 
@@ -366,6 +366,11 @@ class LighterClient(BaseExchangeClient):
 
             await asyncio.sleep(0.3)
 
+    async def place_reduce_only_close_order(self, quantity: Decimal, side: str) -> OrderResult:
+        """Place a reduce-only post-only close order using current BBO as reference."""
+        maker_price = await self._calculate_post_only_price(side, None)
+        return await self.place_limit_order(self.config.contract_id, quantity, maker_price, side, reduce_only=True)
+
     async def place_open_order(self, contract_id: str, quantity: Decimal, direction: str) -> OrderResult:
         """Place an open order with Lighter using official SDK."""
 
@@ -374,7 +379,7 @@ class LighterClient(BaseExchangeClient):
         order_price = await self.get_order_price(direction)
 
         order_price = self.round_to_tick(order_price)
-        order_result = await self.place_limit_order(contract_id, quantity, order_price, direction)
+        order_result = await self.place_limit_order(contract_id, quantity, order_price, direction, reduce_only=False)
         if not order_result.success:
             raise Exception(f"[OPEN] Error placing order: {order_result.error_message}")
 
@@ -409,7 +414,7 @@ class LighterClient(BaseExchangeClient):
         """Place a close order with Lighter using official SDK."""
         self.current_order = None
         self.current_order_client_id = None
-        order_result = await self.place_limit_order(contract_id, quantity, price, side)
+        order_result = await self.place_limit_order(contract_id, quantity, price, side, reduce_only=True)
 
         # wait for 5 seconds to ensure order is placed
         await asyncio.sleep(5)
