@@ -21,3 +21,8 @@
   tail -f botA.out # 查看日志
   ps aux | grep python # 查看进程
   ```
+t 'post_only'). Retrying with adjusted price.
+2025-11-25 20:45:19 | WARNING | [LIGHTER][ETH] [POST_ONLY] Attempt 578 failed (got an unexpected keyword argument 'post_only'). Retrying with adjusted price.
+2025-11-25 20:45:19 | WARNING | [LIGHTER][ETH] [POST_ONLY] Attempt 579 failed (got an unexpected keyword argument 'post_only'). Retrying with adjusted price.
+2025-11-25 20:45:19 | WARNING | [LIGHTER][ETH] [POST_ONLY] Attempt 580 failed (got an unexpected keyword argument 'post_only'). Retrying with adjusted price.
+2025-11-25 20:45:20 | WARNING | [LIGHTER][ETH] [POST_ONLY] Attempt 581 failed (got an unexpected keyword argument 'post_only'). Retrying with adjusted price.
