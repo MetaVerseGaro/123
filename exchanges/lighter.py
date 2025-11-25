@@ -753,6 +753,50 @@ class LighterClient(BaseExchangeClient):
 
         return Decimal(0)
 
+    async def get_position_detail(self) -> Tuple[Decimal, Decimal]:
+        """Get signed position size and avg entry price for current market."""
+        positions = await self._fetch_positions_with_retry()
+        for position in positions:
+            if position.market_id == self.config.contract_id:
+                size = Decimal(position.position)
+                avg_price = Decimal(position.avg_price) if hasattr(position, "avg_price") else Decimal(0)
+                return size, avg_price
+        return Decimal(0), Decimal(0)
+
+    async def get_account_equity(self) -> Decimal:
+        """Get account equity/collateral."""
+        account_api = lighter.AccountApi(self.api_client)
+        try:
+            await self._throttle_rest()
+            data = await account_api.account(by="index", value=str(self.account_index))
+            if not data or not data.accounts:
+                raise ValueError("Failed to get account data")
+            collateral = data.accounts[0].collateral
+            self._reset_rate_limit_backoff()
+            return Decimal(str(collateral))
+        except Exception as e:
+            if self._is_rate_limit_error(e):
+                self.logger.log(f"[RATE_LIMIT] get_account_equity: {e}", "WARNING")
+                await self._handle_rate_limit_backoff()
+            raise
+
+    async def get_available_balance(self) -> Optional[Decimal]:
+        """Get available_balance from account data if present."""
+        account_api = lighter.AccountApi(self.api_client)
+        try:
+            await self._throttle_rest()
+            data = await account_api.account(by="index", value=str(self.account_index))
+            if not data or not data.accounts:
+                return None
+            avail = data.accounts[0].available_balance
+            self._reset_rate_limit_backoff()
+            return Decimal(str(avail)) if avail is not None else None
+        except Exception as e:
+            if self._is_rate_limit_error(e):
+                self.logger.log(f"[RATE_LIMIT] get_available_balance: {e}", "WARNING")
+                await self._handle_rate_limit_backoff()
+            return None
+
     async def get_contract_attributes(self) -> Tuple[str, Decimal]:
         """Get contract ID for a ticker."""
         ticker = self.config.ticker
