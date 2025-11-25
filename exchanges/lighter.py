@@ -60,6 +60,31 @@ class LighterClient(BaseExchangeClient):
         self.current_order_client_id = None
         self.current_order = None
         self._order_id_seed = int(time.time() * 1000)
+        # Request throttling and rate-limit backoff
+        self._rest_min_interval = float(os.getenv("LIGHTER_REST_MIN_INTERVAL", "0.3"))
+        self._last_rest_ts = 0.0
+        self._rate_limit_backoff = float(os.getenv("LIGHTER_BACKOFF_START", "0.5"))
+        self._rate_limit_backoff_max = float(os.getenv("LIGHTER_BACKOFF_MAX", "8"))
+
+    async def _throttle_rest(self):
+        """Enforce minimal interval between REST calls to avoid rate limits."""
+        now = time.time()
+        wait = self._rest_min_interval - (now - self._last_rest_ts)
+        if wait > 0:
+            await asyncio.sleep(wait)
+        self._last_rest_ts = time.time()
+
+    def _reset_rate_limit_backoff(self):
+        self._rate_limit_backoff = float(os.getenv("LIGHTER_BACKOFF_START", "0.5"))
+
+    def _is_rate_limit_error(self, err) -> bool:
+        msg = str(err).lower()
+        status = getattr(err, "status", None)
+        return (status == 429 or "too many request" in msg or "rate limit" in msg or "429" in msg)
+
+    async def _handle_rate_limit_backoff(self):
+        await asyncio.sleep(self._rate_limit_backoff)
+        self._rate_limit_backoff = min(self._rate_limit_backoff * 2, self._rate_limit_backoff_max)
 
     def _validate_config(self) -> None:
         """Validate Lighter configuration."""
@@ -251,30 +276,44 @@ class LighterClient(BaseExchangeClient):
         return best_bid, best_ask
 
     async def _submit_order_with_retry(self, order_params: Dict[str, Any]) -> OrderResult:
-        """Submit an order with Lighter using official SDK."""
+        """Submit an order with Lighter using official SDK, with throttling and rate-limit backoff."""
         # Ensure client is initialized
         if self.lighter_client is None:
-            # This is a sync method, so we need to handle this differently
-            # For now, raise an error if client is not initialized
             raise ValueError("Lighter client not initialized. Call connect() first.")
 
-        try:
-            # Create order using official SDK
-            create_order, tx_hash, error = await self.lighter_client.create_order(**order_params)
-        except Exception as exc:
-            return OrderResult(
-                success=False,
-                order_id=str(order_params.get('client_order_index')),
-                error_message=str(exc)
-            )
+        max_attempts = 5
+        attempt = 0
+        while attempt < max_attempts:
+            attempt += 1
+            await self._throttle_rest()
+            try:
+                create_order, tx_hash, error = await self.lighter_client.create_order(**order_params)
+            except Exception as exc:
+                if self._is_rate_limit_error(exc):
+                    self.logger.log(f"[RATE_LIMIT] create_order attempt {attempt}: {exc}", "WARNING")
+                    await self._handle_rate_limit_backoff()
+                    continue
+                return OrderResult(
+                    success=False,
+                    order_id=str(order_params.get('client_order_index')),
+                    error_message=str(exc)
+                )
 
-        if error is not None:
-            return OrderResult(
-                success=False, order_id=str(order_params['client_order_index']),
-                error_message=f"Order creation error: {error}")
+            if error is not None:
+                if self._is_rate_limit_error(error):
+                    self.logger.log(f"[RATE_LIMIT] create_order attempt {attempt}: {error}", "WARNING")
+                    await self._handle_rate_limit_backoff()
+                    continue
+                return OrderResult(
+                    success=False, order_id=str(order_params['client_order_index']),
+                    error_message=f"Order creation error: {error}")
 
-        else:
+            # Success
+            self._reset_rate_limit_backoff()
             return OrderResult(success=True, order_id=str(order_params['client_order_index']))
+
+        return OrderResult(success=False, order_id=str(order_params.get('client_order_index')),
+                           error_message="Order creation exceeded max retries due to rate limits")
 
     def _generate_client_order_index(self) -> int:
         """Generate a unique client order index for tracking orders."""
@@ -503,19 +542,30 @@ class LighterClient(BaseExchangeClient):
         if self.lighter_client is None:
             await self._initialize_lighter_client()
 
-        # Cancel order using official SDK
-        cancel_order, tx_hash, error = await self.lighter_client.cancel_order(
-            market_index=self.config.contract_id,
-            order_index=int(order_id)  # Assuming order_id is the order index
-        )
+        max_attempts = 5
+        attempt = 0
+        while attempt < max_attempts:
+            attempt += 1
+            await self._throttle_rest()
+            cancel_order, tx_hash, error = await self.lighter_client.cancel_order(
+                market_index=self.config.contract_id,
+                order_index=int(order_id)  # Assuming order_id is the order index
+            )
 
-        if error is not None:
-            return OrderResult(success=False, error_message=f"Cancel order error: {error}")
+            if error is not None:
+                if self._is_rate_limit_error(error):
+                    self.logger.log(f"[RATE_LIMIT] cancel_order attempt {attempt}: {error}", "WARNING")
+                    await self._handle_rate_limit_backoff()
+                    continue
+                return OrderResult(success=False, error_message=f"Cancel order error: {error}")
 
-        if tx_hash:
-            return OrderResult(success=True)
-        else:
-            return OrderResult(success=False, error_message='Failed to send cancellation transaction')
+            if tx_hash:
+                self._reset_rate_limit_backoff()
+                return OrderResult(success=True)
+            else:
+                return OrderResult(success=False, error_message='Failed to send cancellation transaction')
+
+        return OrderResult(success=False, error_message='Cancel order exceeded max retries due to rate limits')
 
     async def get_order_info(self, order_id: str) -> Optional[OrderInfo]:
         """Get order information from Lighter using official SDK."""
@@ -554,27 +604,33 @@ class LighterClient(BaseExchangeClient):
         if self.lighter_client is None:
             await self._initialize_lighter_client()
 
-        # Generate auth token for API call
-        auth_token, error = self.lighter_client.create_auth_token_with_expiry()
-        if error is not None:
-            self.logger.log(f"Error creating auth token: {error}", "ERROR")
-            raise ValueError(f"Error creating auth token: {error}")
+        try:
+            await self._throttle_rest()
+            auth_token, error = self.lighter_client.create_auth_token_with_expiry()
+            if error is not None:
+                self.logger.log(f"Error creating auth token: {error}", "ERROR")
+                raise ValueError(f"Error creating auth token: {error}")
 
-        # Use OrderApi to get active orders
-        order_api = lighter.OrderApi(self.api_client)
+            order_api = lighter.OrderApi(self.api_client)
+            await self._throttle_rest()
+            orders_response = await order_api.account_active_orders(
+                account_index=self.account_index,
+                market_id=self.config.contract_id,
+                auth=auth_token
+            )
 
-        # Get active orders for the specific market
-        orders_response = await order_api.account_active_orders(
-            account_index=self.account_index,
-            market_id=self.config.contract_id,
-            auth=auth_token
-        )
+            if not orders_response:
+                self.logger.log("Failed to get orders", "ERROR")
+                raise ValueError("Failed to get orders")
 
-        if not orders_response:
-            self.logger.log("Failed to get orders", "ERROR")
-            raise ValueError("Failed to get orders")
+            self._reset_rate_limit_backoff()
+            return orders_response.orders
 
-        return orders_response.orders
+        except Exception as e:
+            if self._is_rate_limit_error(e):
+                self.logger.log(f"[RATE_LIMIT] fetch_orders: {e}", "WARNING")
+                await self._handle_rate_limit_backoff()
+            raise
 
     async def get_active_orders(self, contract_id: str) -> List[OrderInfo]:
         """Get active orders for a contract using official SDK."""
@@ -606,16 +662,22 @@ class LighterClient(BaseExchangeClient):
     async def _fetch_positions_with_retry(self) -> List[Dict[str, Any]]:
         """Get positions using official SDK."""
         # Use shared API client
-        account_api = lighter.AccountApi(self.api_client)
+        try:
+            account_api = lighter.AccountApi(self.api_client)
+            await self._throttle_rest()
+            account_data = await account_api.account(by="index", value=str(self.account_index))
 
-        # Get account info
-        account_data = await account_api.account(by="index", value=str(self.account_index))
+            if not account_data or not account_data.accounts:
+                self.logger.log("Failed to get positions", "ERROR")
+                raise ValueError("Failed to get positions")
 
-        if not account_data or not account_data.accounts:
-            self.logger.log("Failed to get positions", "ERROR")
-            raise ValueError("Failed to get positions")
-
-        return account_data.accounts[0].positions
+            self._reset_rate_limit_backoff()
+            return account_data.accounts[0].positions
+        except Exception as e:
+            if self._is_rate_limit_error(e):
+                self.logger.log(f"[RATE_LIMIT] fetch_positions: {e}", "WARNING")
+                await self._handle_rate_limit_backoff()
+            raise
 
     async def get_account_positions(self) -> Decimal:
         """Get account positions using official SDK."""
@@ -637,31 +699,39 @@ class LighterClient(BaseExchangeClient):
             raise ValueError("Ticker is empty")
 
         order_api = lighter.OrderApi(self.api_client)
-        # Get all order books to find the market for our ticker
-        order_books = await order_api.order_books()
-
-        # Find the market that matches our ticker
-        market_info = None
-        for market in order_books.order_books:
-            if market.symbol == ticker:
-                market_info = market
-                break
-
-        if market_info is None:
-            self.logger.log("Failed to get markets", "ERROR")
-            raise ValueError("Failed to get markets")
-
-        market_summary = await order_api.order_book_details(market_id=market_info.market_id)
-        order_book_details = market_summary.order_book_details[0]
-        # Set contract_id to market name (Lighter uses market IDs as identifiers)
-        self.config.contract_id = market_info.market_id
-        self.base_amount_multiplier = pow(10, market_info.supported_size_decimals)
-        self.price_multiplier = pow(10, market_info.supported_price_decimals)
-
         try:
-            self.config.tick_size = Decimal("1") / (Decimal("10") ** order_book_details.price_decimals)
-        except Exception:
-            self.logger.log("Failed to get tick size", "ERROR")
-            raise ValueError("Failed to get tick size")
+            await self._throttle_rest()
+            order_books = await order_api.order_books()
 
-        return self.config.contract_id, self.config.tick_size
+            market_info = None
+            for market in order_books.order_books:
+                if market.symbol == ticker:
+                    market_info = market
+                    break
+
+            if market_info is None:
+                self.logger.log("Failed to get markets", "ERROR")
+                raise ValueError("Failed to get markets")
+
+            await self._throttle_rest()
+            market_summary = await order_api.order_book_details(market_id=market_info.market_id)
+            order_book_details = market_summary.order_book_details[0]
+
+            self.config.contract_id = market_info.market_id
+            self.base_amount_multiplier = pow(10, market_info.supported_size_decimals)
+            self.price_multiplier = pow(10, market_info.supported_price_decimals)
+
+            try:
+                self.config.tick_size = Decimal("1") / (Decimal("10") ** order_book_details.price_decimals)
+            except Exception:
+                self.logger.log("Failed to get tick size", "ERROR")
+                raise ValueError("Failed to get tick size")
+
+            self._reset_rate_limit_backoff()
+            return self.config.contract_id, self.config.tick_size
+
+        except Exception as e:
+            if self._is_rate_limit_error(e):
+                self.logger.log(f"[RATE_LIMIT] get_contract_attributes: {e}", "WARNING")
+                await self._handle_rate_limit_backoff()
+            raise
