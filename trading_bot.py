@@ -192,24 +192,62 @@ class TradingBot:
         else:
             return 1
 
-    async def _get_adaptive_close_price(self, filled_price: Decimal, close_side: str) -> Decimal:
-        """Determine a close price that honors take-profit minimum but uses better current prices when available."""
-        if close_side == 'sell':
-            target_price = filled_price * (1 + self.config.take_profit/100)
-        else:
-            target_price = filled_price * (1 - self.config.take_profit/100)
+    async def _place_take_profit_order(self, quantity: Decimal, filled_price: Decimal) -> bool:
+        """Place a take-profit order; on Lighter, chase better-than-target prices with 5s timeout retries."""
+        close_side = self.config.close_order_side
+        target_price = (filled_price * (1 + self.config.take_profit/100)
+                        if close_side == 'sell'
+                        else filled_price * (1 - self.config.take_profit/100))
 
+        # Non-lighter: single placement at target
         if self.config.exchange != "lighter":
-            return target_price
+            close_order_result = await self.exchange_client.place_close_order(
+                self.config.contract_id,
+                quantity,
+                target_price,
+                close_side
+            )
+            if not close_order_result.success:
+                raise Exception(f"[CLOSE] Failed to place close order: {close_order_result.error_message}")
+            return True
 
-        try:
+        # Lighter: adaptive maker pricing with retries when price is better than target
+        while True:
             best_bid, best_ask = await self.exchange_client.fetch_bbo_prices(self.config.contract_id)
             if close_side == 'sell':
-                return max(target_price, best_ask)
+                desired_price = max(target_price, best_ask)
+                has_better = best_ask > target_price
             else:
-                return min(target_price, best_bid)
-        except Exception:
-            return target_price
+                desired_price = min(target_price, best_bid)
+                has_better = best_bid < target_price
+
+            close_order_result = await self.exchange_client.place_close_order(
+                self.config.contract_id,
+                quantity,
+                desired_price,
+                close_side
+            )
+            if not close_order_result.success:
+                raise Exception(f"[CLOSE] Failed to place close order: {close_order_result.error_message}")
+
+            # If we are at target (no better price), keep the order and exit
+            if not has_better or desired_price == target_price:
+                return True
+
+            # Otherwise, wait up to 5s; if not filled, cancel and retry
+            start_time = time.time()
+            while time.time() - start_time < 5:
+                current_order = getattr(self.exchange_client, "current_order", None)
+                if current_order and current_order.status == "FILLED":
+                    return True
+                await asyncio.sleep(0.2)
+
+            # Timeout: cancel and retry with fresh price
+            try:
+                await self.exchange_client.cancel_order(close_order_result.order_id)
+            except Exception as e:
+                self.logger.log(f"[CLOSE] Timeout cancel failed: {e}", "WARNING")
+            self.logger.log("[CLOSE] Reposting take-profit due to timeout at better-than-target price", "WARNING")
 
     async def _place_and_monitor_open_order(self) -> bool:
         """Place an order and monitor its execution."""
@@ -259,23 +297,7 @@ class TradingBot:
                 )
             else:
                 self.last_open_order_time = time.time()
-                # Place close order
-                close_side = self.config.close_order_side
-                close_price = await self._get_adaptive_close_price(filled_price, close_side)
-
-                close_order_result = await self.exchange_client.place_close_order(
-                    self.config.contract_id,
-                    self.config.quantity,
-                    close_price,
-                    close_side
-                )
-                if self.config.exchange == "lighter":
-                    await asyncio.sleep(1)
-
-                if not close_order_result.success:
-                    self.logger.log(f"[CLOSE] Failed to place close order: {close_order_result.error_message}", "ERROR")
-                    raise Exception(f"[CLOSE] Failed to place close order: {close_order_result.error_message}")
-
+                await self._place_take_profit_order(self.config.quantity, filled_price)
                 return True
 
         else:
@@ -355,20 +377,12 @@ class TradingBot:
                         filled_price,
                         close_side
                     )
+                    success = close_order_result.success
                 else:
-                    close_price = await self._get_adaptive_close_price(filled_price, close_side)
-
-                    close_order_result = await self.exchange_client.place_close_order(
-                        self.config.contract_id,
-                        self.order_filled_amount,
-                        close_price,
-                        close_side
-                    )
-                    if self.config.exchange == "lighter":
-                        await asyncio.sleep(1)
+                    success = await self._place_take_profit_order(self.order_filled_amount, filled_price)
 
                 self.last_open_order_time = time.time()
-                if not close_order_result.success:
+                if self.config.boost_mode and not success:
                     self.logger.log(f"[CLOSE] Failed to place close order: {close_order_result.error_message}", "ERROR")
 
             return True
@@ -418,7 +432,11 @@ class TradingBot:
                                 close_qty = mismatch
                                 close_side = self.config.close_order_side
                                 self.logger.log(f"Auto-closing excess position {close_qty} via reduce-only post-only", "WARNING")
-                                await self.exchange_client.place_reduce_only_close_order(close_qty, close_side)
+                                fix_result = await self.exchange_client.reduce_only_close_with_retry(
+                                    close_qty, close_side, timeout_sec=5.0, max_attempts=5
+                                )
+                                if not fix_result.success:
+                                    raise Exception(f"Reduce-only close failed: {fix_result.error_message}")
                             else:
                                 self.logger.log("Position > active close; auto-fix not implemented for this exchange", "WARNING")
                         else:
