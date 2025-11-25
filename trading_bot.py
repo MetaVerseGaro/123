@@ -100,6 +100,14 @@ class TradingBot:
         self.current_sl_order_id: Optional[str] = None
         self.zigzag_current_direction: int = 0
         self.break_buffer_ticks = Decimal(os.getenv("ZIGZAG_BREAK_BUFFER_TICKS", "10"))
+        # Risk control
+        self.risk_pct = Decimal(os.getenv("RISK_PCT", "0.5"))
+        self.release_timeout_minutes = int(os.getenv("RELEASE_TIMEOUT_MINUTES", "10"))
+        self.stop_new_orders_equity_threshold = Decimal(os.getenv("STOP_NEW_ORDERS_EQUITY_THRESHOLD", "50"))
+        self.stop_new_orders = False
+        self.last_new_order_time = time.time()
+        self.last_release_attempt = 0
+        self.last_stop_new_notify = False
         self.zigzag_current_direction: int = 0
 
         # Register order callback
@@ -462,6 +470,9 @@ class TradingBot:
     async def _place_and_monitor_open_order(self) -> bool:
         """Place an order and monitor its execution."""
         try:
+            # Risk gate: stop new orders when flag is set
+            if self.stop_new_orders:
+                return False
             # Reset state before placing order
             self.order_filled_event.clear()
             self.current_order_status = 'OPEN'
@@ -489,6 +500,8 @@ class TradingBot:
             handled = await self._handle_order_result(order_result)
             if handled and self.enable_dynamic_sl:
                 await self._refresh_stop_loss()
+            if handled:
+                self.last_new_order_time = time.time()
             return handled
 
         except Exception as e:
@@ -622,8 +635,23 @@ class TradingBot:
                         })
 
                 # Get positions
-                position_amt = await self.exchange_client.get_account_positions()
-                position_amt = abs(position_amt)
+                position_signed = await self.exchange_client.get_account_positions()
+                position_amt = abs(position_signed)
+                # Equity from exchange if available
+                equity = None
+                if hasattr(self.exchange_client, "get_account_equity"):
+                    try:
+                        equity = await self.exchange_client.get_account_equity()
+                        # available_balance fallback
+                        if equity is None and hasattr(self.exchange_client, "get_available_balance"):
+                            equity = await self.exchange_client.get_available_balance()
+                    except Exception as e:
+                        self.logger.log(f"[RISK] get_account_equity failed: {e}", "WARNING")
+                # Fallback equity proxy
+                best_bid, best_ask = await self.exchange_client.fetch_bbo_prices(self.config.contract_id)
+                mid_price = (best_bid + best_ask) / 2
+                if equity is None:
+                    equity = position_amt * mid_price
 
                 # Calculate active closing amount
                 active_close_amount = sum(
@@ -678,6 +706,65 @@ class TradingBot:
                         if not self.shutdown_requested:
                             self.shutdown_requested = True
                         mismatch_detected = True
+
+                # Risk gating: stop new orders if equity < threshold
+                if equity < self.stop_new_orders_equity_threshold:
+                    self.logger.log(f"[RISK] Equity below threshold ({equity}<{self.stop_new_orders_equity_threshold}), shutting down.", "ERROR")
+                    await self._close_all_positions_and_orders()
+                    await self.graceful_shutdown("Equity below threshold")
+                    mismatch_detected = True
+
+                # Redundancy calculation for stop-new-orders gating
+                # Need avg entry price; fallback: mid_price
+                avg_price = mid_price
+                if hasattr(self.exchange_client, "get_position_detail"):
+                    try:
+                        pos_signed_detail, avg_price_detail = await self.exchange_client.get_position_detail()
+                        if pos_signed_detail != 0:
+                            avg_price = avg_price_detail
+                    except Exception as e:
+                        self.logger.log(f"[RISK] get_position_detail failed: {e}", "WARNING")
+
+                stop_price = self.dynamic_stop_price if (self.enable_dynamic_sl and self.dynamic_stop_price) else self.config.stop_loss_price if self.config.stop_loss_price != -1 else None
+                if stop_price and position_amt > 0:
+                    if position_signed > 0:
+                        potential_loss = (avg_price - stop_price) * position_amt
+                        per_base_loss = (avg_price - stop_price)
+                    else:
+                        potential_loss = (stop_price - avg_price) * position_amt
+                        per_base_loss = (stop_price - avg_price)
+                    if potential_loss < 0:
+                        potential_loss = Decimal(0)
+                    max_loss = equity * (self.risk_pct / Decimal(100))
+                    redundancy_u = max_loss - potential_loss
+                    if redundancy_u < 0:
+                        redundancy_u = Decimal(0)
+                    redundancy_base = redundancy_u / per_base_loss if per_base_loss > 0 else Decimal(0)
+                    if redundancy_base < self.config.quantity:
+                        self.stop_new_orders = True
+                        if not self.last_stop_new_notify:
+                            self.logger.log(f"[RISK] Stop new orders: redundancy {redundancy_base} < quantity {self.config.quantity}", "WARNING")
+                            self.last_stop_new_notify = True
+                    else:
+                        self.stop_new_orders = False
+                        self.last_stop_new_notify = False
+
+                # If stop-new-orders flag is active, attempt release after timeout by freeing position
+                if self.stop_new_orders:
+                    if time.time() - self.last_release_attempt > self.release_timeout_minutes * 60:
+                        self.last_release_attempt = time.time()
+                        # Release: cancel far TP and close small portion to free margin
+                        try:
+                            active_orders = await self.exchange_client.get_active_orders(self.config.contract_id)
+                            for order in active_orders:
+                                await self.exchange_client.cancel_order(order.order_id)
+                            # Close small portion reduce-only to free space
+                            release_qty = min(self.config.quantity, position_amt)
+                            if release_qty > 0:
+                                close_side = self.config.close_order_side
+                                await self.exchange_client.reduce_only_close_with_retry(release_qty, close_side)
+                        except Exception as e:
+                            self.logger.log(f"[RISK] Release attempt failed: {e}", "WARNING")
 
                 return mismatch_detected
 
