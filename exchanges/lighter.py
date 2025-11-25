@@ -371,6 +371,53 @@ class LighterClient(BaseExchangeClient):
         maker_price = await self._calculate_post_only_price(side, None)
         return await self.place_limit_order(self.config.contract_id, quantity, maker_price, side, reduce_only=True)
 
+    async def reduce_only_close_with_retry(self, quantity: Decimal, side: str, timeout_sec: float = 5.0,
+                                           max_attempts: int = 5) -> OrderResult:
+        """Retry reduce-only post-only close; cancel after timeout and re-post until filled or attempts exhausted."""
+        attempt = 0
+        while attempt < max_attempts:
+            attempt += 1
+            order_result = await self.place_reduce_only_close_order(quantity, side)
+            if not order_result.success:
+                self.logger.log(f"[REDUCE_ONLY] Attempt {attempt} failed to place: {order_result.error_message}", "WARNING")
+                await asyncio.sleep(0.3)
+                continue
+
+            target_client_id = self.current_order_client_id
+            start = time.time()
+            while time.time() - start < timeout_sec:
+                if self.current_order and self.current_order_client_id == target_client_id:
+                    status = self.current_order.status
+                    if status == "FILLED":
+                        return OrderResult(
+                            success=True,
+                            order_id=str(self.current_order.order_id),
+                            side=side,
+                            size=self.current_order.filled_size,
+                            price=self.current_order.price,
+                            status=status,
+                            filled_size=self.current_order.filled_size
+                        )
+                    if status == "CANCELED":
+                        break
+                await asyncio.sleep(0.2)
+
+            # Not filled within timeout, cancel and retry
+            cancel_id = None
+            if self.current_order and self.current_order_client_id == target_client_id:
+                cancel_id = self.current_order.order_id
+            if cancel_id is None:
+                cancel_id = order_result.order_id
+
+            try:
+                await self.cancel_order(str(cancel_id))
+            except Exception as e:
+                self.logger.log(f"[REDUCE_ONLY] Cancel after timeout failed: {e}", "WARNING")
+
+            self.logger.log(f"[REDUCE_ONLY] Attempt {attempt} timed out; retrying", "WARNING")
+
+        return OrderResult(success=False, error_message="Reduce-only close exceeded max attempts")
+
     async def place_open_order(self, contract_id: str, quantity: Decimal, direction: str) -> OrderResult:
         """Place an open order with Lighter using official SDK."""
 
