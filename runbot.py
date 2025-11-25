@@ -104,6 +104,13 @@ def merge_config(args, cfg: dict):
     for k in ("enable_auto_reverse", "enable_dynamic_sl"):
         if cfg.get(k) is not None:
             os.environ[k.upper()] = str(cfg[k]).lower()
+    # Risk control env
+    if cfg.get("risk_pct") is not None:
+        os.environ["RISK_PCT"] = str(cfg["risk_pct"])
+    if cfg.get("release_timeout_minutes") is not None:
+        os.environ["RELEASE_TIMEOUT_MINUTES"] = str(cfg["release_timeout_minutes"])
+    if cfg.get("stop_new_orders_equity_threshold") is not None:
+        os.environ["STOP_NEW_ORDERS_EQUITY_THRESHOLD"] = str(cfg["stop_new_orders_equity_threshold"])
 
     return args
 
