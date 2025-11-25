@@ -3,7 +3,7 @@
   "exchange": "lighter",
   "ticker": "ETH",
   "quantity": 0.01,
-  "take_profit": 0.01,
+  "take_profit": 0.005,
   "max_orders": 40,
   "wait_time": 450,
   "grid_step": -100,
