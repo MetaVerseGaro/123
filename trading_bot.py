@@ -14,6 +14,7 @@ from exchanges import ExchangeFactory
 from helpers import TradingLogger
 from helpers.lark_bot import LarkBot
 from helpers.telegram_bot import TelegramBot
+from helpers.zigzag_tracker import ZigZagTracker, ZigZagEvent
 
 
 @dataclass
@@ -83,6 +84,12 @@ class TradingBot:
         self.shutdown_requested = False
         self.loop = None
         self.stop_loss_triggered = False
+        self.zigzag = None
+        self.zigzag_params = {
+            "depth": int(os.getenv("ZIGZAG_DEPTH", "15")),
+            "deviation_pct": Decimal(os.getenv("ZIGZAG_DEVIATION", "5")),
+            "backstep": int(os.getenv("ZIGZAG_BACKSTEP", "2")),
+        }
 
         # Register order callback
         self._setup_websocket_handlers()
@@ -511,6 +518,14 @@ class TradingBot:
             return stop_trading, pause_trading, stop_loss_triggered, best_bid, best_ask
 
         best_bid, best_ask = await self.exchange_client.fetch_bbo_prices(self.config.contract_id)
+        # Update ZigZag tracker using current best bid/ask
+        if self.zigzag:
+            try:
+                event = self.zigzag.update(Decimal(best_ask), Decimal(best_bid))
+                if event:
+                    self.logger.log(f"[ZIGZAG] {event.label} @ {event.price} dir={event.direction}", "INFO")
+            except Exception as e:
+                self.logger.log(f"[ZIGZAG] update failed: {e}", "WARNING")
         if best_bid <= 0 or best_ask <= 0 or best_bid >= best_ask:
             raise ValueError("No bid/ask data available")
 
@@ -611,6 +626,12 @@ class TradingBot:
         """Main trading loop."""
         try:
             self.config.contract_id, self.config.tick_size = await self.exchange_client.get_contract_attributes()
+            # Initialize ZigZag tracker once tick size is known
+            self.zigzag = ZigZagTracker(
+                depth=self.zigzag_params["depth"],
+                deviation_pct=self.zigzag_params["deviation_pct"],
+                backstep=self.zigzag_params["backstep"],
+            )
 
             # Log current TradingConfig
             self.logger.log("=== Trading Configuration ===", "INFO")
