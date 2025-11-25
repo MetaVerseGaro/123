@@ -1,0 +1,19 @@
+{
+  "env_file": "acc1.env",
+  "exchange": "lighter",
+  "ticker": "ETH",
+  "quantity": 0.01,
+  "take_profit": 0.01,
+  "max_orders": 40,
+  "wait_time": 450,
+  "grid_step": -100,
+  "stop_price": -1,
+  "stop_loss_price": 2761,
+  "pause_price": -1,
+  "direction": "buy",
+  "boost": false,
+  "env": {
+    "LOG_FILE_PREFIX": "botA_",
+    "LOG_RETENTION_DAYS": "1"
+  }
+}
