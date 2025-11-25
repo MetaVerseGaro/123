@@ -59,6 +59,7 @@ class LighterClient(BaseExchangeClient):
         self.orders_cache = {}
         self.current_order_client_id = None
         self.current_order = None
+        self._order_id_seed = int(time.time() * 1000)
 
     def _validate_config(self) -> None:
         """Validate Lighter configuration."""
@@ -257,8 +258,16 @@ class LighterClient(BaseExchangeClient):
             # For now, raise an error if client is not initialized
             raise ValueError("Lighter client not initialized. Call connect() first.")
 
-        # Create order using official SDK
-        create_order, tx_hash, error = await self.lighter_client.create_order(**order_params)
+        try:
+            # Create order using official SDK
+            create_order, tx_hash, error = await self.lighter_client.create_order(**order_params)
+        except Exception as exc:
+            return OrderResult(
+                success=False,
+                order_id=str(order_params.get('client_order_index')),
+                error_message=str(exc)
+            )
+
         if error is not None:
             return OrderResult(
                 success=False, order_id=str(order_params['client_order_index']),
@@ -267,14 +276,41 @@ class LighterClient(BaseExchangeClient):
         else:
             return OrderResult(success=True, order_id=str(order_params['client_order_index']))
 
+    def _generate_client_order_index(self) -> int:
+        """Generate a unique client order index for tracking orders."""
+        self._order_id_seed = (self._order_id_seed + 1) % 1000000
+        return self._order_id_seed
+
+    async def _calculate_post_only_price(self, side: str, desired_price: Optional[Decimal]) -> Decimal:
+        """Calculate a non-marketable (post-only) price based on current BBO and desired price."""
+        best_bid, best_ask = await self.fetch_bbo_prices(self.config.contract_id)
+        tick = self.config.tick_size
+
+        if side.lower() == 'buy':
+            target = desired_price if desired_price is not None else best_bid
+            price = min(target, best_bid - tick)
+            price = self.round_to_tick(max(price, tick))
+            # Ensure we do not cross the ask
+            if price >= best_ask:
+                price = self.round_to_tick(best_bid - tick)
+        elif side.lower() == 'sell':
+            target = desired_price if desired_price is not None else best_ask
+            price = max(target, best_ask + tick)
+            price = self.round_to_tick(price)
+            # Ensure we do not cross the bid
+            if price <= best_bid:
+                price = self.round_to_tick(best_ask + tick)
+        else:
+            raise Exception(f"Invalid side: {side}")
+
+        return price
+
     async def place_limit_order(self, contract_id: str, quantity: Decimal, price: Decimal,
                                 side: str) -> OrderResult:
-        """Place a post only order with Lighter using official SDK."""
-        # Ensure client is initialized
+        """Place a post-only order with retry until it is accepted as maker."""
         if self.lighter_client is None:
             await self._initialize_lighter_client()
 
-        # Determine order side and price
         if side.lower() == 'buy':
             is_ask = False
         elif side.lower() == 'sell':
@@ -282,25 +318,54 @@ class LighterClient(BaseExchangeClient):
         else:
             raise Exception(f"Invalid side: {side}")
 
-        # Generate unique client order index
-        client_order_index = int(time.time() * 1000) % 1000000  # Simple unique ID
-        self.current_order_client_id = client_order_index
+        attempt = 0
+        desired_price = price
 
-        # Create order parameters
-        order_params = {
-            'market_index': self.config.contract_id,
-            'client_order_index': client_order_index,
-            'base_amount': int(quantity * self.base_amount_multiplier),
-            'price': int(price * self.price_multiplier),
-            'is_ask': is_ask,
-            'order_type': self.lighter_client.ORDER_TYPE_LIMIT,
-            'time_in_force': self.lighter_client.ORDER_TIME_IN_FORCE_GOOD_TILL_TIME,
-            'reduce_only': False,
-            'trigger_price': 0,
-        }
+        while True:
+            attempt += 1
+            maker_price = await self._calculate_post_only_price(side, desired_price)
 
-        order_result = await self._submit_order_with_retry(order_params)
-        return order_result
+            client_order_index = self._generate_client_order_index()
+            self.current_order_client_id = client_order_index
+
+            order_params = {
+                'market_index': self.config.contract_id,
+                'client_order_index': client_order_index,
+                'base_amount': int(quantity * self.base_amount_multiplier),
+                'price': int(maker_price * self.price_multiplier),
+                'is_ask': is_ask,
+                'order_type': self.lighter_client.ORDER_TYPE_LIMIT,
+                'time_in_force': self.lighter_client.ORDER_TIME_IN_FORCE_GOOD_TILL_TIME,
+                'reduce_only': False,
+                'trigger_price': 0,
+                'post_only': True,
+            }
+
+            order_result = await self._submit_order_with_retry(order_params)
+            if order_result.success:
+                return OrderResult(
+                    success=True,
+                    order_id=str(client_order_index),
+                    side=side,
+                    size=quantity,
+                    price=maker_price,
+                    status='OPEN'
+                )
+
+            # If post-only rejected (or other error), log and retry with safer price
+            self.logger.log(
+                f"[POST_ONLY] Attempt {attempt} failed ({order_result.error_message}). "
+                f"Retrying with adjusted price.", "WARNING"
+            )
+
+            if side.lower() == 'buy':
+                desired_price = maker_price - self.config.tick_size
+                if desired_price <= 0:
+                    desired_price = maker_price
+            else:
+                desired_price = maker_price + self.config.tick_size
+
+            await asyncio.sleep(0.3)
 
     async def place_open_order(self, contract_id: str, quantity: Decimal, direction: str) -> OrderResult:
         """Place an open order with Lighter using official SDK."""
@@ -328,7 +393,7 @@ class LighterClient(BaseExchangeClient):
             order_id=self.current_order.order_id,
             side=direction,
             size=quantity,
-            price=order_price,
+            price=order_result.price,
             status=self.current_order.status
         )
 
@@ -355,7 +420,7 @@ class LighterClient(BaseExchangeClient):
                 order_id=order_result.order_id,
                 side=side,
                 size=quantity,
-                price=price,
+                price=order_result.price,
                 status='OPEN'
             )
         else:
