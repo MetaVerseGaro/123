@@ -100,6 +100,10 @@ def merge_config(args, cfg: dict):
     set_if_present("pause_price", Decimal)
     if cfg.get("boost") is not None:
         setattr(args, "boost", bool(cfg["boost"]))
+    # Feature toggles to env
+    for k in ("enable_auto_reverse", "enable_dynamic_sl"):
+        if cfg.get(k) is not None:
+            os.environ[k.upper()] = str(cfg[k]).lower()
 
     return args
 
