@@ -502,7 +502,7 @@ class LighterClient(BaseExchangeClient):
         return OrderResult(success=False, order_id=str(client_order_index), error_message="Stop-loss exceeded max retries due to rate limits")
 
     async def cancel_all_orders(self):
-        """Cancel all active orders for current contract."""
+        """Cancel all active orders for current contract only."""
         orders = await self.get_active_orders(self.config.contract_id)
         for order in orders:
             try:
@@ -619,6 +619,15 @@ class LighterClient(BaseExchangeClient):
                 return OrderResult(success=False, error_message='Failed to send cancellation transaction')
 
         return OrderResult(success=False, error_message='Cancel order exceeded max retries due to rate limits')
+
+    async def cancel_all_orders(self):
+        """Cancel all active orders for current contract."""
+        orders = await self.get_active_orders(self.config.contract_id)
+        for order in orders:
+            try:
+                await self.cancel_order(order.order_id)
+            except Exception as e:
+                self.logger.log(f"Failed to cancel order {order.order_id}: {e}", "WARNING")
 
     async def get_order_info(self, order_id: str) -> Optional[OrderInfo]:
         """Get order information from Lighter using official SDK."""
@@ -752,6 +761,7 @@ class LighterClient(BaseExchangeClient):
             raise ValueError("Ticker is empty")
 
         order_api = lighter.OrderApi(self.api_client)
+        candle_api = lighter.CandlestickApi(self.api_client)
         try:
             await self._throttle_rest()
             order_books = await order_api.order_books()
@@ -786,5 +796,23 @@ class LighterClient(BaseExchangeClient):
         except Exception as e:
             if self._is_rate_limit_error(e):
                 self.logger.log(f"[RATE_LIMIT] get_contract_attributes: {e}", "WARNING")
+                await self._handle_rate_limit_backoff()
+            raise
+
+    async def fetch_history_candles(self, limit: int = 200, timeframe: str = "1m"):
+        """Fetch historical candles for warmup (default 200 x 1m)."""
+        candle_api = lighter.CandlestickApi(self.api_client)
+        try:
+            await self._throttle_rest()
+            resp = await candle_api.candlesticks(
+                market_id=self.config.contract_id,
+                interval=timeframe,
+                limit=limit
+            )
+            self._reset_rate_limit_backoff()
+            return resp.candlesticks if resp else []
+        except Exception as e:
+            if self._is_rate_limit_error(e):
+                self.logger.log(f"[RATE_LIMIT] fetch_history_candles: {e}", "WARNING")
                 await self._handle_rate_limit_backoff()
             raise
