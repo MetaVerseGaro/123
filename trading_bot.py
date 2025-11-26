@@ -97,18 +97,22 @@ class TradingBot:
         self.last_confirmed_high: Optional[Decimal] = None
         self.enable_auto_reverse = str(os.getenv("ENABLE_AUTO_REVERSE", "true")).lower() == "true"
         self.enable_dynamic_sl = str(os.getenv("ENABLE_DYNAMIC_SL", "true")).lower() == "true"
+        self.auto_reverse_fast = str(os.getenv("AUTO_REVERSE_FAST", "true")).lower() == "true"
         self.current_sl_order_id: Optional[str] = None
         self.zigzag_current_direction: int = 0
         self.break_buffer_ticks = Decimal(os.getenv("ZIGZAG_BREAK_BUFFER_TICKS", "10"))
+        self.zigzag_timeframe = os.getenv("ZIGZAG_TIMEFRAME", "1m")
+        self.zigzag_warmup_candles = int(os.getenv("ZIGZAG_WARMUP_CANDLES", "200"))
         # Risk control
         self.risk_pct = Decimal(os.getenv("RISK_PCT", "0.5"))
         self.release_timeout_minutes = int(os.getenv("RELEASE_TIMEOUT_MINUTES", "10"))
-        self.stop_new_orders_equity_threshold = Decimal(os.getenv("STOP_NEW_ORDERS_EQUITY_THRESHOLD", "50"))
+        self.stop_new_orders_equity_threshold = Decimal(os.getenv("STOP_NEW_ORDERS_EQUITY_THRESHOLD", "10"))
         self.stop_new_orders = False
         self.last_new_order_time = time.time()
         self.last_release_attempt = 0
         self.last_stop_new_notify = False
         self.zigzag_current_direction: int = 0
+        self.pending_reverse_direction: Optional[str] = None
 
         # Register order callback
         self._setup_websocket_handlers()
@@ -119,6 +123,8 @@ class TradingBot:
         self.shutdown_requested = True
 
         try:
+            # Try to close positions and orders before disconnect
+            await self._close_all_positions_and_orders()
             # Disconnect from exchange
             await self.exchange_client.disconnect()
             self.logger.log("Graceful shutdown completed", "INFO")
@@ -241,11 +247,13 @@ class TradingBot:
         while True:
             best_bid, best_ask = await self.exchange_client.fetch_bbo_prices(self.config.contract_id)
             if close_side == 'sell':
-                desired_price = max(target_price, best_ask)
-                has_better = best_ask > target_price
+                desired_price = max(target_price, best_ask + self.config.tick_size)
+                has_better = desired_price > target_price
             else:
-                desired_price = min(target_price, best_bid)
-                has_better = best_bid < target_price
+                desired_price = min(target_price, best_bid - self.config.tick_size)
+                if desired_price <= 0:
+                    desired_price = target_price
+                has_better = desired_price < target_price
 
             close_order_result = await self.exchange_client.place_close_order(
                 self.config.contract_id,
@@ -381,18 +389,27 @@ class TradingBot:
         current_dir = self.config.direction.lower()
         if self.enable_auto_reverse:
             if current_dir == "buy" and event.label == "LL":
-                await self._reverse_position("sell", event.price)
+                await self._handle_reverse_signal("sell", event.price)
                 return
             if current_dir == "sell" and event.label == "HH":
-                await self._reverse_position("buy", event.price)
+                await self._handle_reverse_signal("buy", event.price)
                 return
 
         # If not reversing, just refresh stop-loss if needed
         if self.enable_dynamic_sl:
             await self._refresh_stop_loss(force=True)
 
+    async def _handle_reverse_signal(self, new_direction: str, pivot_price: Decimal):
+        """Handle reverse signal based on configured mode."""
+        if not self.enable_auto_reverse:
+            return
+        if self.auto_reverse_fast:
+            await self._reverse_position(new_direction, pivot_price)
+        else:
+            await self._schedule_slow_reverse(new_direction, pivot_price)
+
     async def _reverse_position(self, new_direction: str, pivot_price: Decimal):
-        """Reverse position based on ZigZag signal: cancel orders, close current position, set direction, and re-enter."""
+        """Fast reverse: cancel orders, close position, flip direction, re-enter."""
         if self.reversing:
             return
         self.reversing = True
@@ -433,39 +450,48 @@ class TradingBot:
         await self._place_and_monitor_open_order()
         self.reversing = False
 
-    async def _reverse_position(self, new_direction: str, pivot_price: Decimal):
-        """Reverse position based on ZigZag signal: cancel orders, close current position, set direction."""
-        if not self.enable_auto_reverse:
+    async def _schedule_slow_reverse(self, new_direction: str, pivot_price: Decimal):
+        """Slow reverse: stop new entries, cancel TPs, gradually unwind then flip."""
+        self.logger.log(f"[REV-SLOW] Schedule slow reverse to {new_direction.upper()} via ZigZag at {pivot_price}", "WARNING")
+        self.pending_reverse_direction = new_direction
+        self.stop_new_orders = True
+        # Cancel current TP/active orders to avoid new entries
+        try:
+            active_orders = await self.exchange_client.get_active_orders(self.config.contract_id)
+            for order in active_orders:
+                try:
+                    await self.exchange_client.cancel_order(order.order_id)
+                except Exception as e:
+                    self.logger.log(f"[REV-SLOW] Cancel order {order.order_id} failed: {e}", "WARNING")
+        except Exception as e:
+            self.logger.log(f"[REV-SLOW] Fetch active orders failed: {e}", "WARNING")
+
+    async def _perform_slow_unwind(self):
+        """Gradually close current position before flipping direction."""
+        try:
+            pos_signed = await self.exchange_client.get_account_positions()
+        except Exception as e:
+            self.logger.log(f"[REV-SLOW] Failed to fetch position: {e}", "ERROR")
             return
 
-        self.logger.log(f"[REV] Trigger reverse to {new_direction.upper()} via ZigZag at {pivot_price}", "WARNING")
-        # Cancel all existing orders on this contract
-        if hasattr(self.exchange_client, "cancel_all_orders"):
-            try:
-                await self.exchange_client.cancel_all_orders()
-            except Exception as e:
-                self.logger.log(f"[REV] Cancel all orders failed: {e}", "ERROR")
+        pos_abs = abs(pos_signed)
+        if pos_abs == 0:
+            if self.pending_reverse_direction:
+                self.config.direction = self.pending_reverse_direction
+                self.pending_reverse_direction = None
+                self.stop_new_orders = False
+                self.last_open_order_time = 0
+                if self.enable_dynamic_sl:
+                    await self._refresh_stop_loss(force=True)
+            return
 
-        # Close existing position
+        close_side = 'sell' if pos_signed > 0 else 'buy'
+        unwind_qty = min(self.config.quantity, pos_abs)
         try:
-            position_size = abs(await self.exchange_client.get_account_positions())
+            await self.exchange_client.reduce_only_close_with_retry(unwind_qty, close_side)
+            self.last_release_attempt = time.time()
         except Exception as e:
-            self.logger.log(f"[REV] Failed to fetch position: {e}", "ERROR")
-            position_size = Decimal(0)
-
-        if position_size > 0:
-            close_side = 'sell' if new_direction == "buy" else 'buy'
-            try:
-                await self.exchange_client.reduce_only_close_with_retry(position_size, close_side)
-            except Exception as e:
-                self.logger.log(f"[REV] Failed to close existing position: {e}", "ERROR")
-                return
-
-        # Update direction
-        self.config.direction = new_direction
-        # Place new stop-loss after direction change
-        if self.enable_dynamic_sl:
-            await self._refresh_stop_loss(force=True)
+            self.logger.log(f"[REV-SLOW] Unwind attempt failed: {e}", "WARNING")
 
     async def _place_and_monitor_open_order(self) -> bool:
         """Place an order and monitor its execution."""
@@ -666,46 +692,37 @@ class TradingBot:
                 # Check for position mismatch
                 mismatch_detected = False
                 mismatch = position_amt - active_close_amount
-                if abs(mismatch) > (2 * self.config.quantity):
-                    try:
-                        if mismatch > 0:
-                            # Position larger than active close orders: place reduce-only close to trim the excess
-                            if self.config.exchange == "lighter":
-                                close_qty = mismatch
-                                close_side = self.config.close_order_side
-                                self.logger.log(f"Auto-closing excess position {close_qty} via reduce-only post-only", "WARNING")
-                                fix_result = await self.exchange_client.reduce_only_close_with_retry(
-                                    close_qty, close_side, timeout_sec=5.0, max_attempts=5
-                                )
-                                if not fix_result.success:
-                                    raise Exception(f"Reduce-only close failed: {fix_result.error_message}")
-                            else:
-                                self.logger.log("Position > active close; auto-fix not implemented for this exchange", "WARNING")
-                        else:
-                            # Active close orders exceed position: cancel extra close orders
-                            excess = abs(mismatch)
-                            cancelled = Decimal(0)
-                            # Cancel from the end of the list
-                            for order in list(self.active_close_orders):
-                                if cancelled >= excess:
-                                    break
-                                await self.exchange_client.cancel_order(order['id'])
-                                cancelled += Decimal(order.get('size', 0))
-                                self.logger.log(f"Canceled excess close order {order['id']} size {order.get('size')}", "WARNING")
-                    except Exception as fix_err:
-                        self.logger.log(f"Auto-fix for position mismatch failed: {fix_err}", "ERROR")
-                        error_message = f"\n\nERROR: [{self.config.exchange.upper()}_{self.config.ticker.upper()}] "
-                        error_message += "Position mismatch detected\n"
-                        error_message += "###### ERROR ###### ERROR ###### ERROR ###### ERROR #####\n"
-                        error_message += "Please manually rebalance your position and take-profit orders\n"
-                        error_message += "请手动平衡当前仓位和正在关闭的仓位\n"
-                        error_message += f"current position: {position_amt} | active closing amount: {active_close_amount} | "f"Order quantity: {len(self.active_close_orders)}\n"
-                        error_message += "###### ERROR ###### ERROR ###### ERROR ###### ERROR #####\n"
-                        self.logger.log(error_message, "ERROR")
-                        await self.send_notification(error_message.lstrip())
-                        if not self.shutdown_requested:
-                            self.shutdown_requested = True
-                        mismatch_detected = True
+                try:
+                    if mismatch > 0:
+                        # Position larger than active close orders: add reduce-only maker close to trim excess
+                        close_qty = mismatch
+                        close_side = self.config.close_order_side
+                        self.logger.log(f"Auto-closing excess position {close_qty} via reduce-only post-only", "WARNING")
+                        fix_result = await self.exchange_client.reduce_only_close_with_retry(
+                            close_qty, close_side, timeout_sec=5.0, max_attempts=5
+                        )
+                        if not fix_result.success:
+                            raise Exception(f"Reduce-only close failed: {fix_result.error_message}")
+                    elif mismatch < 0:
+                        # Active close orders exceed position: cancel farthest-from-mid until aligned
+                        excess = abs(mismatch)
+                        cancelled = Decimal(0)
+                        # Sort by distance from mid price (farthest first)
+                        sorted_close = sorted(self.active_close_orders, key=lambda o: abs(Decimal(o["price"]) - mid_price), reverse=True)
+                        for order in sorted_close:
+                            if cancelled >= excess:
+                                break
+                            await self.exchange_client.cancel_order(order['id'])
+                            cancelled += Decimal(order.get('size', 0))
+                            self.logger.log(f"Canceled excess close order {order['id']} size {order.get('size')}", "WARNING")
+                except Exception as fix_err:
+                    self.logger.log(f"Auto-fix for position mismatch failed: {fix_err}", "ERROR")
+                    error_message = f"\n\nERROR: [{self.config.exchange.upper()}_{self.config.ticker.upper()}] "
+                    error_message += "Position mismatch detected, auto-fix failed\n"
+                    error_message += f"current position: {position_amt} | active closing amount: {active_close_amount} | "f"Order quantity: {len(self.active_close_orders)}\n"
+                    self.logger.log(error_message, "ERROR")
+                    await self.send_notification(error_message.lstrip())
+                    mismatch_detected = True
 
                 # Risk gating: stop new orders if equity < threshold
                 if equity < self.stop_new_orders_equity_threshold:
@@ -749,16 +766,15 @@ class TradingBot:
                         self.stop_new_orders = False
                         self.last_stop_new_notify = False
 
-                # If stop-new-orders flag is active, attempt release after timeout by freeing position
-                if self.stop_new_orders:
+                # Release liquidity either when stop-new-orders is active or when长时间未开新仓
+                should_release = self.stop_new_orders or (time.time() - self.last_new_order_time > self.release_timeout_minutes * 60)
+                if should_release:
                     if time.time() - self.last_release_attempt > self.release_timeout_minutes * 60:
                         self.last_release_attempt = time.time()
-                        # Release: cancel far TP and close small portion to free margin
                         try:
                             active_orders = await self.exchange_client.get_active_orders(self.config.contract_id)
                             for order in active_orders:
                                 await self.exchange_client.cancel_order(order.order_id)
-                            # Close small portion reduce-only to free space
                             release_qty = min(self.config.quantity, position_amt)
                             if release_qty > 0:
                                 close_side = self.config.close_order_side
@@ -840,11 +856,11 @@ class TradingBot:
             buffer = self.break_buffer_ticks * self.config.tick_size
             if self.last_confirmed_high is not None and best_ask >= (self.last_confirmed_high + buffer):
                 if self.config.direction == "sell":
-                    await self._reverse_position("buy", Decimal(best_ask))
+                    await self._handle_reverse_signal("buy", Decimal(best_ask))
                     return stop_trading, pause_trading, stop_loss_triggered, best_bid, best_ask
             if self.last_confirmed_low is not None and best_bid <= (self.last_confirmed_low - buffer):
                 if self.config.direction == "buy":
-                    await self._reverse_position("sell", Decimal(best_bid))
+                    await self._handle_reverse_signal("sell", Decimal(best_bid))
                     return stop_trading, pause_trading, stop_loss_triggered, best_bid, best_ask
 
         if self.config.stop_price != -1:
@@ -947,7 +963,10 @@ class TradingBot:
             # Warmup ZigZag with history candles (lighter only)
             if self.config.exchange == "lighter" and hasattr(self.exchange_client, "fetch_history_candles"):
                 try:
-                    candles = await self.exchange_client.fetch_history_candles(limit=200, timeframe="1m")
+                    candles = await self.exchange_client.fetch_history_candles(
+                        limit=self.zigzag_warmup_candles,
+                        timeframe=self.zigzag_timeframe
+                    )
                     for c in candles:
                         high = Decimal(str(c.high))
                         low = Decimal(str(c.low))
@@ -987,6 +1006,12 @@ class TradingBot:
 
             # Main trading loop
             while not self.shutdown_requested:
+                # Handle pending slow reverse before normal flow
+                if self.pending_reverse_direction:
+                    await self._perform_slow_unwind()
+                    await asyncio.sleep(max(self.config.wait_time, 1))
+                    continue
+
                 # Update active orders
                 active_orders = await self.exchange_client.get_active_orders(self.config.contract_id)
 
