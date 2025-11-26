@@ -51,14 +51,14 @@ def parse_arguments():
     parser.add_argument('--stop-price', type=Decimal, default=-1,
                         help='Price to stop trading and exit. Buy: exits if price >= stop-price.'
                         'Sell: exits if price <= stop-price. (default: -1, no stop)')
-    parser.add_argument('--stop-loss-price', type=Decimal, default=-1,
-                        help='Fixed price stop-loss. Buy: close all if price <= stop-loss-price. '
-                        'Sell: close all if price >= stop-loss-price. (default: -1, disabled)')
     parser.add_argument('--pause-price', type=Decimal, default=-1,
                         help='Pause trading and wait. Buy: pause if price >= pause-price.'
                         'Sell: pause if price <= pause-price. (default: -1, no pause)')
     parser.add_argument('--boost', action='store_true',
                         help='Use the Boost mode for volume boosting')
+    # Optional min order size; typically set via config JSON
+    parser.add_argument('--min-order-size', dest='min_order_size', type=Decimal, default=None,
+                        help='Minimal order size for this market (override config if set)')
 
     return parser.parse_args()
 
@@ -114,8 +114,8 @@ def merge_config(args, cfg: dict):
     set_from(cfg, "env_file", str)
     set_from(trading, "grid_step", Decimal)
     set_from(trading, "stop_price", Decimal)
-    set_from(trading, "stop_loss_price", Decimal)
     set_from(trading, "pause_price", Decimal)
+    set_from(trading, "min_order_size", Decimal, target="min_order_size")
     if "boost" in trading:
         setattr(args, "boost", bool(trading["boost"]))
     # Feature toggles to env
@@ -145,6 +145,20 @@ def merge_config(args, cfg: dict):
         os.environ["RELEASE_TIMEOUT_MINUTES"] = str(risk["release_timeout_minutes"])
     if risk.get("stop_new_orders_equity_threshold") is not None:
         os.environ["STOP_NEW_ORDERS_EQUITY_THRESHOLD"] = str(risk["stop_new_orders_equity_threshold"])
+    if risk.get("enable_advanced_risk") is not None:
+        setattr(args, "enable_advanced_risk", bool(risk["enable_advanced_risk"]))
+    if risk.get("enable_basic_risk") is not None:
+        setattr(args, "enable_basic_risk", bool(risk["enable_basic_risk"]))
+    if risk.get("max_position_count") is not None:
+        setattr(args, "max_position_count", int(risk["max_position_count"]))
+    if risk.get("basic_release_timeout_minutes") is not None:
+        setattr(args, "basic_release_timeout_minutes", int(risk["basic_release_timeout_minutes"]))
+    # Notifications
+    notify = cfg.get("notifications", {})
+    if notify.get("enable_notifications") is not None:
+        os.environ["ENABLE_NOTIFICATIONS"] = str(notify["enable_notifications"]).lower()
+    if notify.get("daily_pnl_report") is not None:
+        os.environ["DAILY_PNL_REPORT"] = str(notify["daily_pnl_report"]).lower()
 
     return args
 
@@ -218,9 +232,13 @@ async def main():
         exchange=args.exchange.lower(),
         grid_step=Decimal(args.grid_step),
         stop_price=Decimal(args.stop_price),
-        stop_loss_price=Decimal(args.stop_loss_price),
         pause_price=Decimal(args.pause_price),
-        boost_mode=args.boost
+        boost_mode=args.boost,
+        min_order_size=getattr(args, "min_order_size", None),
+        max_position_count=getattr(args, "max_position_count", 0),
+        basic_release_timeout_minutes=getattr(args, "basic_release_timeout_minutes", 0),
+        enable_advanced_risk=getattr(args, "enable_advanced_risk", True),
+        enable_basic_risk=getattr(args, "enable_basic_risk", True)
     )
 
     # Create and run the bot
