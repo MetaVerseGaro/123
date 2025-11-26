@@ -98,6 +98,7 @@ class TradingBot:
         self.last_confirmed_high: Optional[Decimal] = None
         self.enable_auto_reverse = str(os.getenv("ENABLE_AUTO_REVERSE", "true")).lower() == "true"
         self.enable_dynamic_sl = str(os.getenv("ENABLE_DYNAMIC_SL", "true")).lower() == "true"
+        self.enable_zigzag = str(os.getenv("ENABLE_ZIGZAG", "true")).lower() == "true"
         self.auto_reverse_fast = str(os.getenv("AUTO_REVERSE_FAST", "true")).lower() == "true"
         self.current_sl_order_id: Optional[str] = None
         self.zigzag_current_direction: int = 0
@@ -118,6 +119,8 @@ class TradingBot:
         self.last_stop_new_notify = False
         self.zigzag_current_direction: int = 0
         self.pending_reverse_direction: Optional[str] = None
+        self.pending_reverse_state: Optional[str] = None  # None | waiting_next_pivot | unwinding
+        self.pending_original_direction: Optional[str] = None
 
         # Register order callback
         self._setup_websocket_handlers()
@@ -273,12 +276,21 @@ class TradingBot:
                     desired_price = target_price
                 has_better = desired_price < target_price
 
-            close_order_result = await self.exchange_client.place_close_order(
-                self.config.contract_id,
-                quantity,
-                desired_price,
-                close_side
-            )
+            place_fn = getattr(self.exchange_client, "place_tp_order", None)
+            if place_fn:
+                close_order_result = await place_fn(
+                    self.config.contract_id,
+                    quantity,
+                    desired_price,
+                    close_side
+                )
+            else:
+                close_order_result = await self.exchange_client.place_close_order(
+                    self.config.contract_id,
+                    quantity,
+                    desired_price,
+                    close_side
+                )
             if not close_order_result.success:
                 raise Exception(f"[CLOSE] Failed to place close order: {close_order_result.error_message}")
 
@@ -403,6 +415,12 @@ class TradingBot:
         """Handle ZigZag pivot events: update pivots, dynamic SL, and optional auto-reverse."""
         self._update_confirmed_pivots(event)
 
+        # Slow reverse follow-up handling
+        if self.pending_reverse_state:
+            handled = await self._process_slow_reverse_followup(event)
+            if handled:
+                return
+
         # Reverse conditions: short -> HH triggers long; long -> LL triggers short
         current_dir = self.config.direction.lower()
         if self.enable_auto_reverse:
@@ -469,20 +487,59 @@ class TradingBot:
         self.reversing = False
 
     async def _schedule_slow_reverse(self, new_direction: str, pivot_price: Decimal):
-        """Slow reverse: stop new entries, cancel TPs, gradually unwind then flip."""
-        self.logger.log(f"[REV-SLOW] Schedule slow reverse to {new_direction.upper()} via ZigZag at {pivot_price}", "WARNING")
+        """Slow reverse: pause new opens, observe next pivot before acting."""
+        self.logger.log(f"[REV-SLOW] Observe next pivot for potential reverse to {new_direction.upper()} via ZigZag at {pivot_price}", "WARNING")
         self.pending_reverse_direction = new_direction
-        self.stop_new_orders = True
-        # Cancel current TP/active orders to avoid new entries
+        self.pending_reverse_state = "waiting_next_pivot"
+        self.pending_original_direction = self.config.direction
+        self.stop_new_orders = True  # 暂停新开仓，保留现有 TP
+
+    async def _cancel_close_orders(self):
+        """Cancel existing close/TP orders."""
         try:
             active_orders = await self.exchange_client.get_active_orders(self.config.contract_id)
             for order in active_orders:
-                try:
-                    await self.exchange_client.cancel_order(order.order_id)
-                except Exception as e:
-                    self.logger.log(f"[REV-SLOW] Cancel order {order.order_id} failed: {e}", "WARNING")
+                if order.side == self.config.close_order_side:
+                    try:
+                        await self.exchange_client.cancel_order(order.order_id)
+                    except Exception as e:
+                        self.logger.log(f"[REV-SLOW] Cancel close order {order.order_id} failed: {e}", "WARNING")
         except Exception as e:
             self.logger.log(f"[REV-SLOW] Fetch active orders failed: {e}", "WARNING")
+
+    async def _resume_after_invalid_reverse(self):
+        """Resume original direction when slow reverse is invalidated."""
+        self.pending_reverse_direction = None
+        self.pending_reverse_state = None
+        self.pending_original_direction = None
+        self.stop_new_orders = False
+
+    async def _process_slow_reverse_followup(self, event: ZigZagEvent) -> bool:
+        """Process next pivot for slow reverse logic. Returns True if handled."""
+        if self.pending_reverse_state != "waiting_next_pivot":
+            return False
+
+        # If pending reverse to sell (current long broke low)
+        if self.pending_reverse_direction == "sell":
+            if event.label == "LH":
+                await self._cancel_close_orders()
+                self.pending_reverse_state = "unwinding"
+                return True
+            if event.label == "HH":
+                await self._resume_after_invalid_reverse()
+                return True
+
+        # If pending reverse to buy (current short broke high)
+        if self.pending_reverse_direction == "buy":
+            if event.label == "HL":
+                await self._cancel_close_orders()
+                self.pending_reverse_state = "unwinding"
+                return True
+            if event.label == "LL":
+                await self._resume_after_invalid_reverse()
+                return True
+
+        return False
 
     async def _perform_slow_unwind(self):
         """Gradually close current position before flipping direction."""
@@ -497,6 +554,8 @@ class TradingBot:
             if self.pending_reverse_direction:
                 self.config.direction = self.pending_reverse_direction
                 self.pending_reverse_direction = None
+                self.pending_reverse_state = None
+                self.pending_original_direction = None
                 self.stop_new_orders = False
                 self.last_open_order_time = 0
                 if self.enable_dynamic_sl:
@@ -515,8 +574,8 @@ class TradingBot:
         """Place an order and monitor its execution."""
         try:
             # Risk gate: stop new orders when flag is set
-            if self.stop_new_orders:
-                return False
+        if self.stop_new_orders:
+            return False
             # Reset state before placing order
             self.order_filled_event.clear()
             self.current_order_status = 'OPEN'
@@ -847,7 +906,7 @@ class TradingBot:
 
         best_bid, best_ask = await self.exchange_client.fetch_bbo_prices(self.config.contract_id)
         # Update ZigZag tracker using current best bid/ask
-        if self.zigzag and self.zigzag_timeframe_sec > 0:
+        if self.enable_zigzag and self.zigzag and self.zigzag_timeframe_sec > 0:
             try:
                 now = time.time()
                 # Initialize candle bucket
@@ -891,7 +950,7 @@ class TradingBot:
             elif self.config.direction == "sell" and best_ask >= self.config.stop_loss_price:
                 stop_loss_triggered = True
         # Immediate reverse on break of confirmed high/low (± buffer ticks)
-        if self.enable_auto_reverse:
+        if self.enable_zigzag and self.enable_auto_reverse:
             buffer = self.break_buffer_ticks * self.config.tick_size
             if self.last_confirmed_high is not None and best_ask >= (self.last_confirmed_high + buffer):
                 if self.config.direction == "sell":
@@ -994,29 +1053,30 @@ class TradingBot:
         try:
             self.config.contract_id, self.config.tick_size = await self.exchange_client.get_contract_attributes()
             # Initialize ZigZag tracker once tick size is known
-            self.zigzag = ZigZagTracker(
-                depth=self.zigzag_params["depth"],
-                deviation_pct=self.zigzag_params["deviation_pct"],
-                backstep=self.zigzag_params["backstep"],
-            )
-            # Warmup ZigZag with history candles (lighter only)
-            if self.config.exchange == "lighter" and hasattr(self.exchange_client, "fetch_history_candles"):
-                try:
-                    candles = await self.exchange_client.fetch_history_candles(
-                        limit=self.zigzag_warmup_candles,
-                        timeframe=self.zigzag_timeframe
-                    )
-                    for c in candles:
-                        high = Decimal(str(c.high))
-                        low = Decimal(str(c.low))
-                        evt = self.zigzag.update(high, low, ts=getattr(c, "open_time", None))
-                        if evt:
-                            self._update_confirmed_pivots(evt)
-                    # After warmup, dynamic stop price based on confirmed pivots
-                    if self.enable_dynamic_sl:
-                        await self._refresh_stop_loss(force=True)
-                except Exception as e:
-                    self.logger.log(f"[ZIGZAG] Warmup failed: {e}", "WARNING")
+            if self.enable_zigzag:
+                self.zigzag = ZigZagTracker(
+                    depth=self.zigzag_params["depth"],
+                    deviation_pct=self.zigzag_params["deviation_pct"],
+                    backstep=self.zigzag_params["backstep"],
+                )
+                # Warmup ZigZag with history candles (lighter only)
+                if self.config.exchange == "lighter" and hasattr(self.exchange_client, "fetch_history_candles"):
+                    try:
+                        candles = await self.exchange_client.fetch_history_candles(
+                            limit=self.zigzag_warmup_candles,
+                            timeframe=self.zigzag_timeframe
+                        )
+                        for c in candles:
+                            high = Decimal(str(c.high))
+                            low = Decimal(str(c.low))
+                            evt = self.zigzag.update(high, low, ts=getattr(c, "open_time", None))
+                            if evt:
+                                self._update_confirmed_pivots(evt)
+                        # After warmup, dynamic stop price based on confirmed pivots
+                        if self.enable_dynamic_sl:
+                            await self._refresh_stop_loss(force=True)
+                    except Exception as e:
+                        self.logger.log(f"[ZIGZAG] Warmup failed: {e}", "WARNING")
 
             # Log current TradingConfig
             self.logger.log("=== Trading Configuration ===", "INFO")
@@ -1046,7 +1106,7 @@ class TradingBot:
             # Main trading loop
             while not self.shutdown_requested:
                 # Handle pending slow reverse before normal flow
-                if self.pending_reverse_direction:
+                if self.pending_reverse_state == "unwinding":
                     await self._perform_slow_unwind()
                     await asyncio.sleep(max(self.config.wait_time, 1))
                     continue
