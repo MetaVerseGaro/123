@@ -591,8 +591,8 @@ class LighterClient(BaseExchangeClient):
             raise Exception(f"[CLOSE] Error placing order: {order_result.error_message}")
 
     async def place_tp_order(self, contract_id: str, quantity: Decimal, price: Decimal, side: str) -> OrderResult:
-        """Place a TP order (post-only, non reduce-only)."""
-        return await self.place_close_order(contract_id, quantity, price, side, reduce_only=False)
+        """Place a TP order (post-only, reduce-only 避免加仓)."""
+        return await self.place_close_order(contract_id, quantity, price, side, reduce_only=True)
     
     async def get_order_price(self, side: str = '') -> Decimal:
         """Get the price of an order with Lighter using official SDK."""
@@ -806,6 +806,51 @@ class LighterClient(BaseExchangeClient):
                 await self._handle_rate_limit_backoff()
             raise
 
+    async def get_account_pnl(self) -> Optional[Decimal]:
+        """Get account PnL using official SDK."""
+        try:
+            account_api = lighter.AccountApi(self.api_client)
+            await self._throttle_rest()
+            # lighter API requires resolution/start/end/count_back
+            now_ms = int(time.time() * 1000)
+            # 拉取最近 1 天的 PnL 曲线，取最新值
+            one_day_ms = 24 * 60 * 60 * 1000
+            start_ts = now_ms - one_day_ms
+            resp = await account_api.account_pn_l(
+                by="index",
+                value=str(self.account_index),
+                resolution="1d",
+                start_timestamp=start_ts,
+                end_timestamp=now_ms,
+                count_back=1,
+            )
+            self._reset_rate_limit_backoff()
+            if resp and hasattr(resp, "pnl"):
+                return Decimal(str(resp.pnl))
+        except Exception as e:
+            if self._is_rate_limit_error(e):
+                self.logger.log(f"[RATE_LIMIT] get_account_pnl: {e}", "WARNING")
+                await self._handle_rate_limit_backoff()
+            else:
+                self.logger.log(f"Error get_account_pnl: {e}", "WARNING")
+        return None
+
+    async def get_account_daily_return(self) -> Optional[Decimal]:
+        """Get latest daily return if available."""
+        try:
+            account_api = lighter.AccountApi(self.api_client)
+            await self._throttle_rest()
+            resp = await account_api.account(by="index", value=str(self.account_index))
+            self._reset_rate_limit_backoff()
+            # daily_return is not directly exposed; placeholder for future extension
+        except Exception as e:
+            if self._is_rate_limit_error(e):
+                self.logger.log(f"[RATE_LIMIT] get_account_daily_return: {e}", "WARNING")
+                await self._handle_rate_limit_backoff()
+            else:
+                self.logger.log(f"Error get_account_daily_return: {e}", "WARNING")
+        return None
+
     async def get_available_balance(self) -> Optional[Decimal]:
         """Get available_balance from account data if present."""
         account_api = lighter.AccountApi(self.api_client)
@@ -874,10 +919,23 @@ class LighterClient(BaseExchangeClient):
         candle_api = lighter.CandlestickApi(self.api_client)
         try:
             await self._throttle_rest()
+            now_ms = int(time.time() * 1000)
+            # timeframe 转秒，按 limit 计算开始时间
+            tf_sec = 60
+            if timeframe.endswith("h"):
+                tf_sec = int(timeframe[:-1]) * 3600
+            elif timeframe.endswith("m"):
+                tf_sec = int(timeframe[:-1]) * 60
+            elif timeframe.endswith("s"):
+                tf_sec = int(timeframe[:-1])
+            start_ms = now_ms - limit * tf_sec * 1000
             resp = await candle_api.candlesticks(
                 market_id=self.config.contract_id,
-                interval=timeframe,
-                limit=limit
+                resolution=timeframe,
+                start_timestamp=start_ms,
+                end_timestamp=now_ms,
+                count_back=limit,
+                set_timestamp_to_end=True,
             )
             self._reset_rate_limit_backoff()
             return resp.candlesticks if resp else []
