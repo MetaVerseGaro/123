@@ -67,7 +67,20 @@ def load_config(config_path: str) -> dict:
     """Load JSON config from file."""
     try:
         with open(config_path, 'r', encoding='utf-8') as f:
-            return json.load(f)
+            raw = f.readlines()
+        # 支持行内 # 注释（非 JSON 标准）
+        cleaned_lines = []
+        for line in raw:
+            in_str = False
+            new_line = ""
+            for ch in line:
+                if ch == '"' and (not new_line or new_line[-1] != '\\'):
+                    in_str = not in_str
+                if ch == '#' and not in_str:
+                    break
+                new_line += ch
+            cleaned_lines.append(new_line)
+        return json.loads("\n".join(cleaned_lines))
     except Exception as e:
         print(f"Failed to load config file {config_path}: {e}")
         sys.exit(1)
@@ -82,41 +95,56 @@ def merge_config(args, cfg: dict):
     for key, val in cfg.get("env", {}).items():
         os.environ[str(key)] = str(val)
 
-    def set_if_present(field, transform=lambda x: x):
-        if field in cfg and cfg[field] is not None:
-            setattr(args, field.replace('-', '_'), transform(cfg[field]))
+    trading = cfg.get("trading", {})
+    # 兼容旧版扁平配置
+    flat = cfg
 
-    set_if_present("exchange", str)
-    set_if_present("ticker", str)
-    set_if_present("quantity", Decimal)
-    set_if_present("take_profit", Decimal)
-    set_if_present("direction", str)
-    set_if_present("max_orders", int)
-    set_if_present("wait_time", int)
-    set_if_present("env_file", str)
-    set_if_present("grid_step", Decimal)
-    set_if_present("stop_price", Decimal)
-    set_if_present("stop_loss_price", Decimal)
-    set_if_present("pause_price", Decimal)
-    if cfg.get("boost") is not None:
-        setattr(args, "boost", bool(cfg["boost"]))
+    def set_from(section, key, transform=lambda x: x, target=None):
+        data = section if key in section else flat
+        if key in data and data[key] is not None:
+            setattr(args, target or key.replace('-', '_'), transform(data[key]))
+
+    set_from(cfg, "exchange", str)
+    set_from(trading, "ticker", str)
+    set_from(trading, "direction", str)
+    set_from(trading, "quantity", Decimal)
+    set_from(trading, "take_profit", Decimal)
+    set_from(trading, "max_orders", int)
+    set_from(trading, "wait_time", int)
+    set_from(cfg, "env_file", str)
+    set_from(trading, "grid_step", Decimal)
+    set_from(trading, "stop_price", Decimal)
+    set_from(trading, "stop_loss_price", Decimal)
+    set_from(trading, "pause_price", Decimal)
+    if "boost" in trading:
+        setattr(args, "boost", bool(trading["boost"]))
     # Feature toggles to env
-    for k in ("enable_auto_reverse", "enable_dynamic_sl"):
-        if cfg.get(k) is not None:
-            os.environ[k.upper()] = str(cfg[k]).lower()
+    zig = cfg.get("zigzag", {})
+    flags = cfg.get("flags", {})
+    for key in ("enable_auto_reverse", "enable_dynamic_sl", "enable_zigzag", "auto_reverse_fast"):
+        val = zig.get(key, flat.get(key, flags.get(key)))
+        if val is not None:
+            os.environ[key.upper()] = str(val).lower()
+    if zig.get("break_buffer_ticks") is not None:
+        os.environ["ZIGZAG_BREAK_BUFFER_TICKS"] = str(zig["break_buffer_ticks"])
+    if zig.get("zigzag_depth") is not None:
+        os.environ["ZIGZAG_DEPTH"] = str(zig["zigzag_depth"])
+    if zig.get("zigzag_deviation") is not None:
+        os.environ["ZIGZAG_DEVIATION"] = str(zig["zigzag_deviation"])
+    if zig.get("zigzag_backstep") is not None:
+        os.environ["ZIGZAG_BACKSTEP"] = str(zig["zigzag_backstep"])
+    if zig.get("zigzag_timeframe") is not None:
+        os.environ["ZIGZAG_TIMEFRAME"] = str(zig["zigzag_timeframe"])
+    if zig.get("zigzag_warmup_candles") is not None:
+        os.environ["ZIGZAG_WARMUP_CANDLES"] = str(zig["zigzag_warmup_candles"])
     # Risk control env
-    if cfg.get("risk_pct") is not None:
-        os.environ["RISK_PCT"] = str(cfg["risk_pct"])
-    if cfg.get("release_timeout_minutes") is not None:
-        os.environ["RELEASE_TIMEOUT_MINUTES"] = str(cfg["release_timeout_minutes"])
-    if cfg.get("stop_new_orders_equity_threshold") is not None:
-        os.environ["STOP_NEW_ORDERS_EQUITY_THRESHOLD"] = str(cfg["stop_new_orders_equity_threshold"])
-    if cfg.get("auto_reverse_fast") is not None:
-        os.environ["AUTO_REVERSE_FAST"] = str(cfg["auto_reverse_fast"]).lower()
-    if cfg.get("zigzag_timeframe") is not None:
-        os.environ["ZIGZAG_TIMEFRAME"] = str(cfg["zigzag_timeframe"])
-    if cfg.get("zigzag_warmup_candles") is not None:
-        os.environ["ZIGZAG_WARMUP_CANDLES"] = str(cfg["zigzag_warmup_candles"])
+    risk = cfg.get("risk", {})
+    if risk.get("risk_pct") is not None:
+        os.environ["RISK_PCT"] = str(risk["risk_pct"])
+    if risk.get("release_timeout_minutes") is not None:
+        os.environ["RELEASE_TIMEOUT_MINUTES"] = str(risk["release_timeout_minutes"])
+    if risk.get("stop_new_orders_equity_threshold") is not None:
+        os.environ["STOP_NEW_ORDERS_EQUITY_THRESHOLD"] = str(risk["stop_new_orders_equity_threshold"])
 
     return args
 
