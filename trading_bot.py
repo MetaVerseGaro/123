@@ -9,6 +9,7 @@ import traceback
 from dataclasses import dataclass
 from decimal import Decimal
 from typing import Optional
+from collections import deque
 
 from exchanges import ExchangeFactory
 from helpers import TradingLogger
@@ -103,6 +104,10 @@ class TradingBot:
         self.break_buffer_ticks = Decimal(os.getenv("ZIGZAG_BREAK_BUFFER_TICKS", "10"))
         self.zigzag_timeframe = os.getenv("ZIGZAG_TIMEFRAME", "1m")
         self.zigzag_warmup_candles = int(os.getenv("ZIGZAG_WARMUP_CANDLES", "200"))
+        self.zigzag_timeframe_sec = self._parse_timeframe_to_seconds(self.zigzag_timeframe)
+        self._zz_period_start: Optional[float] = None
+        self._zz_high: Optional[Decimal] = None
+        self._zz_low: Optional[Decimal] = None
         # Risk control
         self.risk_pct = Decimal(os.getenv("RISK_PCT", "0.5"))
         self.release_timeout_minutes = int(os.getenv("RELEASE_TIMEOUT_MINUTES", "10"))
@@ -116,6 +121,19 @@ class TradingBot:
 
         # Register order callback
         self._setup_websocket_handlers()
+
+    def _parse_timeframe_to_seconds(self, tf: str) -> int:
+        """Convert timeframe string like '1m','5m','1h' to seconds."""
+        try:
+            if tf.endswith("m"):
+                return int(tf[:-1]) * 60
+            if tf.endswith("h"):
+                return int(tf[:-1]) * 3600
+            if tf.endswith("s"):
+                return int(tf[:-1])
+            return int(tf)
+        except Exception:
+            return 60
 
     async def graceful_shutdown(self, reason: str = "Unknown"):
         """Perform graceful shutdown of the trading bot."""
@@ -829,13 +847,34 @@ class TradingBot:
 
         best_bid, best_ask = await self.exchange_client.fetch_bbo_prices(self.config.contract_id)
         # Update ZigZag tracker using current best bid/ask
-        if self.zigzag:
+        if self.zigzag and self.zigzag_timeframe_sec > 0:
             try:
-                event = self.zigzag.update(Decimal(best_ask), Decimal(best_bid))
-                if event:
-                    self.logger.log(f"[ZIGZAG] {event.label} @ {event.price} dir={event.direction}", "INFO")
-                    self.zigzag_current_direction = event.direction
-                    await self._handle_zigzag_event(event)
+                now = time.time()
+                # Initialize candle bucket
+                if self._zz_period_start is None:
+                    self._zz_period_start = int(now // self.zigzag_timeframe_sec) * self.zigzag_timeframe_sec
+                    self._zz_high = Decimal(best_ask)
+                    self._zz_low = Decimal(best_bid)
+                else:
+                    # New period?
+                    if now >= self._zz_period_start + self.zigzag_timeframe_sec:
+                        # Emit previous period
+                        if self._zz_high is not None and self._zz_low is not None:
+                            event = self.zigzag.update(self._zz_high, self._zz_low, ts=self._zz_period_start)
+                            if event:
+                                self.logger.log(f"[ZIGZAG] {event.label} @ {event.price} dir={event.direction}", "INFO")
+                                self.zigzag_current_direction = event.direction
+                                await self._handle_zigzag_event(event)
+                        # reset period
+                        self._zz_period_start = int(now // self.zigzag_timeframe_sec) * self.zigzag_timeframe_sec
+                        self._zz_high = Decimal(best_ask)
+                        self._zz_low = Decimal(best_bid)
+                    else:
+                        # update high/low within bucket
+                        if self._zz_high is None or Decimal(best_ask) > self._zz_high:
+                            self._zz_high = Decimal(best_ask)
+                        if self._zz_low is None or Decimal(best_bid) < self._zz_low:
+                            self._zz_low = Decimal(best_bid)
             except Exception as e:
                 self.logger.log(f"[ZIGZAG] update failed: {e}", "WARNING")
         if best_bid <= 0 or best_ask <= 0 or best_bid >= best_ask:
