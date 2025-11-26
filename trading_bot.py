@@ -32,9 +32,14 @@ class TradingConfig:
     exchange: str
     grid_step: Decimal
     stop_price: Decimal
-    stop_loss_price: Decimal
     pause_price: Decimal
     boost_mode: bool
+    min_order_size: Optional[Decimal] = None
+    max_position_count: int = 0
+    basic_release_timeout_minutes: int = 0
+    enable_advanced_risk: bool = True
+    enable_basic_risk: bool = True
+    min_order_size: Optional[Decimal] = None
 
     @property
     def close_order_side(self) -> str:
@@ -100,6 +105,8 @@ class TradingBot:
         self.enable_dynamic_sl = str(os.getenv("ENABLE_DYNAMIC_SL", "true")).lower() == "true"
         self.enable_zigzag = str(os.getenv("ENABLE_ZIGZAG", "true")).lower() == "true"
         self.auto_reverse_fast = str(os.getenv("AUTO_REVERSE_FAST", "true")).lower() == "true"
+        self.enable_notifications = str(os.getenv("ENABLE_NOTIFICATIONS", "false")).lower() == "true"
+        self.daily_pnl_report = str(os.getenv("DAILY_PNL_REPORT", "false")).lower() == "true"
         self.current_sl_order_id: Optional[str] = None
         self.zigzag_current_direction: int = 0
         self.break_buffer_ticks = Decimal(os.getenv("ZIGZAG_BREAK_BUFFER_TICKS", "10"))
@@ -112,15 +119,32 @@ class TradingBot:
         # Risk control
         self.risk_pct = Decimal(os.getenv("RISK_PCT", "0.5"))
         self.release_timeout_minutes = int(os.getenv("RELEASE_TIMEOUT_MINUTES", "10"))
-        self.stop_new_orders_equity_threshold = Decimal(os.getenv("STOP_NEW_ORDERS_EQUITY_THRESHOLD", "10"))
+        self.basic_release_timeout_minutes = getattr(config, "basic_release_timeout_minutes", 0) or 0
+        self.stop_new_orders_equity_threshold = Decimal(os.getenv("STOP_NEW_ORDERS_EQUITY_THRESHOLD", "50"))
         self.stop_new_orders = False
         self.last_new_order_time = time.time()
         self.last_release_attempt = 0
         self.last_stop_new_notify = False
-        self.zigzag_current_direction: int = 0
         self.pending_reverse_direction: Optional[str] = None
         self.pending_reverse_state: Optional[str] = None  # None | waiting_next_pivot | unwinding
         self.pending_original_direction: Optional[str] = None
+        self.last_daily_pnl_date: Optional[str] = None
+        self.daily_pnl_baseline: Optional[Decimal] = None
+        self.last_daily_sent_date: Optional[str] = None
+        cfg_adv_risk = getattr(config, "enable_advanced_risk", None)
+        cfg_basic_risk = getattr(config, "enable_basic_risk", None)
+        self.enable_advanced_risk = (str(cfg_adv_risk).lower() == "true") if cfg_adv_risk is not None else str(os.getenv("ENABLE_ADVANCED_RISK", "true")).lower() == "true"
+        self.enable_basic_risk = (str(cfg_basic_risk).lower() == "true") if cfg_basic_risk is not None else True
+        # 交易所/交易对最小下单量：优先配置文件，其次 ENV 覆盖
+        try:
+            cfg_min = config.min_order_size if getattr(config, "min_order_size", None) not in (None, 0) else None
+            env_min = Decimal(os.getenv("MIN_ORDER_SIZE", "0.005"))
+            self.min_order_size = Decimal(cfg_min) if cfg_min is not None else env_min
+        except Exception:
+            self.min_order_size = Decimal("0.005")
+        # 基础风险最大持仓量 = quantity * max_position_count
+        self.max_position_count = int(getattr(config, "max_position_count", 0) or 0)
+        self.max_position_limit = (self.config.quantity * self.max_position_count) if self.max_position_count > 0 else None
 
         # Register order callback
         self._setup_websocket_handlers()
@@ -149,6 +173,8 @@ class TradingBot:
             # Disconnect from exchange
             await self.exchange_client.disconnect()
             self.logger.log("Graceful shutdown completed", "INFO")
+            if self.enable_notifications:
+                await self.send_notification(f"[STOP] Bot stopped. Reason: {reason}")
 
         except Exception as e:
             self.logger.log(f"Error during graceful shutdown: {e}", "ERROR")
@@ -244,6 +270,61 @@ class TradingBot:
             return 0
         else:
             return 1
+
+    async def _get_equity_snapshot(self) -> Optional[Decimal]:
+        """Fetch equity with fallbacks."""
+        equity = None
+        if hasattr(self.exchange_client, "get_account_equity"):
+            try:
+                equity = await self.exchange_client.get_account_equity()
+            except Exception as e:
+                self.logger.log(f"[RISK] get_account_equity failed: {e}", "WARNING")
+        if equity is None and hasattr(self.exchange_client, "get_available_balance"):
+            try:
+                equity = await self.exchange_client.get_available_balance()
+            except Exception as e:
+                self.logger.log(f"[RISK] get_available_balance failed: {e}", "WARNING")
+        if equity is None:
+            try:
+                pos_signed = await self.exchange_client.get_account_positions()
+                best_bid, best_ask = await self.exchange_client.fetch_bbo_prices(self.config.contract_id)
+                mid_price = (best_bid + best_ask) / 2
+                equity = abs(pos_signed) * mid_price
+            except Exception as e:
+                self.logger.log(f"[RISK] equity fallback failed: {e}", "ERROR")
+                equity = None
+        return equity
+
+    async def _maybe_send_daily_pnl(self):
+        """Send daily PnL at 20:00 UTC+8 (12:00 UTC)."""
+        if not (self.enable_notifications and self.daily_pnl_report):
+            return
+        now = time.gmtime()
+        current_date = f"{now.tm_year:04d}-{now.tm_mon:02d}-{now.tm_mday:02d}"
+        equity = await self._get_equity_snapshot()
+        # Try account_pnl if supported
+        if hasattr(self.exchange_client, "get_account_pnl"):
+            try:
+                pnl_val = await self.exchange_client.get_account_pnl()
+                if pnl_val is not None and self.daily_pnl_baseline is None:
+                    self.daily_pnl_baseline = equity
+                if pnl_val is not None:
+                    equity = pnl_val
+            except Exception as e:
+                self.logger.log(f"[PNL] get_account_pnl failed: {e}", "WARNING")
+        if self.last_daily_pnl_date != current_date:
+            self.daily_pnl_baseline = equity
+            self.last_daily_pnl_date = current_date
+            self.last_daily_sent_date = None
+            return
+        if now.tm_hour == 12 and self.last_daily_sent_date != current_date:
+            if equity is None or self.daily_pnl_baseline is None:
+                await self.send_notification("[PNL] Daily PnL unavailable (missing equity data)")
+            else:
+                pnl = equity - self.daily_pnl_baseline
+                msg = f"[PNL] {current_date} Equity: {equity} | PnL: {pnl}"
+                await self.send_notification(msg)
+            self.last_daily_sent_date = current_date
 
     async def _place_take_profit_order(self, quantity: Decimal, filled_price: Decimal) -> bool:
         """Place a take-profit order; on Lighter, chase better-than-target prices with 5s timeout retries."""
@@ -410,6 +491,63 @@ class TradingBot:
 
         self.dynamic_stop_price = dyn_stop
         await self._place_stop_loss_native(pos_abs, dyn_stop, 'sell' if direction == "buy" else 'buy')
+        # After SL update, re-evaluate redundancy and optionally stop new orders
+        await self._run_redundancy_check(direction, pos_signed)
+
+    async def _run_redundancy_check(self, direction: str, pos_signed: Decimal):
+        """Re-evaluate redundancy and update stop_new_orders state."""
+        try:
+            position_amt = abs(pos_signed)
+            best_bid, best_ask = await self.exchange_client.fetch_bbo_prices(self.config.contract_id)
+            mid_price = (best_bid + best_ask) / 2
+            # Need avg entry price; fallback: mid_price
+            avg_price = mid_price
+            if hasattr(self.exchange_client, "get_position_detail"):
+                try:
+                    pos_signed_detail, avg_price_detail = await self.exchange_client.get_position_detail()
+                    if pos_signed_detail != 0:
+                        avg_price = avg_price_detail
+                except Exception as e:
+                    self.logger.log(f"[RISK] get_position_detail failed: {e}", "WARNING")
+
+                stop_price = self.dynamic_stop_price if (self.enable_dynamic_sl and self.dynamic_stop_price) else None
+            if stop_price and position_amt > 0:
+                if pos_signed > 0:
+                    potential_loss = (avg_price - stop_price) * position_amt
+                    per_base_loss = (avg_price - stop_price)
+                else:
+                    potential_loss = (stop_price - avg_price) * position_amt
+                    per_base_loss = (stop_price - avg_price)
+                if potential_loss < 0:
+                    potential_loss = Decimal(0)
+                equity = await self._get_equity_snapshot()
+                if equity is None:
+                    return
+                max_loss = equity * (self.risk_pct / Decimal(100))
+                redundancy_u = max_loss - potential_loss
+                if redundancy_u < 0:
+                    redundancy_u = Decimal(0)
+                redundancy_base = redundancy_u / per_base_loss if per_base_loss > 0 else Decimal(0)
+                if redundancy_base < self.config.quantity:
+                    if not self.stop_new_orders and self.enable_notifications:
+                        await self.send_notification(f"[RISK] Stop new orders after SL update: redundancy {redundancy_base} < qty {self.config.quantity}")
+                    self.stop_new_orders = True
+                    self.last_stop_new_notify = True
+                    # Cancel open orders to avoid new entries
+                    try:
+                        active_orders = await self.exchange_client.get_active_orders(self.config.contract_id)
+                        for order in active_orders:
+                            if order.side != self.config.close_order_side:
+                                await self.exchange_client.cancel_order(order.order_id)
+                    except Exception as e:
+                        self.logger.log(f"[RISK] Cancel open orders after SL update failed: {e}", "WARNING")
+                else:
+                    if self.stop_new_orders and self.enable_notifications:
+                        await self.send_notification("[RISK] Resume new orders after SL update: redundancy restored")
+                    self.stop_new_orders = False
+                    self.last_stop_new_notify = False
+        except Exception as e:
+            self.logger.log(f"[RISK] redundancy check after SL update failed: {e}", "WARNING")
 
     async def _handle_zigzag_event(self, event: ZigZagEvent):
         """Handle ZigZag pivot events: update pivots, dynamic SL, and optional auto-reverse."""
@@ -482,6 +620,9 @@ class TradingBot:
         if self.enable_dynamic_sl:
             await self._refresh_stop_loss(force=True)
 
+        if self.enable_notifications:
+            await self.send_notification(f"[DIRECTION] Switched to {new_direction.upper()} (fast reverse)")
+
         # Immediately place a new open order in new direction
         await self._place_and_monitor_open_order()
         self.reversing = False
@@ -515,7 +656,7 @@ class TradingBot:
         self.stop_new_orders = False
 
     async def _process_slow_reverse_followup(self, event: ZigZagEvent) -> bool:
-        """Process next pivot for slow reverse logic. Returns True if handled."""
+        """Process next confirmed pivot for slow reverse logic. Returns True if handled."""
         if self.pending_reverse_state != "waiting_next_pivot":
             return False
 
@@ -558,6 +699,8 @@ class TradingBot:
                 self.pending_original_direction = None
                 self.stop_new_orders = False
                 self.last_open_order_time = 0
+                if self.enable_notifications:
+                    await self.send_notification(f"[DIRECTION] Switched to {self.config.direction.upper()} (slow reverse complete)")
                 if self.enable_dynamic_sl:
                     await self._refresh_stop_loss(force=True)
             return
@@ -574,8 +717,8 @@ class TradingBot:
         """Place an order and monitor its execution."""
         try:
             # Risk gate: stop new orders when flag is set
-        if self.stop_new_orders:
-            return False
+            if self.stop_new_orders:
+                return False
             # Reset state before placing order
             self.order_filled_event.clear()
             self.current_order_status = 'OPEN'
@@ -768,11 +911,27 @@ class TradingBot:
                 self.last_log_time = time.time()
                 # Check for position mismatch
                 mismatch_detected = False
+                # 基础风险：最大持仓限制（启用时）
+                if self.enable_basic_risk and self.max_position_limit is not None and position_amt >= self.max_position_limit:
+                    self.stop_new_orders = True
+                    if position_amt > self.max_position_limit:
+                        excess_pos = position_amt - self.max_position_limit
+                        close_side = self.config.close_order_side
+                        try:
+                            await self.exchange_client.reduce_only_close_with_retry(excess_pos, close_side)
+                            self.logger.log(f"[RISK-BASIC] Trimmed excess position {excess_pos} over limit {self.max_position_limit}", "WARNING")
+                        except Exception as e:
+                            self.logger.log(f"[RISK-BASIC] Failed to trim excess position: {e}", "ERROR")
+
+                # 进阶风险：仅当开启时执行冗余检查
                 mismatch = position_amt - active_close_amount
                 try:
-                    if mismatch > 0:
+                    if self.enable_advanced_risk and mismatch > 0:
                         # Position larger than active close orders: add reduce-only maker close to trim excess
                         close_qty = mismatch
+                        # 若缺口小于最小下单量，则附加一手常规 quantity 一起平掉
+                        if close_qty < self.min_order_size:
+                            close_qty = close_qty + self.config.quantity
                         close_side = self.config.close_order_side
                         self.logger.log(f"Auto-closing excess position {close_qty} via reduce-only post-only", "WARNING")
                         fix_result = await self.exchange_client.reduce_only_close_with_retry(
@@ -780,7 +939,22 @@ class TradingBot:
                         )
                         if not fix_result.success:
                             raise Exception(f"Reduce-only close failed: {fix_result.error_message}")
-                    elif mismatch < 0:
+                        # 如果平掉数量超过缺口，按超出量取消远端挂单
+                        if close_qty > mismatch:
+                            excess = close_qty - mismatch
+                            cancelled = Decimal(0)
+                            sorted_close = sorted(
+                                self.active_close_orders,
+                                key=lambda o: abs(Decimal(o["price"]) - mid_price),
+                                reverse=True
+                            )
+                            for order in sorted_close:
+                                if cancelled >= excess:
+                                    break
+                                await self.exchange_client.cancel_order(order['id'])
+                                cancelled += Decimal(order.get('size', 0))
+                                self.logger.log(f"Canceled excess close order {order['id']} size {order.get('size')}", "WARNING")
+                    elif self.enable_advanced_risk and mismatch < 0:
                         # Active close orders exceed position: cancel farthest-from-mid until aligned
                         excess = abs(mismatch)
                         cancelled = Decimal(0)
@@ -804,23 +978,25 @@ class TradingBot:
                 # Risk gating: stop new orders if equity < threshold
                 if equity < self.stop_new_orders_equity_threshold:
                     self.logger.log(f"[RISK] Equity below threshold ({equity}<{self.stop_new_orders_equity_threshold}), shutting down.", "ERROR")
+                    if self.enable_notifications:
+                        await self.send_notification(f"[RISK] Equity below threshold {equity} < {self.stop_new_orders_equity_threshold}, shutting down.")
                     await self._close_all_positions_and_orders()
                     await self.graceful_shutdown("Equity below threshold")
                     mismatch_detected = True
 
-                # Redundancy calculation for stop-new-orders gating
-                # Need avg entry price; fallback: mid_price
-                avg_price = mid_price
-                if hasattr(self.exchange_client, "get_position_detail"):
-                    try:
-                        pos_signed_detail, avg_price_detail = await self.exchange_client.get_position_detail()
-                        if pos_signed_detail != 0:
-                            avg_price = avg_price_detail
-                    except Exception as e:
-                        self.logger.log(f"[RISK] get_position_detail failed: {e}", "WARNING")
+                if self.enable_advanced_risk:
+                    # Redundancy calculation for stop-new-orders gating
+                    avg_price = mid_price
+                    if hasattr(self.exchange_client, "get_position_detail"):
+                        try:
+                            pos_signed_detail, avg_price_detail = await self.exchange_client.get_position_detail()
+                            if pos_signed_detail != 0:
+                                avg_price = avg_price_detail
+                        except Exception as e:
+                            self.logger.log(f"[RISK] get_position_detail failed: {e}", "WARNING")
 
-                stop_price = self.dynamic_stop_price if (self.enable_dynamic_sl and self.dynamic_stop_price) else self.config.stop_loss_price if self.config.stop_loss_price != -1 else None
-                if stop_price and position_amt > 0:
+                stop_price = self.dynamic_stop_price if (self.enable_dynamic_sl and self.dynamic_stop_price) else None
+                if self.enable_advanced_risk and stop_price and position_amt > 0:
                     if position_signed > 0:
                         potential_loss = (avg_price - stop_price) * position_amt
                         per_base_loss = (avg_price - stop_price)
@@ -835,18 +1011,25 @@ class TradingBot:
                         redundancy_u = Decimal(0)
                     redundancy_base = redundancy_u / per_base_loss if per_base_loss > 0 else Decimal(0)
                     if redundancy_base < self.config.quantity:
+                        if not self.stop_new_orders:
+                            msg = f"[RISK] Stop new orders: redundancy {redundancy_base} < quantity {self.config.quantity}"
+                            self.logger.log(msg, "WARNING")
+                            if self.enable_notifications:
+                                await self.send_notification(msg)
                         self.stop_new_orders = True
-                        if not self.last_stop_new_notify:
-                            self.logger.log(f"[RISK] Stop new orders: redundancy {redundancy_base} < quantity {self.config.quantity}", "WARNING")
-                            self.last_stop_new_notify = True
+                        self.last_stop_new_notify = True
                     else:
+                        if self.stop_new_orders and self.enable_notifications and self.last_stop_new_notify:
+                            await self.send_notification("[RISK] Resume new orders: redundancy restored")
                         self.stop_new_orders = False
                         self.last_stop_new_notify = False
 
-                # Release liquidity either when stop-new-orders is active or when长时间未开新仓
-                should_release = self.stop_new_orders or (time.time() - self.last_new_order_time > self.release_timeout_minutes * 60)
-                if should_release:
-                    if time.time() - self.last_release_attempt > self.release_timeout_minutes * 60:
+                # Release liquidity: advanced uses release_timeout_minutes；基础风险也可用 basic_release_timeout_minutes
+                should_release_advanced = self.enable_advanced_risk and (self.stop_new_orders or (time.time() - self.last_new_order_time > self.release_timeout_minutes * 60))
+                should_release_basic = self.enable_basic_risk and not self.enable_advanced_risk and self.basic_release_timeout_minutes > 0 and (time.time() - self.last_new_order_time > self.basic_release_timeout_minutes * 60)
+                if should_release_advanced or should_release_basic:
+                    interval = self.release_timeout_minutes if should_release_advanced else self.basic_release_timeout_minutes
+                    if time.time() - self.last_release_attempt > interval * 60:
                         self.last_release_attempt = time.time()
                         try:
                             active_orders = await self.exchange_client.get_active_orders(self.config.contract_id)
@@ -901,7 +1084,7 @@ class TradingBot:
         best_bid = None
         best_ask = None
 
-        if self.config.pause_price == self.config.stop_price == self.config.stop_loss_price == -1:
+        if self.config.pause_price == self.config.stop_price == -1 and not self.enable_dynamic_sl:
             return stop_trading, pause_trading, stop_loss_triggered, best_bid, best_ask
 
         best_bid, best_ask = await self.exchange_client.fetch_bbo_prices(self.config.contract_id)
@@ -943,11 +1126,6 @@ class TradingBot:
             if self.config.direction == "buy" and best_bid <= self.dynamic_stop_price:
                 stop_loss_triggered = True
             elif self.config.direction == "sell" and best_ask >= self.dynamic_stop_price:
-                stop_loss_triggered = True
-        elif (self.config.stop_loss_price != -1) and (not self.stop_loss_triggered):
-            if self.config.direction == "buy" and best_bid <= self.config.stop_loss_price:
-                stop_loss_triggered = True
-            elif self.config.direction == "sell" and best_ask >= self.config.stop_loss_price:
                 stop_loss_triggered = True
         # Immediate reverse on break of confirmed high/low (± buffer ticks)
         if self.enable_zigzag and self.enable_auto_reverse:
@@ -1037,6 +1215,8 @@ class TradingBot:
         await self.graceful_shutdown("Fixed stop-loss executed")
 
     async def send_notification(self, message: str):
+        if not self.enable_notifications:
+            return
         lark_token = os.getenv("LARK_TOKEN")
         if lark_token:
             async with LarkBot(lark_token) as lark_bot:
@@ -1069,7 +1249,8 @@ class TradingBot:
                         for c in candles:
                             high = Decimal(str(c.high))
                             low = Decimal(str(c.low))
-                            evt = self.zigzag.update(high, low, ts=getattr(c, "open_time", None))
+                            ts_val = getattr(c, "timestamp", None)
+                            evt = self.zigzag.update(high, low, ts=ts_val)
                             if evt:
                                 self._update_confirmed_pivots(evt)
                         # After warmup, dynamic stop price based on confirmed pivots
@@ -1090,10 +1271,14 @@ class TradingBot:
             self.logger.log(f"Exchange: {self.config.exchange}", "INFO")
             self.logger.log(f"Grid Step: {self.config.grid_step}%", "INFO")
             self.logger.log(f"Stop Price: {self.config.stop_price}", "INFO")
-            self.logger.log(f"Stop Loss Price: {self.config.stop_loss_price}", "INFO")
+            if self.enable_dynamic_sl:
+                self.logger.log(f"Dynamic SL enabled", "INFO")
             self.logger.log(f"Pause Price: {self.config.pause_price}", "INFO")
             self.logger.log(f"Boost Mode: {self.config.boost_mode}", "INFO")
             self.logger.log("=============================", "INFO")
+
+            if self.enable_notifications:
+                await self.send_notification(f"[START] {self.config.exchange.upper()} {self.config.ticker} bot started.")
 
             # Capture the running event loop for thread-safe callbacks
             self.loop = asyncio.get_running_loop()
@@ -1105,6 +1290,7 @@ class TradingBot:
 
             # Main trading loop
             while not self.shutdown_requested:
+                await self._maybe_send_daily_pnl()
                 # Handle pending slow reverse before normal flow
                 if self.pending_reverse_state == "unwinding":
                     await self._perform_slow_unwind()
