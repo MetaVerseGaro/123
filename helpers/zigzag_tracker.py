@@ -2,6 +2,7 @@ from dataclasses import dataclass
 from typing import Optional, Tuple
 from decimal import Decimal
 import time
+from collections import deque
 
 
 @dataclass
@@ -31,6 +32,8 @@ class ZigZagTracker:
         self.candidate_low: Optional[Decimal] = None
         self.bars_since_pivot: int = 0
         self.direction: int = 0  # +1 up, -1 down
+        self.high_window: deque = deque(maxlen=self.depth)
+        self.low_window: deque = deque(maxlen=self.depth)
 
     def reset(self):
         self.__init__(self.depth, self.deviation_pct, self.backstep)
@@ -55,6 +58,17 @@ class ZigZagTracker:
             self.candidate_low = low
             self.direction = 0
             self.bars_since_pivot = 0
+            self.high_window.clear()
+            self.low_window.clear()
+            self.high_window.append(high)
+            self.low_window.append(low)
+            return None
+
+        # maintain depth windows
+        self.high_window.append(high)
+        self.low_window.append(low)
+
+        if len(self.high_window) < self.depth or len(self.low_window) < self.depth:
             return None
 
         dev = self._deviation_price(self.last_pivot_price)
@@ -63,8 +77,7 @@ class ZigZagTracker:
 
         if self.direction >= 0:
             # Looking for high swing
-            if self.candidate_high is None or high > self.candidate_high:
-                self.candidate_high = high
+            self.candidate_high = max(self.high_window)
 
             price_move = self.candidate_high - self.last_pivot_price
             if price_move >= dev and self.bars_since_pivot >= self.backstep:
@@ -74,13 +87,12 @@ class ZigZagTracker:
                 self.last_pivot_type = "high"
                 self.direction = 1
                 self.bars_since_pivot = 0
-                self.candidate_low = low
+                self.candidate_low = min(self.low_window)
                 label = "HH" if prev_high is not None and self.candidate_high > prev_high else "LH"
                 event = ZigZagEvent(label=label, price=self.candidate_high, direction=self.direction, timestamp=ts)
         if self.direction <= 0 or event is None:
             # Looking for low swing
-            if self.candidate_low is None or low < self.candidate_low:
-                self.candidate_low = low
+            self.candidate_low = min(self.low_window)
 
             price_move = self.last_pivot_price - self.candidate_low
             if price_move >= dev and self.bars_since_pivot >= self.backstep:
@@ -90,7 +102,7 @@ class ZigZagTracker:
                 self.last_pivot_type = "low"
                 self.direction = -1
                 self.bars_since_pivot = 0
-                self.candidate_high = high
+                self.candidate_high = max(self.high_window)
                 label = "LL" if prev_low is not None and self.candidate_low < prev_low else "HL"
                 event = ZigZagEvent(label=label, price=self.candidate_low, direction=self.direction, timestamp=ts)
 
