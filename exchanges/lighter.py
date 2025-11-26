@@ -570,11 +570,11 @@ class LighterClient(BaseExchangeClient):
                 active_close_orders += 1
         return active_close_orders
 
-    async def place_close_order(self, contract_id: str, quantity: Decimal, price: Decimal, side: str) -> OrderResult:
+    async def place_close_order(self, contract_id: str, quantity: Decimal, price: Decimal, side: str, reduce_only: bool = True) -> OrderResult:
         """Place a close order with Lighter using official SDK."""
         self.current_order = None
         self.current_order_client_id = None
-        order_result = await self.place_limit_order(contract_id, quantity, price, side, reduce_only=True)
+        order_result = await self.place_limit_order(contract_id, quantity, price, side, reduce_only=reduce_only)
 
         # wait for 5 seconds to ensure order is placed
         await asyncio.sleep(5)
@@ -589,6 +589,10 @@ class LighterClient(BaseExchangeClient):
             )
         else:
             raise Exception(f"[CLOSE] Error placing order: {order_result.error_message}")
+
+    async def place_tp_order(self, contract_id: str, quantity: Decimal, price: Decimal, side: str) -> OrderResult:
+        """Place a TP order (post-only, non reduce-only)."""
+        return await self.place_close_order(contract_id, quantity, price, side, reduce_only=False)
     
     async def get_order_price(self, side: str = '') -> Decimal:
         """Get the price of an order with Lighter using official SDK."""
