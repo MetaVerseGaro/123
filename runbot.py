@@ -111,6 +111,12 @@ def merge_config(args, cfg: dict):
         os.environ["RELEASE_TIMEOUT_MINUTES"] = str(cfg["release_timeout_minutes"])
     if cfg.get("stop_new_orders_equity_threshold") is not None:
         os.environ["STOP_NEW_ORDERS_EQUITY_THRESHOLD"] = str(cfg["stop_new_orders_equity_threshold"])
+    if cfg.get("auto_reverse_fast") is not None:
+        os.environ["AUTO_REVERSE_FAST"] = str(cfg["auto_reverse_fast"]).lower()
+    if cfg.get("zigzag_timeframe") is not None:
+        os.environ["ZIGZAG_TIMEFRAME"] = str(cfg["zigzag_timeframe"])
+    if cfg.get("zigzag_warmup_candles") is not None:
+        os.environ["ZIGZAG_WARMUP_CANDLES"] = str(cfg["zigzag_warmup_candles"])
 
     return args
 
