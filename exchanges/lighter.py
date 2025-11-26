@@ -6,7 +6,7 @@ import os
 import asyncio
 import time
 import logging
-from decimal import Decimal
+from decimal import Decimal, ROUND_HALF_UP
 from typing import Dict, Any, List, Optional, Tuple
 
 from .base import BaseExchangeClient, OrderResult, OrderInfo, query_retry
@@ -256,6 +256,20 @@ class LighterClient(BaseExchangeClient):
 
             if status in ['FILLED', 'CANCELED']:
                 self.logger.log_transaction(order_id, side, filled_size, price, status)
+            if self._order_update_handler:
+                try:
+                    self._order_update_handler({
+                        "contract_id": self.config.contract_id,
+                        "order_id": order_id,
+                        "status": status,
+                        "side": side,
+                        "order_type": order_type,
+                        "filled_size": filled_size,
+                        "size": size,
+                        "price": price,
+                    })
+                except Exception as e:
+                    self.logger.log(f"Error forwarding order update: {e}", "WARNING")
 
     @query_retry(default_return=(0, 0))
     async def fetch_bbo_prices(self, contract_id: str) -> Tuple[Decimal, Decimal]:
@@ -320,6 +334,16 @@ class LighterClient(BaseExchangeClient):
         self._order_id_seed = (self._order_id_seed + 1) % 1000000
         return self._order_id_seed
 
+    def _normalize_quantity(self, quantity: Decimal) -> Decimal:
+        """Clamp quantity to exchange base step to avoid invalid base amount."""
+        if not self.base_amount_multiplier:
+            return quantity
+        step = Decimal("1") / Decimal(self.base_amount_multiplier)
+        units = (quantity / step).to_integral_value(rounding=ROUND_HALF_UP)
+        if units <= 0:
+            units = 1
+        return units * step
+
     async def _calculate_post_only_price(self, side: str, desired_price: Optional[Decimal]) -> Decimal:
         """Calculate a non-marketable (post-only) price based on current BBO and desired price."""
         best_bid, best_ask = await self.fetch_bbo_prices(self.config.contract_id)
@@ -350,6 +374,8 @@ class LighterClient(BaseExchangeClient):
         if self.lighter_client is None:
             await self._initialize_lighter_client()
 
+        quantity = self._normalize_quantity(quantity)
+
         if side.lower() == 'buy':
             is_ask = False
         elif side.lower() == 'sell':
@@ -367,10 +393,14 @@ class LighterClient(BaseExchangeClient):
             client_order_index = self._generate_client_order_index()
             self.current_order_client_id = client_order_index
 
+            base_amount = int(quantity * self.base_amount_multiplier)
+            if base_amount <= 0:
+                return OrderResult(success=False, error_message="Invalid base amount after normalization")
+
             order_params = {
                 'market_index': self.config.contract_id,
                 'client_order_index': client_order_index,
-                'base_amount': int(quantity * self.base_amount_multiplier),
+                'base_amount': base_amount,
                 'price': int(maker_price * self.price_multiplier),
                 'is_ask': is_ask,
                 'order_type': self.lighter_client.ORDER_TYPE_LIMIT,
@@ -501,15 +531,6 @@ class LighterClient(BaseExchangeClient):
 
         return OrderResult(success=False, order_id=str(client_order_index), error_message="Stop-loss exceeded max retries due to rate limits")
 
-    async def cancel_all_orders(self):
-        """Cancel all active orders for current contract only."""
-        orders = await self.get_active_orders(self.config.contract_id)
-        for order in orders:
-            try:
-                await self.cancel_order(order.order_id)
-            except Exception as e:
-                self.logger.log(f"Failed to cancel order {order.order_id}: {e}", "WARNING")
-
     async def place_open_order(self, contract_id: str, quantity: Decimal, direction: str) -> OrderResult:
         """Place an open order with Lighter using official SDK."""
 
@@ -638,20 +659,21 @@ class LighterClient(BaseExchangeClient):
             # Get account orders
             account_data = await account_api.account(by="index", value=str(self.account_index))
 
-            # Look for the specific order in account positions
-            for position in account_data.positions:
-                if position.symbol == self.config.ticker:
-                    position_amt = abs(float(position.position))
-                    if position_amt > 0.001:  # Only include significant positions
-                        return OrderInfo(
-                            order_id=order_id,
-                            side="buy" if float(position.position) > 0 else "sell",
-                            size=Decimal(str(position_amt)),
-                            price=Decimal(str(position.avg_price)),
-                            status="FILLED",  # Positions are filled orders
-                            filled_size=Decimal(str(position_amt)),
-                            remaining_size=Decimal('0')
-                        )
+            positions = getattr(account_data, "accounts", None)
+            if positions:
+                for position in positions[0].positions:
+                    if position.symbol == self.config.ticker or position.market_id == self.config.contract_id:
+                        position_amt = abs(Decimal(str(position.position)))
+                        if position_amt > Decimal("0.001"):
+                            return OrderInfo(
+                                order_id=order_id,
+                                side="buy" if Decimal(str(position.position)) > 0 else "sell",
+                                size=position_amt,
+                                price=Decimal(str(position.avg_price)),
+                                status="FILLED",
+                                filled_size=position_amt,
+                                remaining_size=Decimal('0')
+                            )
 
             return None
 
@@ -711,7 +733,7 @@ class LighterClient(BaseExchangeClient):
                 contract_orders.append(OrderInfo(
                     order_id=str(order.order_index),
                     side=side,
-                    size=Decimal(order.remaining_base_amount),  # FIXME: This is wrong. Should be size
+                    size=Decimal(order.remaining_base_amount),
                     price=price,
                     status=order.status.upper(),
                     filled_size=Decimal(order.filled_base_amount),
