@@ -587,7 +587,7 @@ class TradingBot:
 
     async def _cancel_open_orders_beyond_stop(self, stop_price: Decimal):
         """Cancel open-side orders that sit beyond the new stop price."""
-            active_orders = await self._get_active_orders_cached()
+        active_orders = await self._get_active_orders_cached()
         for order in active_orders:
             if order.side != self.config.direction:
                 continue
@@ -1090,7 +1090,7 @@ class TradingBot:
                         await self.send_notification(f"[RISK] Equity below threshold {equity} < {self.stop_new_orders_equity_threshold}, stop new and unwind.")
                     self._set_stop_new_orders(True)
                     try:
-            active_orders = await self._get_active_orders_cached()
+                        active_orders = await self._get_active_orders_cached()
                         for order in active_orders:
                             await self.exchange_client.cancel_order(order.order_id)
                     except Exception as e:
@@ -1101,7 +1101,7 @@ class TradingBot:
                             release_qty = min(self.config.quantity, position_amt)
                             await self.exchange_client.reduce_only_close_with_retry(release_qty, close_side)
                             await asyncio.sleep(0.5)
-                position_signed = await self._get_position_signed_cached()
+                            position_signed = await self._get_position_signed_cached()
                             position_amt = abs(position_signed)
                     except Exception as e:
                         self.logger.log(f"[RISK] Unwind during low equity failed: {e}", "ERROR")
