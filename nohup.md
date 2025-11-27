@@ -12,14 +12,11 @@
   tail -f botA.out        # 实时日志
   ps aux | grep runbot    # 查看进程
   ```
-Operation: [_fetch_positions_with_retry] failed after 5 retries, exception: Cannot connect to host mainnet.zklighter.elliot.ai:443 ssl:default [Connection reset by peer]
---------------------------------
-Operation: [fetch_bbo_prices] failed after 5 retries, exception: Invalid bid/ask prices from REST
-Bot execution failed: No bid/ask data available
-ERROR:asyncio:Unclosed client session
-client_session: <aiohttp.client.ClientSession object at 0x7f042cadf440>
-ERROR:asyncio:Unclosed connector
-connections: ['deque([(<aiohttp.client_proto.ResponseHandler object at 0x7f04281272f0>, 329310.671717134)])']
-connector: <aiohttp.connector.TCPConnector object at 0x7f042c13fcb0>
-ERROR:asyncio:Unclosed client session
-client_session: <aiohttp.client.ClientSession object at 0x7f042c0d7b60>
+2025-11-28 01:53:12 | ERROR | [LIGHTER][ETH] Traceback: Traceback (most recent call last):
+  File "/home/lighter/123/trading_bot.py", line 847, in _place_and_monitor_open_order
+    order_result = await self.exchange_client.place_open_order(
+                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/lighter/123/exchanges/lighter.py", line 578, in place_open_order
+    order_id=self.current_order.order_id,
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AttributeError: 'NoneType' object has no attribute 'order_id'
