@@ -12,7 +12,8 @@
   tail -f botA.out        # 实时日志
   ps aux | grep runbot    # 查看进程
   ```
-2025-11-27 11:29:02 | WARNING | [LIGHTER][ETH] Error get_account_pnl: (400)
+2025-11-27 11:39:19 | INFO | [LIGHTER][ETH] Current Position: 0.0700 | Active closing amount: 0.0700 | Order quantity: 7
+2025-11-27 11:39:21 | WARNING | [LIGHTER][ETH] Error get_account_pnl(l1_address): (400)
 Reason: Bad Request
-HTTP response headers: <CIMultiDictProxy('Date': 'Thu, 27 Nov 2025 03:29:01 GMT', 'Content-Type': 'application/json; charset=utf-8', 'Content-Length': '44', 'Connection': 'keep-alive', 'Access-Control-Allow-Credentials': 'true', 'Access-Control-Allow-Headers': 'Content-Type, Origin, X-CSRF-Token, Authorization, AccessToken, Token, Range', 'Access-Control-Allow-Methods': 'GET, HEAD, POST, PATCH, PUT, DELETE', 'Access-Control-Allow-Origin': '*', 'Access-Control-Expose-Headers': 'Content-Length, Access-Control-Allow-Origin, Access-Control-Allow-Headers', 'Access-Control-Max-Age': '86400', 'Vary': 'Origin', 'Vary': 'Origin')>
-HTTP response body: code=21100 message='account not found' additional_properties={}
+HTTP response headers: <CIMultiDictProxy('Date': 'Thu, 27 Nov 2025 03:39:20 GMT', 'Content-Type': 'application/json; charset=utf-8', 'Content-Length': '119', 'Connection': 'keep-alive', 'Access-Control-Allow-Credentials': 'true', 'Access-Control-Allow-Headers': 'Content-Type, Origin, X-CSRF-Token, Authorization, AccessToken, Token, Range', 'Access-Control-Allow-Methods': 'GET, HEAD, POST, PATCH, PUT, DELETE', 'Access-Control-Allow-Origin': '*', 'Access-Control-Expose-Headers': 'Content-Length, Access-Control-Allow-Origin, Access-Control-Allow-Headers', 'Access-Control-Max-Age': '86400', 'Vary': 'Origin', 'Vary': 'Origin')>
+HTTP response body: code=20001 message='invalid param: : value "l1_address" for field "by" is not defined in options "[index]"' additional_properties={}
