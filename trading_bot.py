@@ -103,6 +103,16 @@ class TradingBot:
         self.account_name = os.getenv('ACCOUNT_NAME', '').strip()
         self.stop_loss_enabled = str(os.getenv('STOP_LOSS_ENABLED', 'true')).lower() == 'true'
         self.enable_auto_reverse = str(os.getenv('ENABLE_AUTO_REVERSE', 'true')).lower() == 'true'
+        self._equity_cache: Optional[Decimal] = None
+        self._equity_cache_ts: float = 0.0
+        self._equity_cache_ttl: float = 60.0  # seconds
+        self.last_pnl_fetch_ts: float = 0.0
+        self._orders_cache = None
+        self._orders_cache_ts: float = 0.0
+        self._orders_cache_ttl: float = 100.0  # seconds
+        self._position_cache: Optional[Decimal] = None
+        self._position_cache_ts: float = 0.0
+        self._position_cache_ttl: float = 100.0  # seconds
         # 动态 SL 无单独开关：开启止损即开启动态 SL
         self.enable_dynamic_sl = self.stop_loss_enabled
         self.enable_zigzag = str(os.getenv('ENABLE_ZIGZAG', 'true')).lower() == 'true'
@@ -170,6 +180,34 @@ class TradingBot:
 
         # Register order callback
         self._setup_websocket_handlers()
+
+    def _invalidate_order_cache(self):
+        self._orders_cache = None
+        self._orders_cache_ts = 0.0
+
+    def _invalidate_position_cache(self):
+        self._position_cache = None
+        self._position_cache_ts = 0.0
+
+    async def _get_active_orders_cached(self) -> list:
+        """Throttled active orders (100s TTL)."""
+        now = time.time()
+        if self._orders_cache is not None and (now - self._orders_cache_ts) < self._orders_cache_ttl:
+            return self._orders_cache
+        orders = await self.exchange_client.get_active_orders(self.config.contract_id)
+        self._orders_cache = orders
+        self._orders_cache_ts = now
+        return orders
+
+    async def _get_position_signed_cached(self) -> Decimal:
+        """Throttled signed position (100s TTL)."""
+        now = time.time()
+        if self._position_cache is not None and (now - self._position_cache_ts) < self._position_cache_ttl:
+            return self._position_cache
+            pos_signed = await self._get_position_signed_cached()
+        self._position_cache = pos_signed
+        self._position_cache_ts = now
+        return pos_signed
 
     def _set_stop_new_orders(self, enable: bool):
         """Set stop_new_orders flag and track duration."""
@@ -307,6 +345,9 @@ class TradingBot:
 
     async def _get_equity_snapshot(self) -> Optional[Decimal]:
         """Fetch equity with fallbacks."""
+        now_ts = time.time()
+        if self._equity_cache is not None and (now_ts - self._equity_cache_ts) < self._equity_cache_ttl:
+            return self._equity_cache
         equity = None
         if hasattr(self.exchange_client, "get_account_equity"):
             try:
@@ -320,13 +361,16 @@ class TradingBot:
                 self.logger.log(f"[RISK] get_available_balance failed: {e}", "WARNING")
         if equity is None:
             try:
-                pos_signed = await self.exchange_client.get_account_positions()
+                pos_signed = await self._get_position_signed_cached()
                 best_bid, best_ask = await self.exchange_client.fetch_bbo_prices(self.config.contract_id)
                 mid_price = (best_bid + best_ask) / 2
                 equity = abs(pos_signed) * mid_price
             except Exception as e:
                 self.logger.log(f"[RISK] equity fallback failed: {e}", "ERROR")
                 equity = None
+        if equity is not None:
+            self._equity_cache = equity
+            self._equity_cache_ts = now_ts
         return equity
 
     async def _maybe_send_daily_pnl(self):
@@ -336,22 +380,25 @@ class TradingBot:
         now = time.gmtime()
         current_date = f"{now.tm_year:04d}-{now.tm_mon:02d}-{now.tm_mday:02d}"
         equity = await self._get_equity_snapshot()
-        # Try account_pnl if supported
-        if hasattr(self.exchange_client, "get_account_pnl"):
-            try:
-                pnl_val = await self.exchange_client.get_account_pnl()
-                if pnl_val is not None and self.daily_pnl_baseline is None:
-                    self.daily_pnl_baseline = equity
-                if pnl_val is not None:
-                    equity = pnl_val
-            except Exception as e:
-                self.logger.log(f"[PNL] get_account_pnl failed: {e}", "WARNING")
+        now_ts = time.time()
+        # 重置日基准
         if self.last_daily_pnl_date != current_date:
             self.daily_pnl_baseline = equity
             self.last_daily_pnl_date = current_date
             self.last_daily_sent_date = None
+            self.last_pnl_fetch_ts = 0.0
             return
+        # 仅在 12:00 UTC 时段发送一次，并在发送前尝试获取最新 PnL（调用一次）
         if now.tm_hour == 12 and self.last_daily_sent_date != current_date:
+            if hasattr(self.exchange_client, "get_account_pnl"):
+                if now_ts - self.last_pnl_fetch_ts > 300:
+                    try:
+                        pnl_val = await self.exchange_client.get_account_pnl()
+                        self.last_pnl_fetch_ts = now_ts
+                        if pnl_val is not None:
+                            equity = pnl_val
+                    except Exception as e:
+                        self.logger.log(f"[PNL] get_account_pnl failed: {e}", "WARNING")
             if equity is None or self.daily_pnl_baseline is None:
                 await self.send_notification("[PNL] Daily PnL unavailable (missing equity data)")
             else:
@@ -455,7 +502,7 @@ class TradingBot:
             self.logger.log(f"Error cancelling all orders: {e}", "ERROR")
 
         try:
-            pos_signed = await self.exchange_client.get_account_positions()
+            pos_signed = await self._get_position_signed_cached()
         except Exception as e:
             self.logger.log(f"Error fetching position during cleanup: {e}", "ERROR")
             pos_signed = Decimal(0)
@@ -503,7 +550,7 @@ class TradingBot:
         if not self.enable_dynamic_sl:
             return
         try:
-            pos_signed = await self.exchange_client.get_account_positions()
+                pos_signed = await self._get_position_signed_cached()
         except Exception as e:
             self.logger.log(f"[SL] Failed to fetch position for refresh: {e}", "WARNING")
             return
@@ -540,7 +587,7 @@ class TradingBot:
 
     async def _cancel_open_orders_beyond_stop(self, stop_price: Decimal):
         """Cancel open-side orders that sit beyond the new stop price."""
-        active_orders = await self.exchange_client.get_active_orders(self.config.contract_id)
+            active_orders = await self._get_active_orders_cached()
         for order in active_orders:
             if order.side != self.config.direction:
                 continue
@@ -594,7 +641,7 @@ class TradingBot:
                     self.last_stop_new_notify = True
                     # Cancel open orders to avoid new entries
                     try:
-                        active_orders = await self.exchange_client.get_active_orders(self.config.contract_id)
+                        active_orders = await self._get_active_orders_cached()
                         for order in active_orders:
                             if order.side != self.config.close_order_side:
                                 await self.exchange_client.cancel_order(order.order_id)
@@ -656,7 +703,7 @@ class TradingBot:
 
         # Close existing position
         try:
-            pos_signed = await self.exchange_client.get_account_positions()
+            pos_signed = await self._get_position_signed_cached()
         except Exception as e:
             self.logger.log(f"[REV] Failed to fetch position: {e}", "ERROR")
             pos_signed = Decimal(0)
@@ -697,7 +744,7 @@ class TradingBot:
     async def _cancel_close_orders(self):
         """Cancel existing close/TP orders."""
         try:
-            active_orders = await self.exchange_client.get_active_orders(self.config.contract_id)
+            active_orders = await self._get_active_orders_cached()
             for order in active_orders:
                 if order.side == self.config.close_order_side:
                     try:
@@ -744,7 +791,7 @@ class TradingBot:
     async def _perform_slow_unwind(self):
         """Gradually close current position before flipping direction."""
         try:
-            pos_signed = await self.exchange_client.get_account_positions()
+            pos_signed = await self._get_position_signed_cached()
         except Exception as e:
             self.logger.log(f"[REV-SLOW] Failed to fetch position: {e}", "ERROR")
             return
@@ -926,8 +973,8 @@ class TradingBot:
         if time.time() - self.last_log_time > 60 or self.last_log_time == 0:
             print("--------------------------------")
             try:
-                # Get active orders
-                active_orders = await self.exchange_client.get_active_orders(self.config.contract_id)
+                # Get active orders (throttled)
+                active_orders = await self._get_active_orders_cached()
 
                 # Filter close orders
                 self.active_close_orders = []
@@ -940,7 +987,7 @@ class TradingBot:
                         })
 
                 # Get positions
-                position_signed = await self.exchange_client.get_account_positions()
+                position_signed = await self._get_position_signed_cached()
                 position_amt = abs(position_signed)
                 # Equity from exchange if available
                 equity = None
@@ -1043,7 +1090,7 @@ class TradingBot:
                         await self.send_notification(f"[RISK] Equity below threshold {equity} < {self.stop_new_orders_equity_threshold}, stop new and unwind.")
                     self._set_stop_new_orders(True)
                     try:
-                        active_orders = await self.exchange_client.get_active_orders(self.config.contract_id)
+            active_orders = await self._get_active_orders_cached()
                         for order in active_orders:
                             await self.exchange_client.cancel_order(order.order_id)
                     except Exception as e:
@@ -1054,7 +1101,7 @@ class TradingBot:
                             release_qty = min(self.config.quantity, position_amt)
                             await self.exchange_client.reduce_only_close_with_retry(release_qty, close_side)
                             await asyncio.sleep(0.5)
-                            position_signed = await self.exchange_client.get_account_positions()
+                position_signed = await self._get_position_signed_cached()
                             position_amt = abs(position_signed)
                     except Exception as e:
                         self.logger.log(f"[RISK] Unwind during low equity failed: {e}", "ERROR")
@@ -1122,15 +1169,39 @@ class TradingBot:
                     if time.time() - self.last_release_attempt > interval * 60:
                         self.last_release_attempt = time.time()
                         try:
-                            active_orders = await self.exchange_client.get_active_orders(self.config.contract_id)
-                            for order in active_orders:
-                                await self.exchange_client.cancel_order(order.order_id)
                             release_qty = min(self.config.quantity, position_amt)
                             if release_qty > 0:
                                 close_side = self.config.close_order_side
-                                await self.exchange_client.reduce_only_close_with_retry(release_qty, close_side)
-                                if self.enable_notifications:
-                                    await self.send_notification(f"[RISK] Released {release_qty} after sustained stop-new (advanced)" if should_release_advanced else f"[RISK-BASIC] Released {release_qty} after sustained full position")
+                                release_result = await self.exchange_client.reduce_only_close_with_retry(
+                                    release_qty, close_side, timeout_sec=5.0, max_attempts=5
+                                )
+                                if release_result.success:
+                                    self._invalidate_position_cache()
+                                    # 取消一笔最远的 TP 单，其余挂单不动
+                                    try:
+                                        active_orders_for_cancel = await self._get_active_orders_cached()
+                                        close_orders = [
+                                            o for o in active_orders_for_cancel
+                                            if o.side == self.config.close_order_side
+                                        ]
+                                        if close_orders:
+                                            best_bid, best_ask = await self.exchange_client.fetch_bbo_prices(self.config.contract_id)
+                                            mid_price = (best_bid + best_ask) / 2
+                                            farthest = sorted(
+                                                close_orders,
+                                                key=lambda o: abs(Decimal(o.price) - Decimal(mid_price)),
+                                                reverse=True
+                                            )[0]
+                                            await self.exchange_client.cancel_order(farthest.order_id)
+                                            self._invalidate_order_cache()
+                                    except Exception as e_cancel:
+                                        self.logger.log(f"[RISK] Release cancel TP failed: {e_cancel}", "WARNING")
+                                    if self.enable_notifications:
+                                        await self.send_notification(
+                                            f"[RISK] Released {release_qty} after sustained stop-new (advanced)"
+                                            if should_release_advanced
+                                            else f"[RISK-BASIC] Released {release_qty} after sustained full position"
+                                        )
                         except Exception as e:
                             self.logger.log(f"[RISK] Release attempt failed: {e}", "WARNING")
                 if self.enable_basic_risk and self.max_position_limit is not None and position_amt < self.max_position_limit:
@@ -1260,7 +1331,7 @@ class TradingBot:
         await self.send_notification(msg.lstrip())
 
         try:
-            active_orders = await self.exchange_client.get_active_orders(self.config.contract_id)
+            active_orders = await self._get_active_orders_cached()
             for order in active_orders:
                 try:
                     await self.exchange_client.cancel_order(order.order_id)
@@ -1270,7 +1341,7 @@ class TradingBot:
             self.logger.log(f"Error fetching active orders during stop-loss: {e}", "ERROR")
 
         try:
-            position_size = abs(await self.exchange_client.get_account_positions())
+            position_size = abs(await self._get_position_signed_cached())
         except Exception as e:
             self.logger.log(f"Error fetching position during stop-loss: {e}", "ERROR")
             position_size = Decimal(0)
@@ -1391,7 +1462,7 @@ class TradingBot:
                     continue
 
                 # Update active orders
-                active_orders = await self.exchange_client.get_active_orders(self.config.contract_id)
+                active_orders = await self._get_active_orders_cached()
 
                 # Filter close orders
                 self.active_close_orders = []
