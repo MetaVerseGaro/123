@@ -692,7 +692,7 @@ class LighterClient(BaseExchangeClient):
                                 order_id=order_id,
                                 side="buy" if Decimal(str(position.position)) > 0 else "sell",
                                 size=position_amt,
-                                price=Decimal(str(position.avg_price)),
+                                price=Decimal(str(getattr(position, "avg_entry_price", position.avg_price if hasattr(position, "avg_price") else 0))),
                                 status="FILLED",
                                 filled_size=position_amt,
                                 remaining_size=Decimal('0')
@@ -804,7 +804,10 @@ class LighterClient(BaseExchangeClient):
         for position in positions:
             if position.market_id == self.config.contract_id:
                 size = Decimal(position.position)
-                avg_price = Decimal(position.avg_price) if hasattr(position, "avg_price") else Decimal(0)
+                avg_raw = getattr(position, "avg_entry_price", None)
+                if avg_raw is None and hasattr(position, "avg_price"):
+                    avg_raw = position.avg_price
+                avg_price = Decimal(str(avg_raw)) if avg_raw is not None else Decimal(0)
                 return size, avg_price
         return Decimal(0), Decimal(0)
 
