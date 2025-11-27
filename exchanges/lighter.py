@@ -66,10 +66,11 @@ class LighterClient(BaseExchangeClient):
         self._rate_limit_backoff = float(os.getenv("LIGHTER_BACKOFF_START", "0.5"))
         self._rate_limit_backoff_max = float(os.getenv("LIGHTER_BACKOFF_MAX", "8"))
 
-    async def _throttle_rest(self):
-        """Enforce minimal interval between REST calls to avoid rate limits."""
+    async def _throttle_rest(self, weight: float = 1.0):
+        """Enforce minimal interval between REST calls to avoid rate limits. Weight scales interval."""
+        interval = self._rest_min_interval * max(weight, 1.0)
         now = time.time()
-        wait = self._rest_min_interval - (now - self._last_rest_ts)
+        wait = interval - (now - self._last_rest_ts)
         if wait > 0:
             await asyncio.sleep(wait)
         self._last_rest_ts = time.time()
@@ -283,11 +284,29 @@ class LighterClient(BaseExchangeClient):
             if best_bid <= 0 or best_ask <= 0 or best_bid >= best_ask:
                 self.logger.log("Invalid bid/ask prices", "ERROR")
                 raise ValueError("Invalid bid/ask prices")
-        else:
-            self.logger.log("Unable to get bid/ask prices from WebSocket.", "ERROR")
-            raise ValueError("WebSocket not running. No bid/ask prices available")
+            return best_bid, best_ask
 
-        return best_bid, best_ask
+        # Fallback to REST when WS unavailable
+        try:
+            await self._throttle_rest()
+            order_api = lighter.OrderApi(self.api_client)
+            ob = await order_api.order_book_details(market_id=contract_id)
+            if not ob or not ob.order_book_details:
+                raise ValueError("No order book details returned")
+            first = ob.order_book_details[0]
+            bids = getattr(first, "bids", [])
+            asks = getattr(first, "asks", [])
+            best_bid = Decimal(str(bids[0].price)) if bids else Decimal(0)
+            best_ask = Decimal(str(asks[0].price)) if asks else Decimal(0)
+            if best_bid <= 0 or best_ask <= 0 or best_bid >= best_ask:
+                raise ValueError("Invalid bid/ask prices from REST")
+            return best_bid, best_ask
+        except Exception as e:
+            if self._is_rate_limit_error(e):
+                self.logger.log(f"[RATE_LIMIT] fetch_bbo_prices fallback: {e}", "WARNING")
+                await self._handle_rate_limit_backoff()
+            self.logger.log(f"Unable to fetch BBO via REST fallback: {e}", "ERROR")
+            raise
 
     async def _submit_order_with_retry(self, order_params: Dict[str, Any]) -> OrderResult:
         """Submit an order with Lighter using official SDK, with throttling and rate-limit backoff."""
@@ -299,7 +318,7 @@ class LighterClient(BaseExchangeClient):
         attempt = 0
         while attempt < max_attempts:
             attempt += 1
-            await self._throttle_rest()
+            await self._throttle_rest(weight=6)
             try:
                 create_order, tx_hash, error = await self.lighter_client.create_order(**order_params)
             except Exception as exc:
@@ -501,7 +520,7 @@ class LighterClient(BaseExchangeClient):
         attempt = 0
         while attempt < max_attempts:
             attempt += 1
-            await self._throttle_rest()
+            await self._throttle_rest(weight=6)
             try:
                 create_order, tx_hash, error = await self.lighter_client.create_sl_order(
                     market_index=self.config.contract_id,
@@ -591,7 +610,7 @@ class LighterClient(BaseExchangeClient):
             raise Exception(f"[CLOSE] Error placing order: {order_result.error_message}")
 
     async def place_tp_order(self, contract_id: str, quantity: Decimal, price: Decimal, side: str) -> OrderResult:
-        """Place a TP order (post-only, reduce-only 避免加仓)."""
+        """Place a TP order (post-only, reduce-only 閬垮厤鍔犱粨)."""
         return await self.place_close_order(contract_id, quantity, price, side, reduce_only=True)
     
     async def get_order_price(self, side: str = '') -> Decimal:
@@ -624,7 +643,7 @@ class LighterClient(BaseExchangeClient):
         attempt = 0
         while attempt < max_attempts:
             attempt += 1
-            await self._throttle_rest()
+            await self._throttle_rest(weight=6)
             cancel_order, tx_hash, error = await self.lighter_client.cancel_order(
                 market_index=self.config.contract_id,
                 order_index=int(order_id)  # Assuming order_id is the order index
@@ -813,10 +832,9 @@ class LighterClient(BaseExchangeClient):
             await self._throttle_rest()
             # lighter API requires resolution/start/end/count_back
             now_ms = int(time.time() * 1000)
-            # 拉取最近 1 天的 PnL 曲线，取最新值
             one_day_ms = 24 * 60 * 60 * 1000
             start_ts = now_ms - one_day_ms
-            resp = await account_api.account_pn_l(
+            resp = await account_api.pnl(
                 by="index",
                 value=str(self.account_index),
                 resolution="1d",
@@ -825,8 +843,12 @@ class LighterClient(BaseExchangeClient):
                 count_back=1,
             )
             self._reset_rate_limit_backoff()
-            if resp and hasattr(resp, "pnl"):
-                return Decimal(str(resp.pnl))
+            pnl_list = getattr(resp, "pnl", None)
+            if pnl_list:
+                last_entry = pnl_list[-1]
+                trade_pnl = getattr(last_entry, "trade_pnl", None)
+                if trade_pnl is not None:
+                    return Decimal(str(trade_pnl))
         except Exception as e:
             if self._is_rate_limit_error(e):
                 self.logger.log(f"[RATE_LIMIT] get_account_pnl: {e}", "WARNING")
@@ -918,10 +940,9 @@ class LighterClient(BaseExchangeClient):
         """Fetch historical candles for warmup (default 200 x 1m)."""
         candle_api = lighter.CandlestickApi(self.api_client)
         try:
-            await self._throttle_rest()
+            await self._throttle_rest(weight=50)
             now_ms = int(time.time() * 1000)
-            # timeframe 转秒，按 limit 计算开始时间
-            tf_sec = 60
+            # timeframe 杞锛屾寜 limit 璁＄畻寮€濮嬫椂闂?            tf_sec = 60
             if timeframe.endswith("h"):
                 tf_sec = int(timeframe[:-1]) * 3600
             elif timeframe.endswith("m"):
@@ -944,3 +965,4 @@ class LighterClient(BaseExchangeClient):
                 self.logger.log(f"[RATE_LIMIT] fetch_history_candles: {e}", "WARNING")
                 await self._handle_rate_limit_backoff()
             raise
+
