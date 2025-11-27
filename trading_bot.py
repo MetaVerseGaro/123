@@ -1047,7 +1047,7 @@ class TradingBot:
                 # 进阶风险：仅当开启时执行冗余检查
                 mismatch = position_amt - active_close_amount
                 try:
-                    if self.enable_advanced_risk and mismatch > 0:
+                    if mismatch > 0:
                         # Position larger than active close orders: add reduce-only maker close to trim excess
                         close_qty = mismatch
                         # 若缺口小于最小下单量，则附加一手常规 quantity 一起平掉
@@ -1075,7 +1075,7 @@ class TradingBot:
                                 await self.exchange_client.cancel_order(order['id'])
                                 cancelled += Decimal(order.get('size', 0))
                                 self.logger.log(f"Canceled excess close order {order['id']} size {order.get('size')}", "WARNING")
-                    elif self.enable_advanced_risk and mismatch < 0:
+                    elif mismatch < 0:
                         # Active close orders exceed position: cancel farthest-from-mid until aligned
                         excess = abs(mismatch)
                         cancelled = Decimal(0)
