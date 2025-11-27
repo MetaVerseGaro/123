@@ -2,7 +2,6 @@
 
 - 单实例（使用 `botA.json`，env 文件在 JSON 中指定）：
   ```bash
-  LOG_FILE_PREFIX=botA_ LOG_RETENTION_DAYS=1 \
   nohup python3 runbot.py botA.json > botA.out 2>&1 &
   ```
 
