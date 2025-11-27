@@ -235,12 +235,14 @@ class LighterClient(BaseExchangeClient):
             if status == 'OPEN' and filled_size > 0:
                 status = 'PARTIALLY_FILLED'
 
-            if status == 'OPEN':
-                self.logger.log(f"[{order_type}] [{order_id}] {status} "
-                                f"{size} @ {price}", "INFO")
-            else:
-                self.logger.log(f"[{order_type}] [{order_id}] {status} "
-                                f"{filled_size} @ {price}", "INFO")
+            # Avoid duplicate logging: when bot provided a callback, let it handle logs/notifications
+            if self._order_update_handler is None:
+                if status == 'OPEN':
+                    self.logger.log(f"[{order_type}] [{order_id}] {status} "
+                                    f"{size} @ {price}", "INFO")
+                else:
+                    self.logger.log(f"[{order_type}] [{order_id}] {status} "
+                                    f"{filled_size} @ {price}", "INFO")
 
             if order_data['client_order_index'] == self.current_order_client_id or order_type == 'OPEN':
                 current_order = OrderInfo(
@@ -255,7 +257,7 @@ class LighterClient(BaseExchangeClient):
                 )
                 self.current_order = current_order
 
-            if status in ['FILLED', 'CANCELED']:
+            if status in ['FILLED', 'CANCELED'] and self._order_update_handler is None:
                 self.logger.log_transaction(order_id, side, filled_size, price, status)
             if self._order_update_handler:
                 try:
