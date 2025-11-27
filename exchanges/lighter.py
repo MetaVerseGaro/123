@@ -310,8 +310,8 @@ class LighterClient(BaseExchangeClient):
             self.logger.log(f"Unable to fetch BBO via REST fallback: {e}", "ERROR")
             raise
 
-    async def _submit_order_with_retry(self, order_params: Dict[str, Any]) -> OrderResult:
-        """Submit an order with Lighter using official SDK, with throttling and rate-limit backoff."""
+async def _submit_order_with_retry(self, order_params: Dict[str, Any]) -> OrderResult:
+        """Submit an order with Lighter using official SDK, with rate-limit backoff but no extra throttling."""
         # Ensure client is initialized
         if self.lighter_client is None:
             raise ValueError("Lighter client not initialized. Call connect() first.")
@@ -320,35 +320,44 @@ class LighterClient(BaseExchangeClient):
         attempt = 0
         while attempt < max_attempts:
             attempt += 1
-            await self._throttle_rest(weight=6)
             try:
                 create_order, tx_hash, error = await self.lighter_client.create_order(**order_params)
             except Exception as exc:
+                # 网络 / 网关层面的报错里，若识别为限速，则按退避重试
                 if self._is_rate_limit_error(exc):
                     self.logger.log(f"[RATE_LIMIT] create_order attempt {attempt}: {exc}", "WARNING")
                     await self._handle_rate_limit_backoff()
                     continue
                 return OrderResult(
                     success=False,
-                    order_id=str(order_params.get('client_order_index')),
-                    error_message=str(exc)
+                    order_id=str(order_params.get("client_order_index")),
+                    error_message=f"Order creation error: {exc}",
                 )
 
             if error is not None:
+                # API 返回的 error，如果是限速，同样退避重试
                 if self._is_rate_limit_error(error):
                     self.logger.log(f"[RATE_LIMIT] create_order attempt {attempt}: {error}", "WARNING")
                     await self._handle_rate_limit_backoff()
                     continue
                 return OrderResult(
-                    success=False, order_id=str(order_params['client_order_index']),
-                    error_message=f"Order creation error: {error}")
+                    success=False,
+                    order_id=str(order_params.get("client_order_index")),
+                    error_message=f"Order creation error: {error}",
+                )
 
-            # Success
+            # 成功
             self._reset_rate_limit_backoff()
-            return OrderResult(success=True, order_id=str(order_params['client_order_index']))
+            return OrderResult(
+                success=True,
+                order_id=str(order_params.get("client_order_index")),
+            )
 
-        return OrderResult(success=False, order_id=str(order_params.get('client_order_index')),
-                           error_message="Order creation exceeded max retries due to rate limits")
+        return OrderResult(
+            success=False,
+            order_id=str(order_params.get("client_order_index")),
+            error_message="Order creation exceeded max retries due to rate limits",
+        )
 
     def _generate_client_order_index(self) -> int:
         """Generate a unique client order index for tracking orders."""
