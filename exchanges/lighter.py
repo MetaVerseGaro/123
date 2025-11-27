@@ -310,8 +310,8 @@ class LighterClient(BaseExchangeClient):
             self.logger.log(f"Unable to fetch BBO via REST fallback: {e}", "ERROR")
             raise
 
-    async def _submit_order_with_retry(self, order_params: Dict[str, Any]) -> OrderResult:
-        """Submit an order with Lighter using official SDK, with throttling and rate-limit backoff."""
+async def _submit_order_with_retry(self, order_params: Dict[str, Any]) -> OrderResult:
+        """Submit an order with Lighter using official SDK, with rate-limit backoff but no extra throttling."""
         # Ensure client is initialized
         if self.lighter_client is None:
             raise ValueError("Lighter client not initialized. Call connect() first.")
@@ -320,35 +320,44 @@ class LighterClient(BaseExchangeClient):
         attempt = 0
         while attempt < max_attempts:
             attempt += 1
-            await self._throttle_rest(weight=6)
             try:
                 create_order, tx_hash, error = await self.lighter_client.create_order(**order_params)
             except Exception as exc:
+                # 网络 / 网关层面的报错里，若识别为限速，则按退避重试
                 if self._is_rate_limit_error(exc):
                     self.logger.log(f"[RATE_LIMIT] create_order attempt {attempt}: {exc}", "WARNING")
                     await self._handle_rate_limit_backoff()
                     continue
                 return OrderResult(
                     success=False,
-                    order_id=str(order_params.get('client_order_index')),
-                    error_message=str(exc)
+                    order_id=str(order_params.get("client_order_index")),
+                    error_message=f"Order creation error: {exc}",
                 )
 
             if error is not None:
+                # API 返回的 error，如果是限速，同样退避重试
                 if self._is_rate_limit_error(error):
                     self.logger.log(f"[RATE_LIMIT] create_order attempt {attempt}: {error}", "WARNING")
                     await self._handle_rate_limit_backoff()
                     continue
                 return OrderResult(
-                    success=False, order_id=str(order_params['client_order_index']),
-                    error_message=f"Order creation error: {error}")
+                    success=False,
+                    order_id=str(order_params.get("client_order_index")),
+                    error_message=f"Order creation error: {error}",
+                )
 
-            # Success
+            # 成功
             self._reset_rate_limit_backoff()
-            return OrderResult(success=True, order_id=str(order_params['client_order_index']))
+            return OrderResult(
+                success=True,
+                order_id=str(order_params.get("client_order_index")),
+            )
 
-        return OrderResult(success=False, order_id=str(order_params.get('client_order_index')),
-                           error_message="Order creation exceeded max retries due to rate limits")
+        return OrderResult(
+            success=False,
+            order_id=str(order_params.get("client_order_index")),
+            error_message="Order creation exceeded max retries due to rate limits",
+        )
 
     def _generate_client_order_index(self) -> int:
         """Generate a unique client order index for tracking orders."""
@@ -508,7 +517,7 @@ class LighterClient(BaseExchangeClient):
 
         return OrderResult(success=False, error_message="Reduce-only close exceeded max attempts")
 
-    async def place_stop_loss_order(self, quantity: Decimal, trigger_price: Decimal, side: str) -> OrderResult:
+async def place_stop_loss_order(self, quantity: Decimal, trigger_price: Decimal, side: str) -> OrderResult:
         """Place a native stop-loss (IOC) order."""
         if self.lighter_client is None:
             await self._initialize_lighter_client()
@@ -522,7 +531,6 @@ class LighterClient(BaseExchangeClient):
         attempt = 0
         while attempt < max_attempts:
             attempt += 1
-            await self._throttle_rest(weight=6)
             try:
                 create_order, tx_hash, error = await self.lighter_client.create_sl_order(
                     market_index=self.config.contract_id,
@@ -531,26 +539,43 @@ class LighterClient(BaseExchangeClient):
                     trigger_price=trig_px,
                     price=trig_px,
                     is_ask=is_ask,
-                    reduce_only=True
+                    reduce_only=True,
                 )
             except Exception as exc:
                 if self._is_rate_limit_error(exc):
                     self.logger.log(f"[RATE_LIMIT] stop_loss attempt {attempt}: {exc}", "WARNING")
                     await self._handle_rate_limit_backoff()
                     continue
-                return OrderResult(success=False, order_id=str(client_order_index), error_message=str(exc))
+                return OrderResult(
+                    success=False,
+                    order_id=str(client_order_index),
+                    error_message=str(exc),
+                )
 
             if error is not None:
                 if self._is_rate_limit_error(error):
                     self.logger.log(f"[RATE_LIMIT] stop_loss attempt {attempt}: {error}", "WARNING")
                     await self._handle_rate_limit_backoff()
                     continue
-                return OrderResult(success=False, order_id=str(client_order_index), error_message=str(error))
+                return OrderResult(
+                    success=False,
+                    order_id=str(client_order_index),
+                    error_message=str(error),
+                )
 
             self._reset_rate_limit_backoff()
-            return OrderResult(success=True, order_id=str(client_order_index), side=side, price=trigger_price)
+            return OrderResult(
+                success=True,
+                order_id=str(client_order_index),
+                side=side,
+                price=trigger_price,
+            )
 
-        return OrderResult(success=False, order_id=str(client_order_index), error_message="Stop-loss exceeded max retries due to rate limits")
+        return OrderResult(
+            success=False,
+            order_id=str(client_order_index),
+            error_message="Stop-loss exceeded max retries due to rate limits",
+        )
 
     async def place_open_order(self, contract_id: str, quantity: Decimal, direction: str) -> OrderResult:
         """Place an open order with Lighter using official SDK."""
@@ -635,7 +660,7 @@ class LighterClient(BaseExchangeClient):
 
         return order_price
 
-    async def cancel_order(self, order_id: str) -> OrderResult:
+async def cancel_order(self, order_id: str) -> OrderResult:
         """Cancel an order with Lighter."""
         # Ensure client is initialized
         if self.lighter_client is None:
@@ -645,26 +670,44 @@ class LighterClient(BaseExchangeClient):
         attempt = 0
         while attempt < max_attempts:
             attempt += 1
-            await self._throttle_rest(weight=6)
-            cancel_order, tx_hash, error = await self.lighter_client.cancel_order(
-                market_index=self.config.contract_id,
-                order_index=int(order_id)  # Assuming order_id is the order index
-            )
+            try:
+                cancel_order, tx_hash, error = await self.lighter_client.cancel_order(
+                    market_index=self.config.contract_id,
+                    order_index=int(order_id),
+                )
+            except Exception as exc:
+                if self._is_rate_limit_error(exc):
+                    self.logger.log(f"[RATE_LIMIT] cancel_order attempt {attempt}: {exc}", "WARNING")
+                    await self._handle_rate_limit_backoff()
+                    continue
+                return OrderResult(
+                    success=False,
+                    error_message=f"Cancel order error: {exc}",
+                )
 
             if error is not None:
                 if self._is_rate_limit_error(error):
                     self.logger.log(f"[RATE_LIMIT] cancel_order attempt {attempt}: {error}", "WARNING")
                     await self._handle_rate_limit_backoff()
                     continue
-                return OrderResult(success=False, error_message=f"Cancel order error: {error}")
+                return OrderResult(
+                    success=False,
+                    error_message=f"Cancel order error: {error}",
+                )
 
             if tx_hash:
                 self._reset_rate_limit_backoff()
                 return OrderResult(success=True)
             else:
-                return OrderResult(success=False, error_message='Failed to send cancellation transaction')
+                return OrderResult(
+                    success=False,
+                    error_message="Failed to send cancellation transaction",
+                )
 
-        return OrderResult(success=False, error_message='Cancel order exceeded max retries due to rate limits')
+        return OrderResult(
+            success=False,
+            error_message="Cancel order exceeded max retries due to rate limits",
+        )
 
     async def cancel_all_orders(self):
         """Cancel all active orders for current contract."""
@@ -971,6 +1014,8 @@ class LighterClient(BaseExchangeClient):
         except Exception as e:
             if self._is_rate_limit_error(e):
                 self.logger.log(f"[RATE_LIMIT] fetch_history_candles: {e}", "WARNING")
+                await self._handle_rate_limit_backoff()
+            raise
                 await self._handle_rate_limit_backoff()
             raise
 
