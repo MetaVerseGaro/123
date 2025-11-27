@@ -139,10 +139,12 @@ def merge_config(args, cfg: dict):
     # Feature toggles to env (ZigZag 视作进阶风险的一部分，优先 risk.advanced.zigzag，兼容顶层 zigzag)
     zig = adv.get("zigzag", {}) if isinstance(adv, dict) else cfg.get("zigzag", {})
     flags = cfg.get("flags", {})
-    for key in ("enable_auto_reverse", "enable_dynamic_sl", "enable_zigzag", "auto_reverse_fast"):
+    for key in ("enable_auto_reverse", "enable_zigzag", "auto_reverse_fast"):
         val = zig.get(key, flat.get(key, flags.get(key)))
         if val is not None:
             os.environ[key.upper()] = str(val).lower()
+    if adv.get("enable_stop_loss") is not None:
+        os.environ["STOP_LOSS_ENABLED"] = str(adv["enable_stop_loss"]).lower()
     if zig.get("break_buffer_ticks") is not None:
         os.environ["ZIGZAG_BREAK_BUFFER_TICKS"] = str(zig["break_buffer_ticks"])
     if zig.get("zigzag_depth") is not None:
