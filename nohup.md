@@ -12,9 +12,12 @@
   tail -f botA.out        # 实时日志
   ps aux | grep runbot    # 查看进程
   ```
-Traceback (most recent call last):
-  File "/home/lighter/123/runbot.py", line 15, in <module>
-    from trading_bot import TradingBot, TradingConfig
-  File "/home/lighter/123/trading_bot.py", line 590
-    active_orders = await self._get_active_orders_cached()
-IndentationError: unexpected indent
+2025-11-27 13:00:45 | ERROR | [LIGHTER][ETH] Error in periodic status check: cannot access local variable 'pos_signed' where it is not associated with a value
+2025-11-27 13:00:45 | ERROR | [LIGHTER][ETH] Traceback: Traceback (most recent call last):
+  File "/home/lighter/123/trading_bot.py", line 990, in _log_status_periodically
+    position_signed = await self._get_position_signed_cached()
+                      ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/lighter/123/trading_bot.py", line 208, in _get_position_signed_cached
+    self._position_cache = pos_signed
+                           ^^^^^^^^^^
+UnboundLocalError: cannot access local variable 'pos_signed' where it is not associated with a value
