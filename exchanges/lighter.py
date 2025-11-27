@@ -660,7 +660,7 @@ async def place_stop_loss_order(self, quantity: Decimal, trigger_price: Decimal,
 
         return order_price
 
-    async def cancel_order(self, order_id: str) -> OrderResult:
+async def cancel_order(self, order_id: str) -> OrderResult:
         """Cancel an order with Lighter."""
         # Ensure client is initialized
         if self.lighter_client is None:
@@ -670,26 +670,44 @@ async def place_stop_loss_order(self, quantity: Decimal, trigger_price: Decimal,
         attempt = 0
         while attempt < max_attempts:
             attempt += 1
-            await self._throttle_rest(weight=6)
-            cancel_order, tx_hash, error = await self.lighter_client.cancel_order(
-                market_index=self.config.contract_id,
-                order_index=int(order_id)  # Assuming order_id is the order index
-            )
+            try:
+                cancel_order, tx_hash, error = await self.lighter_client.cancel_order(
+                    market_index=self.config.contract_id,
+                    order_index=int(order_id),
+                )
+            except Exception as exc:
+                if self._is_rate_limit_error(exc):
+                    self.logger.log(f"[RATE_LIMIT] cancel_order attempt {attempt}: {exc}", "WARNING")
+                    await self._handle_rate_limit_backoff()
+                    continue
+                return OrderResult(
+                    success=False,
+                    error_message=f"Cancel order error: {exc}",
+                )
 
             if error is not None:
                 if self._is_rate_limit_error(error):
                     self.logger.log(f"[RATE_LIMIT] cancel_order attempt {attempt}: {error}", "WARNING")
                     await self._handle_rate_limit_backoff()
                     continue
-                return OrderResult(success=False, error_message=f"Cancel order error: {error}")
+                return OrderResult(
+                    success=False,
+                    error_message=f"Cancel order error: {error}",
+                )
 
             if tx_hash:
                 self._reset_rate_limit_backoff()
                 return OrderResult(success=True)
             else:
-                return OrderResult(success=False, error_message='Failed to send cancellation transaction')
+                return OrderResult(
+                    success=False,
+                    error_message="Failed to send cancellation transaction",
+                )
 
-        return OrderResult(success=False, error_message='Cancel order exceeded max retries due to rate limits')
+        return OrderResult(
+            success=False,
+            error_message="Cancel order exceeded max retries due to rate limits",
+        )
 
     async def cancel_all_orders(self):
         """Cancel all active orders for current contract."""
