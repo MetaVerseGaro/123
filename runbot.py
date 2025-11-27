@@ -118,8 +118,26 @@ def merge_config(args, cfg: dict):
     set_from(trading, "min_order_size", Decimal, target="min_order_size")
     if "boost" in trading:
         setattr(args, "boost", bool(trading["boost"]))
-    # Feature toggles to env
-    zig = cfg.get("zigzag", {})
+    # Risk control env
+    risk = cfg.get("risk", {})
+    adv = risk.get("advanced", {})
+    basic = risk.get("basic", {})
+    if adv.get("risk_pct") is not None:
+        os.environ["RISK_PCT"] = str(adv["risk_pct"])
+    if adv.get("release_timeout_minutes") is not None:
+        os.environ["RELEASE_TIMEOUT_MINUTES"] = str(adv["release_timeout_minutes"])
+    if adv.get("stop_new_orders_equity_threshold") is not None:
+        os.environ["STOP_NEW_ORDERS_EQUITY_THRESHOLD"] = str(adv["stop_new_orders_equity_threshold"])
+    if adv.get("enable") is not None:
+        setattr(args, "enable_advanced_risk", bool(adv["enable"]))
+    if basic.get("enable") is not None:
+        setattr(args, "enable_basic_risk", bool(basic["enable"]))
+    if basic.get("max_position_count") is not None:
+        setattr(args, "max_position_count", int(basic["max_position_count"]))
+    if basic.get("basic_release_timeout_minutes") is not None:
+        setattr(args, "basic_release_timeout_minutes", int(basic["basic_release_timeout_minutes"]))
+    # Feature toggles to env (ZigZag 视作进阶风险的一部分，优先 risk.advanced.zigzag，兼容顶层 zigzag)
+    zig = adv.get("zigzag", {}) if isinstance(adv, dict) else cfg.get("zigzag", {})
     flags = cfg.get("flags", {})
     for key in ("enable_auto_reverse", "enable_dynamic_sl", "enable_zigzag", "auto_reverse_fast"):
         val = zig.get(key, flat.get(key, flags.get(key)))
@@ -137,22 +155,6 @@ def merge_config(args, cfg: dict):
         os.environ["ZIGZAG_TIMEFRAME"] = str(zig["zigzag_timeframe"])
     if zig.get("zigzag_warmup_candles") is not None:
         os.environ["ZIGZAG_WARMUP_CANDLES"] = str(zig["zigzag_warmup_candles"])
-    # Risk control env
-    risk = cfg.get("risk", {})
-    if risk.get("risk_pct") is not None:
-        os.environ["RISK_PCT"] = str(risk["risk_pct"])
-    if risk.get("release_timeout_minutes") is not None:
-        os.environ["RELEASE_TIMEOUT_MINUTES"] = str(risk["release_timeout_minutes"])
-    if risk.get("stop_new_orders_equity_threshold") is not None:
-        os.environ["STOP_NEW_ORDERS_EQUITY_THRESHOLD"] = str(risk["stop_new_orders_equity_threshold"])
-    if risk.get("enable_advanced_risk") is not None:
-        setattr(args, "enable_advanced_risk", bool(risk["enable_advanced_risk"]))
-    if risk.get("enable_basic_risk") is not None:
-        setattr(args, "enable_basic_risk", bool(risk["enable_basic_risk"]))
-    if risk.get("max_position_count") is not None:
-        setattr(args, "max_position_count", int(risk["max_position_count"]))
-    if risk.get("basic_release_timeout_minutes") is not None:
-        setattr(args, "basic_release_timeout_minutes", int(risk["basic_release_timeout_minutes"]))
     # Notifications
     notify = cfg.get("notifications", {})
     if notify.get("enable_notifications") is not None:
