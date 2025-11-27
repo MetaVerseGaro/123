@@ -12,12 +12,11 @@
   tail -f botA.out        # 实时日志
   ps aux | grep runbot    # 查看进程
   ```
-2025-11-27 13:00:45 | ERROR | [LIGHTER][ETH] Error in periodic status check: cannot access local variable 'pos_signed' where it is not associated with a value
-2025-11-27 13:00:45 | ERROR | [LIGHTER][ETH] Traceback: Traceback (most recent call last):
-  File "/home/lighter/123/trading_bot.py", line 990, in _log_status_periodically
-    position_signed = await self._get_position_signed_cached()
-                      ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "/home/lighter/123/trading_bot.py", line 208, in _get_position_signed_cached
-    self._position_cache = pos_signed
-                           ^^^^^^^^^^
-UnboundLocalError: cannot access local variable 'pos_signed' where it is not associated with a value
+2025-11-27 13:09:41 | ERROR | [LIGHTER][ETH] Error placing order: [OPEN] Error cancelling order: CANCELED-POST-ONLY
+2025-11-27 13:09:41 | ERROR | [LIGHTER][ETH] Traceback: Traceback (most recent call last):
+  File "/home/lighter/123/trading_bot.py", line 852, in _place_and_monitor_open_order
+    handled = await self._handle_order_result(order_result)
+              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/lighter/123/trading_bot.py", line 923, in _handle_order_result
+    raise Exception(f"[OPEN] Error cancelling order: {self.exchange_client.current_order.status}")
+Exception: [OPEN] Error cancelling order: CANCELED-POST-ONLY
