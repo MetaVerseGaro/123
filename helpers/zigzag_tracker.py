@@ -1,8 +1,7 @@
 from dataclasses import dataclass
-from typing import Optional, Tuple
+from typing import Optional, List, Tuple
 from decimal import Decimal
 import time
-from collections import deque
 
 
 @dataclass
@@ -13,10 +12,20 @@ class ZigZagEvent:
     timestamp: float
 
 
+@dataclass
+class _Pivot:
+    idx: int
+    price: Decimal
+    kind: str  # "high" or "low"
+    ts: float
+
+
 class ZigZagTracker:
     """
-    Lightweight ZigZag tracker approximating TradingView ZigZag++ behaviour.
-    Designed for streaming best bid/ask updates; uses deviation (percent) and backstep filters.
+    ZigZag tracker aligned with Pine ZigZag depth/deviation/backstep semantics:
+    - 深度 depth: 需要左右各 depth 根才能确认 pivot（类似 ta.pivothigh/highest 与 ta.pivotlow/lowest）。
+    - backstep: 同向 pivot 之间若距离不超过 backstep，会用更极值的那个替换旧 pivot。
+    - deviation_pct: 新 pivot 与上一 pivot 的涨跌幅（百分比）必须达到该阈值才确认反向。
     """
 
     def __init__(self, depth: int = 15, deviation_pct: Decimal = Decimal("5"), backstep: int = 2):
@@ -24,86 +33,88 @@ class ZigZagTracker:
         self.deviation_pct = deviation_pct
         self.backstep = backstep
 
-        self.last_pivot_price: Optional[Decimal] = None
-        self.last_pivot_type: Optional[str] = None  # "high" or "low"
+        self.candles: List[Tuple[Decimal, Decimal, float]] = []  # (high, low, ts)
+        self.last_pivot: Optional[_Pivot] = None
         self.last_confirmed_high: Optional[Decimal] = None
         self.last_confirmed_low: Optional[Decimal] = None
-        self.candidate_high: Optional[Decimal] = None
-        self.candidate_low: Optional[Decimal] = None
-        self.bars_since_pivot: int = 0
-        self.direction: int = 0  # +1 up, -1 down
-        self.high_window: deque = deque(maxlen=self.depth)
-        self.low_window: deque = deque(maxlen=self.depth)
 
     def reset(self):
         self.__init__(self.depth, self.deviation_pct, self.backstep)
 
-    def _deviation_price(self, price: Decimal) -> Decimal:
-        return price * self.deviation_pct / Decimal(100)
+    def _change_pct(self, new_price: Decimal, old_price: Decimal, kind: str) -> Decimal:
+        if old_price == 0:
+            return Decimal(0)
+        if kind == "high":
+            return (new_price - old_price) / old_price * Decimal(100)
+        return (old_price - new_price) / old_price * Decimal(100)
+
+    def _register_pivot(self, idx: int, price: Decimal, kind: str, ts: float) -> Optional[ZigZagEvent]:
+        # 同向 pivot 近距离更极值 -> 替换，不产生新事件
+        if self.last_pivot and self.last_pivot.kind == kind:
+            if idx - self.last_pivot.idx <= self.backstep:
+                if (kind == "high" and price > self.last_pivot.price) or (kind == "low" and price < self.last_pivot.price):
+                    self.last_pivot = _Pivot(idx=idx, price=price, kind=kind, ts=ts)
+                    if kind == "high":
+                        self.last_confirmed_high = price
+                    else:
+                        self.last_confirmed_low = price
+                return None
+
+        # 反向时要求达到 deviation 百分比
+        if self.last_pivot:
+            move_pct = self._change_pct(price, self.last_pivot.price, kind)
+            if move_pct < self.deviation_pct:
+                return None
+
+        # 生成事件并更新状态
+        if kind == "high":
+            prev_high = self.last_confirmed_high
+            self.last_confirmed_high = price
+            label = "HH" if prev_high is not None and price > prev_high else "LH"
+            direction = 1
+        else:
+            prev_low = self.last_confirmed_low
+            self.last_confirmed_low = price
+            label = "LL" if prev_low is not None and price < prev_low else "HL"
+            direction = -1
+
+        self.last_pivot = _Pivot(idx=idx, price=price, kind=kind, ts=ts)
+        return ZigZagEvent(label=label, price=price, direction=direction, timestamp=ts)
 
     def update(self, high: Decimal, low: Decimal, ts: Optional[float] = None) -> Optional[ZigZagEvent]:
         """
-        Feed a new high/low sample. Returns a ZigZagEvent when a new pivot confirms.
+        推入一根 K 线的 high/low；当确认 pivot 时返回 ZigZagEvent。
+        采用类似 ta.pivothigh/pivotlow(depth, depth) 的对称确认方式，再结合 backstep/deviation 过滤。
         """
         ts = ts or time.time()
-        self.bars_since_pivot += 1
+        high = Decimal(high)
+        low = Decimal(low)
+        self.candles.append((high, low, ts))
 
-        # Initialize pivot
-        if self.last_pivot_price is None:
-            mid = (high + low) / 2
-            self.last_pivot_price = mid
-            self.last_pivot_type = "low"
-            self.last_confirmed_low = mid
-            self.candidate_high = high
-            self.candidate_low = low
-            self.direction = 0
-            self.bars_since_pivot = 0
-            self.high_window.clear()
-            self.low_window.clear()
-            self.high_window.append(high)
-            self.low_window.append(low)
+        if len(self.candles) < 2 * self.depth + 1:
             return None
 
-        # maintain depth windows
-        self.high_window.append(high)
-        self.low_window.append(low)
-
-        if len(self.high_window) < self.depth or len(self.low_window) < self.depth:
+        pivot_idx = len(self.candles) - self.depth - 1  # 待确认的 pivot 位置（左右各 depth 根已具备）
+        if pivot_idx < self.depth:
             return None
 
-        dev = self._deviation_price(self.last_pivot_price)
+        window = self.candles[pivot_idx - self.depth:pivot_idx + self.depth + 1]
+        pivot_high = max(x[0] for x in window)
+        pivot_low = min(x[1] for x in window)
+        cur_high, cur_low, cur_ts = self.candles[pivot_idx]
 
-        event: Optional[ZigZagEvent] = None
+        candidates = []
+        if cur_high >= pivot_high:
+            score = self._change_pct(cur_high, self.last_pivot.price, "high") if self.last_pivot else cur_high - cur_low
+            candidates.append(("high", cur_high, score))
+        if cur_low <= pivot_low:
+            score = self._change_pct(cur_low, self.last_pivot.price, "low") if self.last_pivot else cur_high - cur_low
+            candidates.append(("low", cur_low, score))
 
-        if self.direction >= 0:
-            # Looking for high swing
-            self.candidate_high = max(self.high_window)
+        if not candidates:
+            return None
 
-            price_move = self.candidate_high - self.last_pivot_price
-            if price_move >= dev and self.bars_since_pivot >= self.backstep:
-                prev_high = self.last_confirmed_high
-                self.last_confirmed_high = self.candidate_high
-                self.last_pivot_price = self.candidate_high
-                self.last_pivot_type = "high"
-                self.direction = 1
-                self.bars_since_pivot = 0
-                self.candidate_low = min(self.low_window)
-                label = "HH" if prev_high is not None and self.candidate_high > prev_high else "LH"
-                event = ZigZagEvent(label=label, price=self.candidate_high, direction=self.direction, timestamp=ts)
-        if self.direction <= 0 or event is None:
-            # Looking for low swing
-            self.candidate_low = min(self.low_window)
-
-            price_move = self.last_pivot_price - self.candidate_low
-            if price_move >= dev and self.bars_since_pivot >= self.backstep:
-                prev_low = self.last_confirmed_low
-                self.last_confirmed_low = self.candidate_low
-                self.last_pivot_price = self.candidate_low
-                self.last_pivot_type = "low"
-                self.direction = -1
-                self.bars_since_pivot = 0
-                self.candidate_high = max(self.high_window)
-                label = "LL" if prev_low is not None and self.candidate_low < prev_low else "HL"
-                event = ZigZagEvent(label=label, price=self.candidate_low, direction=self.direction, timestamp=ts)
-
-        return event
+        # 选取最有意义的候选（优先幅度更大的）
+        candidates.sort(key=lambda x: x[2], reverse=True)
+        kind, price, _ = candidates[0]
+        return self._register_pivot(pivot_idx, price, kind, cur_ts)
