@@ -100,23 +100,26 @@ class TradingBot:
         self.reversing = False
         self.last_confirmed_low: Optional[Decimal] = None
         self.last_confirmed_high: Optional[Decimal] = None
-        self.enable_auto_reverse = str(os.getenv("ENABLE_AUTO_REVERSE", "true")).lower() == "true"
-        # 风控与 ZigZag 开关（ZigZag/动态SL/自动反手视为进阶风险的一部分）
-        self.enable_dynamic_sl = str(os.getenv("ENABLE_DYNAMIC_SL", "true")).lower() == "true"
-        self.enable_zigzag = str(os.getenv("ENABLE_ZIGZAG", "true")).lower() == "true"
-        self.auto_reverse_fast = str(os.getenv("AUTO_REVERSE_FAST", "true")).lower() == "true"
-        self.enable_notifications = str(os.getenv("ENABLE_NOTIFICATIONS", "false")).lower() == "true"
-        self.daily_pnl_report = str(os.getenv("DAILY_PNL_REPORT", "false")).lower() == "true"
-        self.current_sl_order_id: Optional[str] = None
+        self.stop_loss_enabled = str(os.getenv('STOP_LOSS_ENABLED', 'true')).lower() == 'true'
+        self.enable_auto_reverse = str(os.getenv('ENABLE_AUTO_REVERSE', 'true')).lower() == 'true'
+        # 动态 SL 无单独开关：开启止损即开启动态 SL
+        self.enable_dynamic_sl = self.stop_loss_enabled
+        self.enable_zigzag = str(os.getenv('ENABLE_ZIGZAG', 'true')).lower() == 'true'
+        self.auto_reverse_fast = str(os.getenv('AUTO_REVERSE_FAST', 'true')).lower() == 'true'
+        self.enable_notifications = str(os.getenv('ENABLE_NOTIFICATIONS', 'false')).lower() == 'true'
+        self.daily_pnl_report = str(os.getenv('DAILY_PNL_REPORT', 'false')).lower() == 'true'
+        self.current_sl_order_id: Optional[Decimal] = None
         self.zigzag_current_direction: int = 0
-        self.break_buffer_ticks = Decimal(os.getenv("ZIGZAG_BREAK_BUFFER_TICKS", "10"))
-        self.zigzag_timeframe = os.getenv("ZIGZAG_TIMEFRAME", "1m")
-        self.zigzag_warmup_candles = int(os.getenv("ZIGZAG_WARMUP_CANDLES", "200"))
+        self.break_buffer_ticks = Decimal(os.getenv('ZIGZAG_BREAK_BUFFER_TICKS', '10'))
+        self.zigzag_timeframe = os.getenv('ZIGZAG_TIMEFRAME', '1m')
+        self.zigzag_warmup_candles = int(os.getenv('ZIGZAG_WARMUP_CANDLES', '200'))
         self.zigzag_timeframe_sec = self._parse_timeframe_to_seconds(self.zigzag_timeframe)
         self._zz_period_start: Optional[float] = None
         self._zz_high: Optional[Decimal] = None
         self._zz_low: Optional[Decimal] = None
+        self.recent_pivots: deque = deque(maxlen=4)
         # Risk control
+# Risk control
         self.risk_pct = Decimal(os.getenv("RISK_PCT", "0.5"))
         self.release_timeout_minutes = int(os.getenv("RELEASE_TIMEOUT_MINUTES", "10"))
         self.basic_release_timeout_minutes = getattr(config, "basic_release_timeout_minutes", 0) or 0
@@ -138,12 +141,17 @@ class TradingBot:
         cfg_basic_risk = getattr(config, "enable_basic_risk", None)
         self.enable_advanced_risk = (str(cfg_adv_risk).lower() == "true") if cfg_adv_risk is not None else str(os.getenv("ENABLE_ADVANCED_RISK", "true")).lower() == "true"
         self.enable_basic_risk = (str(cfg_basic_risk).lower() == "true") if cfg_basic_risk is not None else True
-        # 进阶风险关闭则禁用 ZigZag/动态SL/自动反手
-        if not self.enable_advanced_risk:
+        # 止损关闭：不止损、不冗余、不自动反手，但仍记录 ZigZag
+        if not self.stop_loss_enabled:
+            self.enable_dynamic_sl = False
+            self.enable_auto_reverse = False
+            self.enable_advanced_risk = False
+        # 进阶风险关闭且未启用止损，则不执行进阶风控（可记录 ZigZag）
+        if not self.enable_advanced_risk and self.stop_loss_enabled:
             self.enable_zigzag = False
             self.enable_dynamic_sl = False
             self.enable_auto_reverse = False
-        # 如果未开启 ZigZag 或未开启自动反手，则不使用 fast 模式
+        # 如果未开启ZigZag 或未开启自动反手，则不使用 fast 模式
         if not self.enable_zigzag:
             self.enable_auto_reverse = False
         if not self.enable_auto_reverse:
@@ -473,6 +481,11 @@ class TradingBot:
             self.last_confirmed_high = event.price
         if event.label in ("LL", "HL"):
             self.last_confirmed_low = event.price
+        self.recent_pivots.append(event)
+        if self.enable_notifications and self.loop is not None:
+            items = [f"{p.label}@{p.price}" for p in self.recent_pivots]
+            msg = "[ZIGZAG] 最新确认高低点: " + " | ".join(items)
+            asyncio.create_task(self.send_notification(msg))
 
     def _compute_dynamic_stop(self, direction: str) -> Optional[Decimal]:
         """Compute dynamic stop based on confirmed pivots and tick buffer (10 ticks)."""
@@ -537,6 +550,8 @@ class TradingBot:
 
     async def _run_redundancy_check(self, direction: str, pos_signed: Decimal):
         """Re-evaluate redundancy and update stop_new_orders state."""
+        if not (self.stop_loss_enabled and self.enable_advanced_risk):
+            return
         try:
             position_amt = abs(pos_signed)
             best_bid, best_ask = await self.exchange_client.fetch_bbo_prices(self.config.contract_id)
@@ -1045,7 +1060,7 @@ class TradingBot:
                     await self.graceful_shutdown("Equity below threshold - unwound")
                     mismatch_detected = True
 
-                if self.enable_advanced_risk:
+                if self.enable_advanced_risk and self.stop_loss_enabled:
                     # Redundancy calculation for stop-new-orders gating
                     avg_price = mid_price
                     if hasattr(self.exchange_client, "get_position_detail"):
@@ -1057,7 +1072,7 @@ class TradingBot:
                             self.logger.log(f"[RISK] get_position_detail failed: {e}", "WARNING")
 
                 stop_price = self.dynamic_stop_price if (self.enable_dynamic_sl and self.dynamic_stop_price) else None
-                if self.enable_advanced_risk and stop_price and position_amt > 0:
+                if self.enable_advanced_risk and self.stop_loss_enabled and stop_price and position_amt > 0:
                     if position_signed > 0:
                         potential_loss = (avg_price - stop_price) * position_amt
                         per_base_loss = (avg_price - stop_price)
@@ -1090,6 +1105,7 @@ class TradingBot:
                 # Release liquidity: advanced uses release_timeout_minutes；基础风险也可用 basic_release_timeout_minutes
                 should_release_advanced = (
                     self.enable_advanced_risk
+                    and self.stop_loss_enabled
                     and self.redundancy_insufficient_since is not None
                     and (time.time() - self.redundancy_insufficient_since > self.release_timeout_minutes * 60)
                 )
@@ -1160,9 +1176,6 @@ class TradingBot:
         stop_loss_triggered = False
         best_bid = None
         best_ask = None
-
-        if self.config.pause_price == self.config.stop_price == -1 and not self.enable_dynamic_sl:
-            return stop_trading, pause_trading, stop_loss_triggered, best_bid, best_ask
 
         best_bid, best_ask = await self.exchange_client.fetch_bbo_prices(self.config.contract_id)
         # Update ZigZag tracker using current best bid/ask
