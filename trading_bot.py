@@ -456,6 +456,12 @@ class TradingBot:
             if not close_order_result.success:
                 raise Exception(f"[CLOSE] Failed to place close order: {close_order_result.error_message}")
 
+            # 如果下单后立即被 post-only 拒绝（CANCELED-POST-ONLY），立即重试
+            curr = getattr(self.exchange_client, "current_order", None)
+            if curr and curr.status == "CANCELED-POST-ONLY":
+                self.logger.log("[CLOSE] TP post-only rejected, retrying with adjusted price", "WARNING")
+                continue
+
             # If we are at target (no better price), keep the order and exit
             if not has_better or desired_price == target_price:
                 return True
