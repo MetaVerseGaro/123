@@ -204,7 +204,7 @@ class TradingBot:
         now = time.time()
         if self._position_cache is not None and (now - self._position_cache_ts) < self._position_cache_ttl:
             return self._position_cache
-            pos_signed = await self._get_position_signed_cached()
+        pos_signed = await self.exchange_client.get_account_positions()
         self._position_cache = pos_signed
         self._position_cache_ts = now
         return pos_signed
@@ -550,7 +550,7 @@ class TradingBot:
         if not self.enable_dynamic_sl:
             return
         try:
-                pos_signed = await self._get_position_signed_cached()
+            pos_signed = await self._get_position_signed_cached()
         except Exception as e:
             self.logger.log(f"[SL] Failed to fetch position for refresh: {e}", "WARNING")
             return
