@@ -310,7 +310,7 @@ class LighterClient(BaseExchangeClient):
             self.logger.log(f"Unable to fetch BBO via REST fallback: {e}", "ERROR")
             raise
 
-async def _submit_order_with_retry(self, order_params: Dict[str, Any]) -> OrderResult:
+    async def _submit_order_with_retry(self, order_params: Dict[str, Any]) -> OrderResult:
         """Submit an order with Lighter using official SDK, with rate-limit backoff but no extra throttling."""
         # Ensure client is initialized
         if self.lighter_client is None:
@@ -517,7 +517,7 @@ async def _submit_order_with_retry(self, order_params: Dict[str, Any]) -> OrderR
 
         return OrderResult(success=False, error_message="Reduce-only close exceeded max attempts")
 
-async def place_stop_loss_order(self, quantity: Decimal, trigger_price: Decimal, side: str) -> OrderResult:
+    async def place_stop_loss_order(self, quantity: Decimal, trigger_price: Decimal, side: str) -> OrderResult:
         """Place a native stop-loss (IOC) order."""
         if self.lighter_client is None:
             await self._initialize_lighter_client()
@@ -660,7 +660,7 @@ async def place_stop_loss_order(self, quantity: Decimal, trigger_price: Decimal,
 
         return order_price
 
-async def cancel_order(self, order_id: str) -> OrderResult:
+    async def cancel_order(self, order_id: str) -> OrderResult:
         """Cancel an order with Lighter."""
         # Ensure client is initialized
         if self.lighter_client is None:
@@ -1016,6 +1016,3 @@ async def cancel_order(self, order_id: str) -> OrderResult:
                 self.logger.log(f"[RATE_LIMIT] fetch_history_candles: {e}", "WARNING")
                 await self._handle_rate_limit_backoff()
             raise
-                await self._handle_rate_limit_backoff()
-            raise
-
