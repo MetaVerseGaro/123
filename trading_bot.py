@@ -106,6 +106,9 @@ class TradingBot:
         self._equity_cache: Optional[Decimal] = None
         self._equity_cache_ts: float = 0.0
         self._equity_cache_ttl: float = 60.0  # seconds
+        self.net_failure_count: int = 0
+        self.last_error_notified_msg: Optional[str] = None
+        self.last_error_notified_ts: float = 0.0
         self.last_pnl_fetch_ts: float = 0.0
         self._orders_cache = None
         self._orders_cache_ts: float = 0.0
@@ -250,6 +253,10 @@ class TradingBot:
 
         except Exception as e:
             self.logger.log(f"Error during graceful shutdown: {e}", "ERROR")
+        # Reset failure counters after a clean shutdown
+        self.net_failure_count = 0
+        self.last_error_notified_msg = None
+        self.last_error_notified_ts = 0.0
 
     def _setup_websocket_handlers(self):
         """Setup WebSocket handlers for order updates."""
@@ -976,7 +983,7 @@ class TradingBot:
 
     async def _log_status_periodically(self):
         """Log status information periodically, including positions."""
-        if time.time() - self.last_log_time > 60 or self.last_log_time == 0:
+        if time.time() - self.last_log_time > 120 or self.last_log_time == 0:
             print("--------------------------------")
             try:
                 # Get active orders (throttled)
@@ -1398,6 +1405,15 @@ class TradingBot:
             with TelegramBot(telegram_token, telegram_chat_id) as tg_bot:
                 tg_bot.send_text(message)
 
+    async def _notify_error_once(self, message: str, dedup_seconds: int = 300):
+        """Send error notification with simple dedup to avoid spam."""
+        now = time.time()
+        if self.last_error_notified_msg == message and (now - self.last_error_notified_ts) < dedup_seconds:
+            return
+        self.last_error_notified_msg = message
+        self.last_error_notified_ts = now
+        await self.send_notification(message)
+
     async def run(self):
         """Main trading loop."""
         try:
@@ -1460,60 +1476,83 @@ class TradingBot:
 
             # Main trading loop
             while not self.shutdown_requested:
-                await self._maybe_send_daily_pnl()
-                # Handle pending slow reverse before normal flow
-                if self.pending_reverse_state == "unwinding":
-                    await self._perform_slow_unwind()
-                    await asyncio.sleep(max(self.config.wait_time, 1))
-                    continue
+                try:
+                    await self._maybe_send_daily_pnl()
+                    # Handle pending slow reverse before normal flow
+                    if self.pending_reverse_state == "unwinding":
+                        await self._perform_slow_unwind()
+                        await asyncio.sleep(max(self.config.wait_time, 1))
+                        continue
 
-                # Update active orders
-                active_orders = await self._get_active_orders_cached()
+                    # Update active orders
+                    active_orders = await self._get_active_orders_cached()
 
-                # Filter close orders
-                self.active_close_orders = []
-                for order in active_orders:
-                    if order.side == self.config.close_order_side:
-                        self.active_close_orders.append({
-                            'id': order.order_id,
-                            'price': order.price,
-                            'size': order.size
-                        })
+                    # Filter close orders
+                    self.active_close_orders = []
+                    for order in active_orders:
+                        if order.side == self.config.close_order_side:
+                            self.active_close_orders.append({
+                                'id': order.order_id,
+                                'price': order.price,
+                                'size': order.size
+                            })
 
-                # Periodic logging
-                mismatch_detected = await self._log_status_periodically()
+                    # Periodic logging
+                    mismatch_detected = await self._log_status_periodically()
 
-                stop_trading, pause_trading, stop_loss_triggered, best_bid, best_ask = await self._check_price_condition()
-                if stop_loss_triggered:
-                    await self._execute_stop_loss(best_bid, best_ask)
-                    continue
+                    stop_trading, pause_trading, stop_loss_triggered, best_bid, best_ask = await self._check_price_condition()
+                    if stop_loss_triggered:
+                        await self._execute_stop_loss(best_bid, best_ask)
+                        continue
 
-                if stop_trading:
-                    msg = f"\n\nWARNING: [{self.config.exchange.upper()}_{self.config.ticker.upper()}] \n"
-                    msg += "Stopped trading due to stop price triggered\n"
-                    msg += "价格已经达到停止交易价格，脚本将停止交易\n"
-                    await self.send_notification(msg.lstrip())
-                    await self.graceful_shutdown(msg)
-                    continue
+                    if stop_trading:
+                        msg = f"\n\nWARNING: [{self.config.exchange.upper()}_{self.config.ticker.upper()}] \n"
+                        msg += "Stopped trading due to stop price triggered\n"
+                        msg += "价格已经达到停止交易价格，脚本将停止交易\n"
+                        await self.send_notification(msg.lstrip())
+                        await self.graceful_shutdown(msg)
+                        continue
 
-                if pause_trading:
-                    await asyncio.sleep(5)
-                    continue
+                    if pause_trading:
+                        await asyncio.sleep(5)
+                        continue
 
-                if not mismatch_detected:
-                    wait_time = self._calculate_wait_time()
+                    if not mismatch_detected:
+                        wait_time = self._calculate_wait_time()
 
-                    if wait_time > 0:
-                        await asyncio.sleep(wait_time)
+                        if wait_time > 0:
+                            await asyncio.sleep(wait_time)
+                            continue
+                        else:
+                            meet_grid_step_condition = await self._meet_grid_step_condition()
+                            if not meet_grid_step_condition:
+                                await asyncio.sleep(1)
+                                continue
+
+                            await self._place_and_monitor_open_order()
+                            self.last_close_orders += 1
+
+                    # 成功运行一轮，若之前有网络失败计数则发送恢复通知一次
+                    if self.net_failure_count > 0:
+                        await self._notify_error_once("[NET] 恢复：已重新连接交易所，恢复交易循环", dedup_seconds=0)
+                        self.net_failure_count = 0
+                except Exception as e:
+                    err_msg = str(e)
+                    self.logger.log(f"Critical error in main loop: {err_msg}", "ERROR")
+                    # 判定是否网络/行情不可用错误
+                    net_keywords = ["connection reset", "cannot connect", "timed out", "no bid/ask data", "ssl", "aiohttp"]
+                    is_net = any(k in err_msg.lower() for k in net_keywords)
+                    if is_net:
+                        self.net_failure_count += 1
+                        if self.net_failure_count % 5 == 0:
+                            await self._notify_error_once(f"[NET] 重试中（次数 {self.net_failure_count}）：{err_msg}", dedup_seconds=0)
+                        await asyncio.sleep(min(30, 5 * self.net_failure_count))
                         continue
                     else:
-                        meet_grid_step_condition = await self._meet_grid_step_condition()
-                        if not meet_grid_step_condition:
-                            await asyncio.sleep(1)
-                            continue
-
-                        await self._place_and_monitor_open_order()
-                        self.last_close_orders += 1
+                        # 普通错误：去重后通知一次
+                        await self._notify_error_once(f"出现报错：{err_msg}", dedup_seconds=300)
+                        await asyncio.sleep(5)
+                        continue
 
         except KeyboardInterrupt:
             self.logger.log("Bot stopped by user")
