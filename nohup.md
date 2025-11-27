@@ -12,10 +12,14 @@
   tail -f botA.out        # 实时日志
   ps aux | grep runbot    # 查看进程
   ```
-2025-11-27 13:20:34 | INFO | [LIGHTER][ETH] [CLOSE] [281475743111443] FILLED 0.0100 @ 3039.38
-2025-11-27 13:20:34 | INFO | [LIGHTER][ETH] [CLOSE] [281475743111443] FILLED 0.0100 @ 3039.38
-2025-11-27 13:20:34 | INFO | [LIGHTER][ETH] [CLOSE] [281475743110655] FILLED 0.0100 @ 3039.44
-2025-11-27 13:20:34 | INFO | [LIGHTER][ETH] [CLOSE] [281475743110655] FILLED 0.0100 @ 3039.44
-2025-11-27 13:21:06 | INFO | [LIGHTER][ETH] Current Position: 0.1300 | Active closing amount: 0.1373 | Order quantity: 14
-2025-11-27 13:21:49 | INFO | [LIGHTER][ETH] [OPEN] [562949219600096] OPEN 0.0100 @ 3037.41
-2025-11-27 13:21:49 | INFO | [LIGHTER][ETH] [OPEN] [562949219600096] OPEN 0.0100 @ 3037.41
+Operation: [_fetch_positions_with_retry] failed after 5 retries, exception: Cannot connect to host mainnet.zklighter.elliot.ai:443 ssl:default [Connection reset by peer]
+--------------------------------
+Operation: [fetch_bbo_prices] failed after 5 retries, exception: Invalid bid/ask prices from REST
+Bot execution failed: No bid/ask data available
+ERROR:asyncio:Unclosed client session
+client_session: <aiohttp.client.ClientSession object at 0x7f042cadf440>
+ERROR:asyncio:Unclosed connector
+connections: ['deque([(<aiohttp.client_proto.ResponseHandler object at 0x7f04281272f0>, 329310.671717134)])']
+connector: <aiohttp.connector.TCPConnector object at 0x7f042c13fcb0>
+ERROR:asyncio:Unclosed client session
+client_session: <aiohttp.client.ClientSession object at 0x7f042c0d7b60>
