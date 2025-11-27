@@ -826,35 +826,57 @@ class LighterClient(BaseExchangeClient):
             raise
 
     async def get_account_pnl(self) -> Optional[Decimal]:
-        """Get account PnL using official SDK."""
-        try:
-            account_api = lighter.AccountApi(self.api_client)
+        """Get account PnL using official SDK with index->l1_address fallback."""
+        account_api = lighter.AccountApi(self.api_client)
+
+        async def _fetch(by: str, value: str):
             await self._throttle_rest()
-            # lighter API requires resolution/start/end/count_back
             now_ms = int(time.time() * 1000)
             one_day_ms = 24 * 60 * 60 * 1000
             start_ts = now_ms - one_day_ms
-            resp = await account_api.pnl(
-                by="index",
-                value=str(self.account_index),
+            return await account_api.pnl(
+                by=by,
+                value=value,
                 resolution="1d",
                 start_timestamp=start_ts,
                 end_timestamp=now_ms,
                 count_back=1,
             )
+
+        l1_address = None
+        try:
+            acct = await account_api.account(by="index", value=str(self.account_index))
             self._reset_rate_limit_backoff()
-            pnl_list = getattr(resp, "pnl", None)
-            if pnl_list:
-                last_entry = pnl_list[-1]
-                trade_pnl = getattr(last_entry, "trade_pnl", None)
-                if trade_pnl is not None:
-                    return Decimal(str(trade_pnl))
-        except Exception as e:
-            if self._is_rate_limit_error(e):
-                self.logger.log(f"[RATE_LIMIT] get_account_pnl: {e}", "WARNING")
-                await self._handle_rate_limit_backoff()
-            else:
-                self.logger.log(f"Error get_account_pnl: {e}", "WARNING")
+            try:
+                l1_address = acct.accounts[0].l1_address
+            except Exception:
+                l1_address = None
+        except Exception:
+            pass
+
+        for by, val in (("index", str(self.account_index)), ("l1_address", l1_address)):
+            if not val:
+                continue
+            try:
+                resp = await _fetch(by, val)
+                self._reset_rate_limit_backoff()
+                pnl_list = getattr(resp, "pnl", None)
+                if pnl_list:
+                    last_entry = pnl_list[-1]
+                    trade_pnl = getattr(last_entry, "trade_pnl", None)
+                    if trade_pnl is not None:
+                        return Decimal(str(trade_pnl))
+            except Exception as e:
+                if self._is_rate_limit_error(e):
+                    self.logger.log(f"[RATE_LIMIT] get_account_pnl({by}): {e}", "WARNING")
+                    await self._handle_rate_limit_backoff()
+                else:
+                    # account not found → try next fallback or return None
+                    status = getattr(e, "status", None)
+                    msg = str(e).lower()
+                    if status == 400 and "account not found" in msg:
+                        continue
+                    self.logger.log(f"Error get_account_pnl({by}): {e}", "WARNING")
         return None
 
     async def get_account_daily_return(self) -> Optional[Decimal]:
