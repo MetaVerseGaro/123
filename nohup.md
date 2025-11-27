@@ -12,11 +12,10 @@
   tail -f botA.out        # 实时日志
   ps aux | grep runbot    # 查看进程
   ```
-2025-11-27 13:09:41 | ERROR | [LIGHTER][ETH] Error placing order: [OPEN] Error cancelling order: CANCELED-POST-ONLY
-2025-11-27 13:09:41 | ERROR | [LIGHTER][ETH] Traceback: Traceback (most recent call last):
-  File "/home/lighter/123/trading_bot.py", line 852, in _place_and_monitor_open_order
-    handled = await self._handle_order_result(order_result)
-              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "/home/lighter/123/trading_bot.py", line 923, in _handle_order_result
-    raise Exception(f"[OPEN] Error cancelling order: {self.exchange_client.current_order.status}")
-Exception: [OPEN] Error cancelling order: CANCELED-POST-ONLY
+2025-11-27 13:20:34 | INFO | [LIGHTER][ETH] [CLOSE] [281475743111443] FILLED 0.0100 @ 3039.38
+2025-11-27 13:20:34 | INFO | [LIGHTER][ETH] [CLOSE] [281475743111443] FILLED 0.0100 @ 3039.38
+2025-11-27 13:20:34 | INFO | [LIGHTER][ETH] [CLOSE] [281475743110655] FILLED 0.0100 @ 3039.44
+2025-11-27 13:20:34 | INFO | [LIGHTER][ETH] [CLOSE] [281475743110655] FILLED 0.0100 @ 3039.44
+2025-11-27 13:21:06 | INFO | [LIGHTER][ETH] Current Position: 0.1300 | Active closing amount: 0.1373 | Order quantity: 14
+2025-11-27 13:21:49 | INFO | [LIGHTER][ETH] [OPEN] [562949219600096] OPEN 0.0100 @ 3037.41
+2025-11-27 13:21:49 | INFO | [LIGHTER][ETH] [OPEN] [562949219600096] OPEN 0.0100 @ 3037.41
