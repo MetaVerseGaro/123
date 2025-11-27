@@ -100,6 +100,7 @@ class TradingBot:
         self.reversing = False
         self.last_confirmed_low: Optional[Decimal] = None
         self.last_confirmed_high: Optional[Decimal] = None
+        self.account_name = os.getenv('ACCOUNT_NAME', '').strip()
         self.stop_loss_enabled = str(os.getenv('STOP_LOSS_ENABLED', 'true')).lower() == 'true'
         self.enable_auto_reverse = str(os.getenv('ENABLE_AUTO_REVERSE', 'true')).lower() == 'true'
         # 动态 SL 无单独开关：开启止损即开启动态 SL
@@ -1307,6 +1308,8 @@ class TradingBot:
     async def send_notification(self, message: str):
         if not self.enable_notifications:
             return
+        if self.account_name:
+            message = f"[{self.account_name}] {message}"
         lark_token = os.getenv("LARK_TOKEN")
         if lark_token:
             async with LarkBot(lark_token) as lark_bot:
