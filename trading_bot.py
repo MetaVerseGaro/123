@@ -193,43 +193,12 @@ class TradingBot:
         self._position_cache_ts = 0.0
 
     async def _get_active_orders_cached(self) -> list:
-        """Throttled active orders (100s TTL)."""
-        now = time.time()
-        if self._orders_cache is not None and (now - self._orders_cache_ts) < self._orders_cache_ttl:
-            return self._orders_cache
-        orders = await self.exchange_client.get_active_orders(self.config.contract_id)
-        self._orders_cache = orders
-        self._orders_cache_ts = now
-        return orders
-
-    async def _get_position_signed_cached(self) -> Decimal:
-        """Throttled signed position (100s TTL)."""
-        now = time.time()
-        if self._position_cache is not None and (now - self._position_cache_ts) < self._position_cache_ttl:
-            return self._position_cache
-        pos_signed = await self.exchange_client.get_account_positions()
-        self._position_cache = pos_signed
-        self._position_cache_ts = now
-        return pos_signed
-
-    async def _get_active_orders_fresh(self) -> list:
-        """
-        Fetch active orders from exchange without using TTL cache.
-
-        用在低频但要求“状态绝对准确”的地方（比如 120s 风控 / 自愈循环）。
-        同时会刷新缓存，保证后续 cached 读取也尽量接近真实。
-        """
         orders = await self.exchange_client.get_active_orders(self.config.contract_id)
         self._orders_cache = orders
         self._orders_cache_ts = time.time()
         return orders
 
-    async def _get_position_signed_fresh(self) -> Decimal:
-        """
-        Fetch signed position from exchange without using TTL cache.
-
-        同理，只在关键检查点使用，避免频繁打 REST。
-        """
+    async def _get_position_signed_cached(self) -> Decimal:
         pos_signed = await self.exchange_client.get_account_positions()
         self._position_cache = pos_signed
         self._position_cache_ts = time.time()
@@ -1011,7 +980,7 @@ class TradingBot:
             print("--------------------------------")
             try:
                 # Get active orders (throttled)
-                active_orders = await self._get_active_orders_fresh()
+                active_orders = await self._get_active_orders_cached()
 
                 # Filter close orders
                 self.active_close_orders = []
@@ -1024,7 +993,7 @@ class TradingBot:
                         })
 
                 # Get positions
-                position_signed = await self._get_position_signed_fresh()
+                position_signed = await self._get_position_signed_cached()
                 position_amt = abs(position_signed)
                 # Equity from exchange if available
                 equity = None
