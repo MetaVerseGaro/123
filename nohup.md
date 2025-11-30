@@ -20,3 +20,5 @@
     order_id=self.current_order.order_id,
              ^^^^^^^^^^^^^^^^^^^^^^^^^^^
 AttributeError: 'NoneType' object has no attribute 'order_id'
+
+2025-11-30 20:45:24 | WARNING | [LIGHTER][ETH] [POST_ONLY] Attempt 75522 failed (Order creation error: HTTP response body: code=21706 message='invalid order base or quote amount' additional_properties={}). Retrying with adjusted price.
