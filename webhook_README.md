@@ -112,4 +112,36 @@
 ## 常见问题
 - **无法写文件**：确认运行目录有写权限，或用环境变量显式指定可写路径。
 - **端口占用**：修改 `WEBHOOK_PORT` 或释放占用端口。
-- **性能/日志**：日志每日切割，保留天数可调；如消息量大，可考虑前置反向代理做限流。 
+- **性能/日志**：日志每日切割，保留天数可调；如消息量大，可考虑前置反向代理做限流。
+  - TradingView Webhook URL：TradingView 仅支持 80/443。可用 `http://<公网IP>/webhook` 或 `https://<域名>/webhook`，如需内部端口，使用反代映射到内部端口（默认 8080）。
+
+## 端口与权限（AWS EC2 上的 ec2-user）
+- 80/443 是特权端口，普通用户直接监听会报 “Permission denied”。
+- 方案 A（简单但需 sudo）：`sudo WEBHOOK_PORT=80 python zigzag_webhook_server.py`（或 443）。
+- 方案 B（推荐）：程序跑高位端口（如 8080），再用 nginx/ALB/反代把公网 80/443 `/webhook` 转发到 `127.0.0.1:8080/webhook`，TradingView 填 80/443，无需程序升权。
+- 安全组/防火墙：放行 80/443（或你的映射端口），防火墙/SELinux 不要拦截。
+
+## 无域名反向代理示例（nginx + 公网 IP）
+1) 安装 nginx（Amazon Linux）：`sudo yum install -y nginx`  
+2) 运行 webhook（示例 8080）：`WEBHOOK_PORT=8080 nohup python zigzag_webhook_server.py > webhook.out 2>&1 &`  
+3) 配置 `/etc/nginx/conf.d/webhook.conf`：  
+   ```nginx
+   server {
+     listen 80;
+     server_name <公网IP>;
+     location /webhook {
+       proxy_pass http://127.0.0.1:8080;
+       proxy_set_header Host $host;
+       proxy_set_header X-Real-IP $remote_addr;
+       proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+     }
+     location /health {
+       proxy_pass http://127.0.0.1:8080/health;
+     }
+   }
+   ```
+4) 检查并重启 nginx：`sudo nginx -t && sudo systemctl restart nginx`  
+5) 安全组放行 80（如需 HTTPS 再放 443；可自签或用 Let’s Encrypt 获取证书）。  
+6) TradingView 填：`http://<公网IP>/webhook`（或 `https://<公网IP>/webhook`）。  
+7) 验证：`curl -X POST http://<公网IP>/webhook -d 'buy | ETHUSDT.P'`，检查文件是否更新。
+
