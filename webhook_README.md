@@ -124,7 +124,7 @@
 ## 无域名反向代理示例（nginx + 公网 IP）
 1) 安装 nginx（Amazon Linux）：`sudo yum install -y nginx`  
 2) 运行 webhook（示例 8080）：`WEBHOOK_PORT=8080 nohup python zigzag_webhook_server.py > webhook.out 2>&1 &`  
-3) 配置 `/etc/nginx/conf.d/webhook.conf`：  
+3) 配置 `sudo nano /etc/nginx/conf.d/webhook.conf`：  
    ```nginx
    server {
      listen 80;
