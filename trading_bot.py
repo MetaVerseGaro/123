@@ -1652,13 +1652,6 @@ class TradingBot:
 
     async def _get_last_trade_price(self, best_bid: Optional[Decimal] = None, best_ask: Optional[Decimal] = None) -> Optional[Decimal]:
         """Fetch last traded price; fallback to mid price if unavailable."""
-        if hasattr(self.exchange_client, "get_last_traded_price"):
-            try:
-                price = await self.exchange_client.get_last_traded_price(self.config.contract_id)
-                if price is not None:
-                    return Decimal(str(price))
-            except Exception as exc:
-                self.logger.log(f"[PRICE] get_last_traded_price failed: {exc}", "WARNING")
         if best_bid is not None and best_ask is not None:
             try:
                 return (Decimal(best_bid) + Decimal(best_ask)) / 2
