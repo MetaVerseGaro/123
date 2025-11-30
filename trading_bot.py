@@ -148,7 +148,8 @@ class TradingBot:
         self.recent_pivots: deque[PivotPoint] = deque(maxlen=12)
         self._processed_pivot_keys: Set[Tuple[str, str]] = set()
         self._last_pivot_poll: float = 0.0
-        self._pivot_poll_interval: float = float(os.getenv("PIVOT_POLL_INTERVAL_SEC", "30"))
+        default_interval = float(self.zigzag_timeframe_sec or 60)
+        self._pivot_poll_interval: float = float(os.getenv("PIVOT_POLL_INTERVAL_SEC", str(int(default_interval))))
         self.webhook_sl = bool(getattr(config, "webhook_sl", False) or str(os.getenv("WEBHOOK_SL", "false")).lower() == "true")
         self.webhook_sl_fast = bool(getattr(config, "webhook_sl_fast", False) or str(os.getenv("WEBHOOK_SL_FAST", "false")).lower() == "true")
         self.webhook_reverse = bool(getattr(config, "webhook_reverse", False) or str(os.getenv("WEBHOOK_REVERSE", "false")).lower() == "true")
