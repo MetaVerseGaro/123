@@ -4,18 +4,20 @@ Modular Trading Bot - Supports multiple exchanges
 
 import os
 import time
+import json
 import asyncio
 import traceback
+from pathlib import Path
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from decimal import Decimal
-from typing import Optional
+from typing import Optional, Dict, List, Tuple, Set, Any
 from collections import deque
 
 from exchanges import ExchangeFactory
 from helpers import TradingLogger
 from helpers.lark_bot import LarkBot
 from helpers.telegram_bot import TelegramBot
-from helpers.zigzag_tracker import ZigZagTracker, ZigZagEvent
 
 
 @dataclass
@@ -39,6 +41,11 @@ class TradingConfig:
     basic_release_timeout_minutes: int = 0
     enable_advanced_risk: bool = True
     enable_basic_risk: bool = True
+    webhook_sl: bool = False
+    webhook_sl_fast: bool = False
+    webhook_reverse: bool = False
+    zigzag_pivot_file: Optional[str] = None
+    webhook_basic_direction_file: Optional[str] = None
 
     @property
     def close_order_side(self) -> str:
@@ -60,6 +67,16 @@ class OrderMonitor:
         self.filled = False
         self.filled_price = None
         self.filled_qty = 0.0
+
+
+@dataclass
+class PivotPoint:
+    """External ZigZag pivot enriched with price information."""
+    label: str
+    price: Decimal
+    close_time: datetime
+    timeframe: str
+    raw_ticker: str
 
 
 class TradingBot:
@@ -89,13 +106,8 @@ class TradingBot:
         self.shutdown_requested = False
         self.loop = None
         self.stop_loss_triggered = False
-        self.zigzag = None
-        self.zigzag_params = {
-            "depth": int(os.getenv("ZIGZAG_DEPTH", "15")),
-            "deviation_pct": Decimal(os.getenv("ZIGZAG_DEVIATION", "5")),
-            "backstep": int(os.getenv("ZIGZAG_BACKSTEP", "2")),
-        }
         self.dynamic_stop_price: Optional[Decimal] = None
+        self.dynamic_stop_direction: Optional[str] = None
         self.current_direction: Optional[str] = self.config.direction.lower()
         self.reversing = False
         self.last_confirmed_low: Optional[Decimal] = None
@@ -123,15 +135,29 @@ class TradingBot:
         self.enable_notifications = str(os.getenv('ENABLE_NOTIFICATIONS', 'false')).lower() == 'true'
         self.daily_pnl_report = str(os.getenv('DAILY_PNL_REPORT', 'false')).lower() == 'true'
         self.current_sl_order_id: Optional[Decimal] = None
-        self.zigzag_current_direction: int = 0
         self.break_buffer_ticks = Decimal(os.getenv('ZIGZAG_BREAK_BUFFER_TICKS', '10'))
         self.zigzag_timeframe = os.getenv('ZIGZAG_TIMEFRAME', '1m')
-        self.zigzag_warmup_candles = int(os.getenv('ZIGZAG_WARMUP_CANDLES', '200'))
         self.zigzag_timeframe_sec = self._parse_timeframe_to_seconds(self.zigzag_timeframe)
-        self._zz_period_start: Optional[float] = None
-        self._zz_high: Optional[Decimal] = None
-        self._zz_low: Optional[Decimal] = None
-        self.recent_pivots: deque = deque(maxlen=4)
+        self.zigzag_timeframe_key = self._normalize_timeframe_key(self.zigzag_timeframe)
+        self.symbol_base = self._extract_symbol_base(self.config.ticker)
+        self.base_dir = Path(__file__).resolve().parent
+        pivot_path_cfg = getattr(config, "zigzag_pivot_file", None)
+        dir_path_cfg = getattr(config, "webhook_basic_direction_file", None)
+        self.zigzag_pivot_file = self._resolve_path(pivot_path_cfg or os.getenv('ZIGZAG_PIVOT_FILE', 'zigzag_pivots.json'))
+        self.basic_direction_file = self._resolve_path(dir_path_cfg or os.getenv('WEBHOOK_BASIC_DIRECTION_FILE', 'webhook_basic_direction.json'))
+        self.recent_pivots: deque[PivotPoint] = deque(maxlen=12)
+        self._processed_pivot_keys: Set[Tuple[str, str]] = set()
+        self._last_pivot_poll: float = 0.0
+        self._pivot_poll_interval: float = float(os.getenv("PIVOT_POLL_INTERVAL_SEC", "30"))
+        self.webhook_sl = bool(getattr(config, "webhook_sl", False) or str(os.getenv("WEBHOOK_SL", "false")).lower() == "true")
+        self.webhook_sl_fast = bool(getattr(config, "webhook_sl_fast", False) or str(os.getenv("WEBHOOK_SL_FAST", "false")).lower() == "true")
+        self.webhook_reverse = bool(getattr(config, "webhook_reverse", False) or str(os.getenv("WEBHOOK_REVERSE", "false")).lower() == "true")
+        self.webhook_latest_direction: Optional[str] = None
+        self.webhook_stop_mode: Optional[str] = None  # None | fast | slow
+        self.webhook_target_direction: Optional[str] = None
+        self.webhook_reverse_pending: bool = False
+        self.webhook_block_trading: bool = False
+        self.webhook_unwind_last_ts: float = 0.0
         # Risk control
 # Risk control
         self.risk_pct = Decimal(os.getenv("RISK_PCT", "0.5"))
@@ -165,6 +191,15 @@ class TradingBot:
             self.enable_zigzag = False
             self.enable_dynamic_sl = False
             self.enable_auto_reverse = False
+        if self.webhook_sl:
+            if self.enable_advanced_risk:
+                self.logger.log("[CONFIG] Advanced risk enabled, ignoring webhook_sl to keep modes exclusive", "WARNING")
+                self.webhook_sl = False
+            else:
+                self.enable_zigzag = False
+                self.enable_dynamic_sl = False
+                self.enable_auto_reverse = False
+                self.enable_advanced_risk = False
         # 如果未开启ZigZag 或未开启自动反手，则不使用 fast 模式
         if not self.enable_zigzag:
             self.enable_auto_reverse = False
@@ -229,6 +264,72 @@ class TradingBot:
             return int(tf)
         except Exception:
             return 60
+
+    def _resolve_path(self, path_str: str) -> Path:
+        """Resolve a file path relative to the project root."""
+        path = Path(str(path_str))
+        if not path.is_absolute():
+            return (self.base_dir / path).resolve()
+        return path
+
+    def _extract_symbol_base(self, ticker: str) -> str:
+        """Extract base symbol prefix (letters before the first non-letter)."""
+        base_chars = []
+        for ch in ticker:
+            if ch.isalpha():
+                base_chars.append(ch)
+            else:
+                break
+        return ("".join(base_chars) or ticker).upper()
+
+    def _normalize_timeframe_key(self, tf: str) -> str:
+        """Normalize timeframe to minutes string for pivot store matching."""
+        tf = str(tf).strip().lower()
+        if tf.endswith("m"):
+            return tf[:-1] or "0"
+        if tf.endswith("h"):
+            try:
+                return str(int(tf[:-1]) * 60)
+            except Exception:
+                return tf
+        if tf.endswith("s"):
+            try:
+                sec = int(tf[:-1])
+                return str(int(sec // 60)) if sec % 60 == 0 else str(sec)
+            except Exception:
+                return tf
+        return tf
+
+    def _parse_pivot_time(self, value: str) -> Optional[datetime]:
+        """Parse pivot close time into UTC datetime."""
+        candidates = [
+            "%Y-%m-%dT%H:%M:%SZ",
+            "%Y-%m-%d %H:%M",
+            "%Y-%m-%d %H:%M:%S",
+        ]
+        for fmt in candidates:
+            try:
+                return datetime.strptime(value, fmt).replace(tzinfo=timezone.utc)
+            except Exception:
+                continue
+        try:
+            dt = datetime.fromisoformat(value)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            return dt.astimezone(timezone.utc)
+        except Exception:
+            return None
+
+    def _load_json_file(self, path: Path) -> Optional[Dict]:
+        """Load JSON content from a file if it exists."""
+        try:
+            if not path.exists():
+                return None
+            with open(path, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception as exc:
+            self.logger.log(f"[WEBHOOK] Failed to load {path}: {exc}", "WARNING")
+            return None
 
     async def graceful_shutdown(self, reason: str = "Unknown"):
         """Perform graceful shutdown of the trading bot."""
@@ -529,17 +630,13 @@ class TradingBot:
                 pass
         self.current_sl_order_id = None
 
-    def _update_confirmed_pivots(self, event: ZigZagEvent):
-        """Update confirmed high/low based on ZigZag event."""
-        if event.label in ("HH", "LH"):
-            self.last_confirmed_high = event.price
-        if event.label in ("LL", "HL"):
-            self.last_confirmed_low = event.price
-        self.recent_pivots.append(event)
-        if self.enable_notifications and self.loop is not None:
-            items = [f"{p.label}@{p.price}" for p in self.recent_pivots]
-            msg = "[ZIGZAG] 最新确认高低点: " + " | ".join(items)
-            asyncio.create_task(self.send_notification(msg))
+    def _update_confirmed_pivots(self, pivot: PivotPoint):
+        """Update confirmed high/low based on external ZigZag pivot."""
+        if pivot.label in ("HH", "LH"):
+            self.last_confirmed_high = pivot.price
+        if pivot.label in ("LL", "HL"):
+            self.last_confirmed_low = pivot.price
+        self.recent_pivots.append(pivot)
 
     def _compute_dynamic_stop(self, direction: str) -> Optional[Decimal]:
         """Compute dynamic stop based on confirmed pivots and tick buffer (10 ticks)."""
@@ -550,6 +647,175 @@ class TradingBot:
         if direction == "sell" and self.last_confirmed_high is not None:
             return self.last_confirmed_high + buffer_ticks
         return None
+
+    def _get_candle_close_ts(self, candle: Any) -> Optional[int]:
+        """Extract candle close timestamp in ms from various field names."""
+        keys = ["timestamp", "close_time", "close_timestamp", "ts", "t"]
+        for key in keys:
+            val = None
+            if isinstance(candle, dict):
+                val = candle.get(key)
+            else:
+                val = getattr(candle, key, None)
+            if val is None:
+                continue
+            try:
+                return int(val)
+            except Exception:
+                continue
+        return None
+
+    async def _fetch_candle_for_time(self, close_time: datetime) -> Optional[Tuple[Decimal, Decimal]]:
+        """Fetch OHLC candle that ends at the given UTC close time."""
+        target_ms = int(close_time.replace(tzinfo=timezone.utc).timestamp() * 1000)
+        tf = self.zigzag_timeframe
+        if hasattr(self.exchange_client, "fetch_candle_by_close_time"):
+            try:
+                candle = await self.exchange_client.fetch_candle_by_close_time(
+                    timeframe=tf,
+                    close_time_ms=target_ms
+                )
+                if candle:
+                    if isinstance(candle, tuple) and len(candle) == 2:
+                        return candle
+                    high_val = getattr(candle, "high", None) if not isinstance(candle, dict) else candle.get("high")
+                    low_val = getattr(candle, "low", None) if not isinstance(candle, dict) else candle.get("low")
+                    if high_val is not None and low_val is not None:
+                        return Decimal(str(high_val)), Decimal(str(low_val))
+            except Exception as exc:
+                self.logger.log(f"[ZIGZAG] fetch_candle_by_close_time failed: {exc}", "WARNING")
+        if hasattr(self.exchange_client, "fetch_history_candles"):
+            try:
+                candles = await self.exchange_client.fetch_history_candles(limit=300, timeframe=tf)
+                for c in candles:
+                    ts_val = self._get_candle_close_ts(c)
+                    if ts_val is not None and int(ts_val) == target_ms:
+                        high_val = getattr(c, "high", None) if not isinstance(c, dict) else c.get("high")
+                        low_val = getattr(c, "low", None) if not isinstance(c, dict) else c.get("low")
+                        if high_val is None or low_val is None:
+                            continue
+                        return Decimal(str(high_val)), Decimal(str(low_val))
+            except Exception as exc:
+                self.logger.log(f"[ZIGZAG] fetch_history_candles failed: {exc}", "WARNING")
+        return None
+
+    def _load_pivots_for_config(self) -> List[Dict[str, Any]]:
+        """Load pivot entries for current symbol/timeframe from persisted store."""
+        store = self._load_json_file(self.zigzag_pivot_file) or {}
+        base_bucket = store.get(self.symbol_base, {}) if isinstance(store, dict) else {}
+        tf_bucket = base_bucket.get(self.zigzag_timeframe_key) or base_bucket.get(str(self.zigzag_timeframe_key))
+        if not tf_bucket:
+            return []
+        pivots: List[Dict[str, Any]] = []
+        for item in tf_bucket[-10:]:
+            try:
+                label = str(item.get("label")).upper()
+                raw_ticker = item.get("raw_ticker") or item.get("ticker") or self.config.ticker
+                tf_val = item.get("tf") or item.get("timeframe") or self.zigzag_timeframe_key
+                if self._normalize_timeframe_key(tf_val) != self.zigzag_timeframe_key:
+                    continue
+                close_raw = item.get("close_time_utc") or item.get("pivot_bar_close") or item.get("close_time")
+                close_dt = self._parse_pivot_time(str(close_raw)) if close_raw else None
+                if not label or close_dt is None:
+                    continue
+                pivots.append({
+                    "label": label,
+                    "raw_ticker": raw_ticker,
+                    "close_time": close_dt,
+                })
+            except Exception:
+                continue
+        pivots.sort(key=lambda x: x["close_time"])
+        return pivots
+
+    async def _build_pivot_point(self, entry: Dict[str, Any]) -> Optional[PivotPoint]:
+        """Build PivotPoint with price derived from exchange OHLC data."""
+        candle = await self._fetch_candle_for_time(entry["close_time"])
+        if not candle:
+            self.logger.log(f"[ZIGZAG] Missing OHLC for pivot at {entry['close_time']}", "WARNING")
+            return None
+        high, low = candle
+        price = high if entry["label"] in ("HH", "LH") else low
+        return PivotPoint(
+            label=entry["label"],
+            price=price,
+            close_time=entry["close_time"],
+            timeframe=self.zigzag_timeframe_key,
+            raw_ticker=entry.get("raw_ticker", self.config.ticker),
+        )
+
+    async def _build_pivot_points(self, entries: List[Dict[str, Any]]) -> List[Tuple[Tuple[str, str], PivotPoint]]:
+        """Convert raw entries into pivot points with processed keys."""
+        result: List[Tuple[Tuple[str, str], PivotPoint]] = []
+        for entry in entries:
+            pivot = await self._build_pivot_point(entry)
+            if not pivot:
+                continue
+            key = (pivot.close_time.isoformat(), pivot.label)
+            result.append((key, pivot))
+        result.sort(key=lambda x: x[1].close_time)
+        return result
+
+    async def _sync_external_pivots(self, force: bool = False, notify: bool = True):
+        """Poll pivot store for new entries and refresh state."""
+        if not self.enable_zigzag:
+            return
+        now = time.time()
+        if (not force) and (now - self._last_pivot_poll < self._pivot_poll_interval):
+            return
+        self._last_pivot_poll = now
+        entries = self._load_pivots_for_config()
+        if not entries:
+            return
+        pivot_points = await self._build_pivot_points(entries)
+        for key, pivot in pivot_points:
+            if key in self._processed_pivot_keys:
+                continue
+            self._processed_pivot_keys.add(key)
+            await self._handle_pivot_event(pivot, notify=notify)
+
+    async def _set_initial_direction_from_pivots(self, pivots: List[PivotPoint]):
+        """Set initial direction based on latest HH/LL pivot when advanced risk is on."""
+        if not pivots or not (self.enable_advanced_risk and self.stop_loss_enabled and self.enable_zigzag):
+            return
+        candidates = [p for p in pivots if p.label in ("HH", "LL")]
+        if not candidates:
+            return
+        latest = max(candidates, key=lambda p: p.close_time)
+        desired_dir = "buy" if latest.label == "HH" else "sell"
+        if desired_dir != self.config.direction:
+            self.config.direction = desired_dir
+            self.current_direction = desired_dir
+            self.logger.log(f"[INIT] Direction set to {desired_dir.upper()} via pivot {latest.label} at {latest.close_time}", "INFO")
+
+    async def _initialize_pivots_from_store(self):
+        """Load existing pivots on startup to seed state without notifications."""
+        if not self.enable_zigzag:
+            return
+        entries = self._load_pivots_for_config()
+        if not entries:
+            return
+        pivot_points = await self._build_pivot_points(entries)
+        for key, pivot in pivot_points:
+            self._processed_pivot_keys.add(key)
+            await self._handle_pivot_event(pivot, notify=False)
+        await self._set_initial_direction_from_pivots([p for _, p in pivot_points])
+        if self.enable_dynamic_sl and (self.last_confirmed_high or self.last_confirmed_low):
+            await self._refresh_stop_loss(force=True)
+
+    async def _notify_recent_pivots(self):
+        """Send notification with recent pivots (latest first)."""
+        if not self.enable_notifications or not self.recent_pivots:
+            return
+        latest = list(self.recent_pivots)[-5:][::-1]
+        lines = ["zigzag info:", ""]
+        for pivot in latest:
+            price_val = pivot.price.quantize(self.config.tick_size) if self.config.tick_size else pivot.price
+            close_str = pivot.close_time.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M")
+            lines.append(
+                f"- {self.symbol_base} | TF={self.zigzag_timeframe_key} | {self.config.exchange} | {pivot.label} | close time {close_str}(UTC) | price @{price_val}"
+            )
+        await self.send_notification("\n".join(lines))
 
     async def _refresh_stop_loss(self, force: bool = False):
         """Refresh native stop-loss according to current position and dynamic SL."""
@@ -569,12 +835,23 @@ class TradingBot:
                 except Exception:
                     pass
                 self.current_sl_order_id = None
+            self.dynamic_stop_price = None
+            self.dynamic_stop_direction = None
             return
 
         direction = "buy" if pos_signed > 0 else "sell"
-        dyn_stop = self._compute_dynamic_stop(direction)
-        if dyn_stop is None:
+        if self.dynamic_stop_direction and self.dynamic_stop_direction != direction:
+            self.dynamic_stop_price = None
+        struct_stop = self._compute_dynamic_stop(direction)
+        if struct_stop is None:
             return
+
+        dyn_stop = struct_stop
+        if self.dynamic_stop_price is not None:
+            if direction == "buy":
+                dyn_stop = max(struct_stop, self.dynamic_stop_price)
+            else:
+                dyn_stop = min(struct_stop, self.dynamic_stop_price)
 
         if (not force) and self.dynamic_stop_price is not None:
             if abs(dyn_stop - self.dynamic_stop_price) < self.config.tick_size:
@@ -582,6 +859,7 @@ class TradingBot:
                 return
 
         self.dynamic_stop_price = dyn_stop
+        self.dynamic_stop_direction = direction
         await self._place_stop_loss_native(pos_abs, dyn_stop, 'sell' if direction == "buy" else 'buy')
         # After SL update, re-evaluate redundancy and optionally stop new orders
         await self._run_redundancy_check(direction, pos_signed)
@@ -661,29 +939,20 @@ class TradingBot:
         except Exception as e:
             self.logger.log(f"[RISK] redundancy check after SL update failed: {e}", "WARNING")
 
-    async def _handle_zigzag_event(self, event: ZigZagEvent):
-        """Handle ZigZag pivot events: update pivots, dynamic SL, and optional auto-reverse."""
-        self._update_confirmed_pivots(event)
+    async def _handle_pivot_event(self, pivot: PivotPoint, notify: bool = True):
+        """Handle external ZigZag pivot: update pivots, dynamic SL, and slow reverse follow-up."""
+        self._update_confirmed_pivots(pivot)
 
-        # Slow reverse follow-up handling
         if self.pending_reverse_state:
-            handled = await self._process_slow_reverse_followup(event)
+            handled = await self._process_slow_reverse_followup(pivot)
             if handled:
                 return
 
-        # Reverse conditions: short -> HH triggers long; long -> LL triggers short
-        current_dir = self.config.direction.lower()
-        if self.enable_auto_reverse:
-            if current_dir == "buy" and event.label == "LL":
-                await self._handle_reverse_signal("sell", event.price)
-                return
-            if current_dir == "sell" and event.label == "HH":
-                await self._handle_reverse_signal("buy", event.price)
-                return
-
-        # If not reversing, just refresh stop-loss if needed
         if self.enable_dynamic_sl:
             await self._refresh_stop_loss(force=True)
+
+        if notify and self.enable_notifications:
+            await self._notify_recent_pivots()
 
     async def _handle_reverse_signal(self, new_direction: str, pivot_price: Decimal):
         """Handle reverse signal based on configured mode."""
@@ -726,6 +995,9 @@ class TradingBot:
 
         # Update direction and reset timers
         self.config.direction = new_direction
+        self.current_direction = new_direction
+        self.dynamic_stop_price = None
+        self.dynamic_stop_direction = None
         self.last_open_order_time = 0
 
         # Refresh stop loss for new direction
@@ -767,28 +1039,26 @@ class TradingBot:
         self.pending_original_direction = None
         self._set_stop_new_orders(False)
 
-    async def _process_slow_reverse_followup(self, event: ZigZagEvent) -> bool:
+    async def _process_slow_reverse_followup(self, pivot: PivotPoint) -> bool:
         """Process next confirmed pivot for slow reverse logic. Returns True if handled."""
         if self.pending_reverse_state != "waiting_next_pivot":
             return False
 
-        # If pending reverse to sell (current long broke low)
         if self.pending_reverse_direction == "sell":
-            if event.label == "LH":
+            if pivot.label == "LH":
                 await self._cancel_close_orders()
                 self.pending_reverse_state = "unwinding"
                 return True
-            if event.label == "HH":
+            if pivot.label == "HH":
                 await self._resume_after_invalid_reverse()
                 return True
 
-        # If pending reverse to buy (current short broke high)
         if self.pending_reverse_direction == "buy":
-            if event.label == "HL":
+            if pivot.label == "HL":
                 await self._cancel_close_orders()
                 self.pending_reverse_state = "unwinding"
                 return True
-            if event.label == "LL":
+            if pivot.label == "LL":
                 await self._resume_after_invalid_reverse()
                 return True
 
@@ -829,7 +1099,7 @@ class TradingBot:
         """Place an order and monitor its execution."""
         try:
             # Risk gate: stop new orders when flag is set
-            if self.stop_new_orders:
+            if self.stop_new_orders or self.webhook_block_trading:
                 return False
             # Reset state before placing order
             self.order_filled_event.clear()
@@ -895,11 +1165,14 @@ class TradingBot:
                     return new_order_price >= order_result_price
                 return False
 
+            current_order_status = None
             if self.config.exchange == "lighter":
-                current_order_status = self.exchange_client.current_order.status
-            else:
+                current_order_status = getattr(self.exchange_client.current_order, "status", None)
+            if current_order_status is None:
                 order_info = await self.exchange_client.get_order_info(order_id)
-                current_order_status = order_info.status
+                current_order_status = getattr(order_info, "status", None)
+            if current_order_status is None:
+                current_order_status = order_result.status or "OPEN"
 
             while (
                 should_wait(self.config.direction, new_order_price, order_result.price)
@@ -1213,6 +1486,9 @@ class TradingBot:
                 if self.enable_basic_risk and self.max_position_limit is not None and position_amt < self.max_position_limit:
                     self.basic_full_since = None
 
+                if self.webhook_sl:
+                    await self._poll_webhook_direction()
+
                 return mismatch_detected
 
             except Exception as e:
@@ -1220,6 +1496,115 @@ class TradingBot:
                 self.logger.log(f"Traceback: {traceback.format_exc()}", "ERROR")
 
             print("--------------------------------")
+
+    async def _cancel_all_orders_safely(self):
+        """Cancel all orders with best-effort handling."""
+        if hasattr(self.exchange_client, "cancel_all_orders"):
+            try:
+                await self.exchange_client.cancel_all_orders()
+                self._invalidate_order_cache()
+                return
+            except Exception as exc:
+                self.logger.log(f"[WEBHOOK] cancel_all_orders failed: {exc}", "WARNING")
+        try:
+            active_orders = await self._get_active_orders_cached()
+            for order in active_orders:
+                try:
+                    await self.exchange_client.cancel_order(order.order_id)
+                except Exception as exc:
+                    self.logger.log(f"[WEBHOOK] Cancel order {order.order_id} failed: {exc}", "WARNING")
+            self._invalidate_order_cache()
+        except Exception as exc:
+            self.logger.log(f"[WEBHOOK] Fetch active orders for cancel failed: {exc}", "WARNING")
+
+    async def _poll_webhook_direction(self):
+        """Poll basic webhook direction file and trigger stop/reverse when needed."""
+        if not self.webhook_sl:
+            return
+        data = self._load_json_file(self.basic_direction_file)
+        entry = data.get(self.symbol_base) if isinstance(data, dict) else None
+        if not entry:
+            return
+        webhook_dir = str(entry.get("direction", "")).lower()
+        if webhook_dir not in ("buy", "sell"):
+            return
+        self.webhook_latest_direction = webhook_dir
+        if webhook_dir == self.config.direction and not self.webhook_stop_mode:
+            if self.webhook_block_trading:
+                self.webhook_block_trading = False
+                self._set_stop_new_orders(False)
+            return
+        await self._handle_webhook_signal(webhook_dir)
+
+    async def _handle_webhook_signal(self, webhook_dir: str):
+        """Handle webhook stop/reverse directive."""
+        if self.webhook_stop_mode and self.webhook_target_direction == webhook_dir:
+            return
+        self.webhook_block_trading = True
+        self._set_stop_new_orders(True)
+        self.webhook_target_direction = webhook_dir
+        self.webhook_reverse_pending = self.webhook_reverse
+        self.webhook_unwind_last_ts = 0.0
+        self.webhook_stop_mode = "fast" if self.webhook_sl_fast else "slow"
+        await self._cancel_all_orders_safely()
+        if self.webhook_sl_fast and self.enable_notifications:
+            await self.send_notification(f"[WEBHOOK] Fast stop toward {webhook_dir.upper()} signal")
+        if self.webhook_sl_fast:
+            await self._handle_webhook_stop_tasks()
+        else:
+            if self.enable_notifications:
+                await self.send_notification(f"[WEBHOOK] Slow stop toward {webhook_dir.upper()} signal (stop new + cancel orders)")
+
+    async def _handle_webhook_stop_tasks(self) -> bool:
+        """Progress webhook stop/unwind; return True if webhook flow handled this tick."""
+        if not self.webhook_stop_mode:
+            return False
+        try:
+            pos_signed = await self._get_position_signed_cached()
+        except Exception as exc:
+            self.logger.log(f"[WEBHOOK] Failed to fetch position during webhook stop: {exc}", "WARNING")
+            return True
+
+        pos_abs = abs(pos_signed)
+        if pos_abs > 0:
+            close_side = "sell" if pos_signed > 0 else "buy"
+            if self.webhook_stop_mode == "fast":
+                try:
+                    await self.exchange_client.reduce_only_close_with_retry(pos_abs, close_side)
+                except Exception as exc:
+                    self.logger.log(f"[WEBHOOK] Fast stop close failed: {exc}", "ERROR")
+                return True
+            if time.time() - self.webhook_unwind_last_ts >= max(self.config.wait_time, 1):
+                close_qty = min(self.config.quantity, pos_abs)
+                try:
+                    await self.exchange_client.reduce_only_close_with_retry(close_qty, close_side)
+                except Exception as exc:
+                    self.logger.log(f"[WEBHOOK] Slow stop close failed: {exc}", "WARNING")
+                self.webhook_unwind_last_ts = time.time()
+            return True
+
+        # Position flat: finalize stop/reverse
+        await self._cancel_all_orders_safely()
+        if self.webhook_reverse_pending and self.webhook_target_direction:
+            self.config.direction = self.webhook_target_direction
+            self.current_direction = self.config.direction
+            self.webhook_reverse_pending = False
+            self.webhook_block_trading = False
+            self.webhook_stop_mode = None
+            self.webhook_target_direction = None
+            self.dynamic_stop_price = None
+            self.dynamic_stop_direction = None
+            self._set_stop_new_orders(False)
+            if self.enable_notifications:
+                await self.send_notification(f"[WEBHOOK] Reversed to {self.config.direction.upper()} after webhook stop")
+            await self._place_and_monitor_open_order()
+        else:
+            if self.enable_notifications and self.webhook_latest_direction:
+                await self.send_notification(f"[WEBHOOK] Flattened after {self.webhook_latest_direction.upper()} signal")
+            self.webhook_stop_mode = None
+            self.webhook_target_direction = None
+            # Keep stop_new_orders until direction aligns again
+        return True
 
     async def _meet_grid_step_condition(self) -> bool:
         if self.active_close_orders:
@@ -1248,6 +1633,27 @@ class TradingBot:
         else:
             return True
 
+    async def _get_last_trade_price(self, best_bid: Optional[Decimal] = None, best_ask: Optional[Decimal] = None) -> Optional[Decimal]:
+        """Fetch last traded price; fallback to mid price if unavailable."""
+        if hasattr(self.exchange_client, "get_last_traded_price"):
+            try:
+                price = await self.exchange_client.get_last_traded_price(self.config.contract_id)
+                if price is not None:
+                    return Decimal(str(price))
+            except Exception as exc:
+                self.logger.log(f"[PRICE] get_last_traded_price failed: {exc}", "WARNING")
+        if best_bid is not None and best_ask is not None:
+            try:
+                return (Decimal(best_bid) + Decimal(best_ask)) / 2
+            except Exception:
+                pass
+        try:
+            bid, ask = await self.exchange_client.fetch_bbo_prices(self.config.contract_id)
+            return (bid + ask) / 2
+        except Exception as exc:
+            self.logger.log(f"[PRICE] Fallback trade price failed: {exc}", "WARNING")
+            return None
+
     async def _check_price_condition(self):
         stop_trading = False
         pause_trading = False
@@ -1255,56 +1661,28 @@ class TradingBot:
         best_bid = None
         best_ask = None
 
+        await self._sync_external_pivots()
         best_bid, best_ask = await self.exchange_client.fetch_bbo_prices(self.config.contract_id)
-        # Update ZigZag tracker using current best bid/ask
-        if self.enable_zigzag and self.zigzag and self.zigzag_timeframe_sec > 0:
-            try:
-                now = time.time()
-                # Initialize candle bucket
-                if self._zz_period_start is None:
-                    self._zz_period_start = int(now // self.zigzag_timeframe_sec) * self.zigzag_timeframe_sec
-                    self._zz_high = Decimal(best_ask)
-                    self._zz_low = Decimal(best_bid)
-                else:
-                    # New period?
-                    if now >= self._zz_period_start + self.zigzag_timeframe_sec:
-                        # Emit previous period
-                        if self._zz_high is not None and self._zz_low is not None:
-                            event = self.zigzag.update(self._zz_high, self._zz_low, ts=self._zz_period_start)
-                            if event:
-                                self.logger.log(f"[ZIGZAG] {event.label} @ {event.price} dir={event.direction}", "INFO")
-                                self.zigzag_current_direction = event.direction
-                                await self._handle_zigzag_event(event)
-                        # reset period
-                        self._zz_period_start = int(now // self.zigzag_timeframe_sec) * self.zigzag_timeframe_sec
-                        self._zz_high = Decimal(best_ask)
-                        self._zz_low = Decimal(best_bid)
-                    else:
-                        # update high/low within bucket
-                        if self._zz_high is None or Decimal(best_ask) > self._zz_high:
-                            self._zz_high = Decimal(best_ask)
-                        if self._zz_low is None or Decimal(best_bid) < self._zz_low:
-                            self._zz_low = Decimal(best_bid)
-            except Exception as e:
-                self.logger.log(f"[ZIGZAG] update failed: {e}", "WARNING")
         if best_bid <= 0 or best_ask <= 0 or best_bid >= best_ask:
             raise ValueError("No bid/ask data available")
+
+        trade_price = await self._get_last_trade_price(best_bid, best_ask)
 
         if self.enable_dynamic_sl and self.dynamic_stop_price is not None and (not self.stop_loss_triggered):
             if self.config.direction == "buy" and best_bid <= self.dynamic_stop_price:
                 stop_loss_triggered = True
             elif self.config.direction == "sell" and best_ask >= self.dynamic_stop_price:
                 stop_loss_triggered = True
-        # Immediate reverse on break of confirmed high/low (± buffer ticks)
-        if self.enable_zigzag and self.enable_auto_reverse:
+        # Immediate reverse on break of confirmed high/low (trade price +/- buffer ticks)
+        if self.enable_zigzag and self.enable_auto_reverse and trade_price is not None:
             buffer = self.break_buffer_ticks * self.config.tick_size
-            if self.last_confirmed_high is not None and best_ask >= (self.last_confirmed_high + buffer):
+            if self.last_confirmed_high is not None and trade_price >= (self.last_confirmed_high + buffer):
                 if self.config.direction == "sell":
-                    await self._handle_reverse_signal("buy", Decimal(best_ask))
+                    await self._handle_reverse_signal("buy", Decimal(trade_price))
                     return stop_trading, pause_trading, stop_loss_triggered, best_bid, best_ask
-            if self.last_confirmed_low is not None and best_bid <= (self.last_confirmed_low - buffer):
+            if self.last_confirmed_low is not None and trade_price <= (self.last_confirmed_low - buffer):
                 if self.config.direction == "buy":
-                    await self._handle_reverse_signal("sell", Decimal(best_bid))
+                    await self._handle_reverse_signal("sell", Decimal(trade_price))
                     return stop_trading, pause_trading, stop_loss_triggered, best_bid, best_ask
 
         if self.config.stop_price != -1:
@@ -1411,32 +1789,17 @@ class TradingBot:
         """Main trading loop."""
         try:
             self.config.contract_id, self.config.tick_size = await self.exchange_client.get_contract_attributes()
-            # Initialize ZigZag tracker once tick size is known
+
+            # Capture the running event loop for thread-safe callbacks
+            self.loop = asyncio.get_running_loop()
+            # Connect to exchange
+            await self.exchange_client.connect()
+
+            # wait for connection to establish
+            await asyncio.sleep(5)
+
             if self.enable_zigzag:
-                self.zigzag = ZigZagTracker(
-                    depth=self.zigzag_params["depth"],
-                    deviation_pct=self.zigzag_params["deviation_pct"],
-                    backstep=self.zigzag_params["backstep"],
-                )
-                # Warmup ZigZag with history candles (lighter only)
-                if self.config.exchange == "lighter" and hasattr(self.exchange_client, "fetch_history_candles"):
-                    try:
-                        candles = await self.exchange_client.fetch_history_candles(
-                            limit=self.zigzag_warmup_candles,
-                            timeframe=self.zigzag_timeframe
-                        )
-                        for c in candles:
-                            high = Decimal(str(c.high))
-                            low = Decimal(str(c.low))
-                            ts_val = getattr(c, "timestamp", None)
-                            evt = self.zigzag.update(high, low, ts=ts_val)
-                            if evt:
-                                self._update_confirmed_pivots(evt)
-                        # After warmup, dynamic stop price based on confirmed pivots
-                        if self.enable_dynamic_sl:
-                            await self._refresh_stop_loss(force=True)
-                    except Exception as e:
-                        self.logger.log(f"[ZIGZAG] Warmup failed: {e}", "WARNING")
+                await self._initialize_pivots_from_store()
 
             # Log current TradingConfig
             self.logger.log("=== Trading Configuration ===", "INFO")
@@ -1458,19 +1821,16 @@ class TradingBot:
 
             if self.enable_notifications:
                 await self.send_notification(f"[START] {self.config.exchange.upper()} {self.config.ticker} bot started.")
-
-            # Capture the running event loop for thread-safe callbacks
-            self.loop = asyncio.get_running_loop()
-            # Connect to exchange
-            await self.exchange_client.connect()
-
-            # wait for connection to establish
-            await asyncio.sleep(5)
-
             # Main trading loop
             while not self.shutdown_requested:
                 try:
                     await self._maybe_send_daily_pnl()
+                    # Webhook slow/fast stop handling takes priority
+                    if self.webhook_sl and self.webhook_stop_mode:
+                        handled_webhook = await self._handle_webhook_stop_tasks()
+                        if handled_webhook:
+                            await asyncio.sleep(0.5 if self.webhook_stop_mode == "fast" else max(self.config.wait_time, 1))
+                            continue
                     # Handle pending slow reverse before normal flow
                     if self.pending_reverse_state == "unwinding":
                         await self._perform_slow_unwind()
