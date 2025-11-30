@@ -841,6 +841,7 @@ class TradingBot:
             return
 
         direction = "buy" if pos_signed > 0 else "sell"
+        prev_stop = self.dynamic_stop_price
         if self.dynamic_stop_direction and self.dynamic_stop_direction != direction:
             self.dynamic_stop_price = None
         struct_stop = self._compute_dynamic_stop(direction)
@@ -862,6 +863,11 @@ class TradingBot:
         self.dynamic_stop_price = dyn_stop
         self.dynamic_stop_direction = direction
         await self._place_stop_loss_native(pos_abs, dyn_stop, 'sell' if direction == "buy" else 'buy')
+        if self.enable_notifications and prev_stop != self.dynamic_stop_price:
+            try:
+                await self.send_notification(f"[SL] Dynamic stop updated from {prev_stop} to {self.dynamic_stop_price} for {direction.upper()}")
+            except Exception:
+                pass
         # After SL update, re-evaluate redundancy and optionally stop new orders
         await self._run_redundancy_check(direction, pos_signed)
         # Cancel open orders that are beyond the new SL
@@ -917,6 +923,16 @@ class TradingBot:
                 if redundancy_u < 0:
                     redundancy_u = Decimal(0)
                 redundancy_base = redundancy_u / per_base_loss if per_base_loss > 0 else Decimal(0)
+                # 若冗余为 0 且持仓超额且超额 >= 最小下单量，则主动削减超额
+                excess = position_amt - redundancy_base
+                if redundancy_base <= 0 and excess >= self.min_order_size and position_amt > 0:
+                    try:
+                        close_qty = excess
+                        close_side = 'sell' if pos_signed > 0 else 'buy'
+                        await self.exchange_client.reduce_only_close_with_retry(close_qty, close_side)
+                        self.logger.log(f"[RISK] Reduced excess position {close_qty} to keep stop-loss exposure within limit", "WARNING")
+                    except Exception as e:
+                        self.logger.log(f"[RISK] Failed to trim excess position: {e}", "ERROR")
                 if redundancy_base < self.config.quantity:
                     if not self.stop_new_orders and self.enable_notifications:
                         await self.send_notification(f"[RISK] Stop new orders after SL update: redundancy {redundancy_base} < qty {self.config.quantity}")
