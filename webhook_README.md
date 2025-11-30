@@ -128,9 +128,9 @@
    ```nginx
    server {
      listen 80;
-     server_name <公网IP>;
+     server_name 公网IP;  # 直接填 IP，无需保留尖括号；如果有域名可写域名
      location /webhook {
-       proxy_pass http://127.0.0.1:8080;
+       proxy_pass http://127.0.0.1:8080;  # 服务监听 8080 时不需要改这里
        proxy_set_header Host $host;
        proxy_set_header X-Real-IP $remote_addr;
        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
@@ -144,4 +144,3 @@
 5) 安全组放行 80（如需 HTTPS 再放 443；可自签或用 Let’s Encrypt 获取证书）。  
 6) TradingView 填：`http://<公网IP>/webhook`（或 `https://<公网IP>/webhook`）。  
 7) 验证：`curl -X POST http://<公网IP>/webhook -d 'buy | ETHUSDT.P'`，检查文件是否更新。
-
