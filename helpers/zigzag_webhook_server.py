@@ -1,390 +1,306 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 """
-Webhook server for ingesting TradingView ZigZag pivots and basic risk directions.
+ZigZag Webhook Server
 
-- Accepts ZigZag pivot messages (label/ticker/timeframe/close_time_utc) and keeps
-  the latest 10 per (base, timeframe) both in memory and on disk.
-- Accepts basic risk direction messages (buy/sell) per base symbol and persists
-  the latest entry.
-- Logs to logs/zigzag_webhook_YYYY-MM-DD.log (configurable) and removes logs
-  older than 7 days on startup.
+功能：
+- 接收 TradingView Webhook 的 ZigZag 报价信息
+- 解析出：label(HH/HL/LH/LL)、symbol_base(ETH/BTC...)、timeframe、pivot bar close UTC 时间
+- 按 (symbol_base, timeframe) 维护最近 4 个 pivot
+- 持久化到本地 zigzag_pivots.json，供 trading_bot 读取
+
+依赖：
+    pip install fastapi uvicorn
+
+启动示例：
+    python3 zigzag_webhook_server.py
+    # 默认监听 0.0.0.0:8000
 """
 
-import asyncio
-import json
-import logging
 import os
-import re
-from datetime import datetime, timedelta, timezone
-from pathlib import Path
-from typing import Any, Dict, Optional, Tuple
+import json
+import asyncio
+from datetime import datetime, timezone
+from typing import Dict, Any
 
-from aiohttp import web
+from fastapi import FastAPI, Request, HTTPException
+from fastapi.responses import JSONResponse
 
+# =========================
+# 配置
+# =========================
 
-BASE_DIR = Path(__file__).resolve().parent
+# 本地保存 pivot 的文件路径（可以用环境变量覆盖）
+PIVOTS_FILE_PATH = os.environ.get("ZIGZAG_PIVOTS_FILE", "zigzag_pivots.json")
 
-
-def resolve_path(path_str: str) -> Path:
-    """Resolve relative paths against project root."""
-    path = Path(path_str)
-    if not path.is_absolute():
-        return (BASE_DIR / path).resolve()
-    return path
-
-
-def setup_logging() -> None:
-    """Configure file logging with daily files and 7-day cleanup."""
-    log_dir = resolve_path(os.getenv("WEBHOOK_LOG_DIR", "logs"))
-    log_dir.mkdir(parents=True, exist_ok=True)
-    retention_days = int(os.getenv("WEBHOOK_LOG_RETENTION_DAYS", "7"))
-
-    cutoff = datetime.now(timezone.utc) - timedelta(days=retention_days)
-    for file in log_dir.glob("zigzag_webhook_*.log"):
-        try:
-            mtime = datetime.fromtimestamp(file.stat().st_mtime, tz=timezone.utc)
-            if mtime < cutoff:
-                file.unlink()
-        except Exception:
-            pass
-
-    log_file = log_dir / f"zigzag_webhook_{datetime.utcnow():%Y-%m-%d}.log"
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s | %(levelname)s | %(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S",
-        handlers=[
-            logging.FileHandler(log_file, encoding="utf-8"),
-            logging.StreamHandler(),
-        ],
-    )
+# TradingView 用的消息模板（示例）：
+# ZigZag HL | ETHUSDT.P | TF=1 | pivot bar close (UTC)=2025-11-28 18:05
 
 
-def extract_base_symbol(ticker: str) -> str:
-    """Extract base symbol prefix (letters before first non-letter)."""
-    base = []
-    for ch in ticker:
-        if ch.isalpha():
-            base.append(ch)
+# =========================
+# 全局状态
+# =========================
+
+# 结构：pivots_store[symbol_base][timeframe] = [pivot_dict, ...]  最多 4 条
+pivots_store: Dict[str, Dict[str, list[Dict[str, Any]]]] = {}
+store_lock = asyncio.Lock()
+
+app = FastAPI(title="ZigZag Webhook Receiver", version="1.0.0")
+
+
+# =========================
+# 工具函数
+# =========================
+
+def _now_utc_iso() -> str:
+    """当前 UTC 时间 ISO 字符串，精确到秒。"""
+    return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+
+
+def extract_symbol_base(raw_ticker: str) -> str:
+    """
+    从 TradingView 的完整符号里提取 base 部分。
+    规则：
+    - 去掉结尾的 ".P"
+    - 去掉结尾的 "USDT"
+    例如：
+    - ETHUSDT.P -> ETH
+    - BTCUSDT   -> BTC
+    - SOLUSDT.P -> SOL
+    """
+    t = raw_ticker.strip()
+
+    if t.endswith(".P"):
+        t = t[:-2]  # 去掉 ".P"
+
+    if t.upper().endswith("USDT"):
+        t = t[:-4]
+
+    return t
+
+
+def load_pivots_from_file() -> None:
+    """程序启动时从本地文件加载已有 pivots。"""
+    global pivots_store
+
+    if not os.path.exists(PIVOTS_FILE_PATH):
+        pivots_store = {}
+        return
+
+    try:
+        with open(PIVOTS_FILE_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        # 兼容结构：{"version":1, "pivots":{...}}
+        if isinstance(data, dict) and "pivots" in data:
+            pivots_store = data["pivots"] or {}
         else:
-            break
-    return ("".join(base) or ticker).upper()
+            pivots_store = data or {}
+    except Exception as e:
+        # 读失败就从空开始
+        print(f"[zigzag-webhook] Failed to load pivots file: {e}")
+        pivots_store = {}
 
 
-def parse_utc_time(value: str) -> datetime:
-    """Parse various UTC time formats and return an aware datetime."""
-    value = value.strip()
-    formats = [
-        "%Y-%m-%dT%H:%M:%SZ",
-        "%Y-%m-%d %H:%M",
-        "%Y-%m-%d %H:%M:%S",
-    ]
-    for fmt in formats:
-        try:
-            return datetime.strptime(value, fmt).replace(tzinfo=timezone.utc)
-        except Exception:
-            continue
+async def save_pivots_to_file_locked() -> None:
+    """
+    保存 pivots_store 到本地文件。
+    需要在 store_lock 内部调用，保证线程安全。
+    使用临时文件 + 原子替换，避免写到一半损坏。
+    """
+    data = {
+        "version": 1,
+        "pivots": pivots_store,
+        "updated_at_utc": _now_utc_iso(),
+    }
+
+    tmp_path = PIVOTS_FILE_PATH + ".tmp"
+
     try:
-        dt = datetime.fromisoformat(value)
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=timezone.utc)
-        return dt.astimezone(timezone.utc)
-    except Exception as exc:
-        raise ValueError(f"Invalid time format: {value}") from exc
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+        os.replace(tmp_path, PIVOTS_FILE_PATH)
+    except Exception as e:
+        print(f"[zigzag-webhook] Failed to save pivots file: {e}")
 
 
-def normalize_timeframe(tf: Any) -> str:
-    """Normalize timeframe to string (minutes)."""
-    if tf is None:
-        raise ValueError("Missing timeframe")
-    if isinstance(tf, (int, float)):
-        return str(int(tf))
-    tf_str = str(tf).strip().lower()
-    if tf_str.endswith("m"):
-        return tf_str[:-1] or "0"
-    if tf_str.endswith("h"):
-        try:
-            return str(int(tf_str[:-1]) * 60)
-        except Exception as exc:
-            raise ValueError(f"Invalid timeframe: {tf}") from exc
-    return tf_str
+async def add_pivot(symbol_base: str, timeframe: str, pivot: Dict[str, Any]) -> None:
+    """
+    将新的 pivot 加入 pivots_store，保持每个 (symbol_base, timeframe) 最多 4 条。
+    """
+    async with store_lock:
+        sym_map = pivots_store.setdefault(symbol_base, {})
+        tf_list = sym_map.setdefault(timeframe, [])
+
+        tf_list.append(pivot)
+        if len(tf_list) > 4:
+            # 只保留最新 4 条
+            sym_map[timeframe] = tf_list[-4:]
+
+        await save_pivots_to_file_locked()
 
 
-def ensure_iso(dt: datetime) -> str:
-    return dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-
-
-class PivotStore:
-    """In-memory + file persistence for ZigZag pivots."""
-
-    def __init__(self, path: Path):
-        self.path = path
-        self.data: Dict[str, Dict[str, list]] = {}
-        self._lock = asyncio.Lock()
-        self._load()
-
-    def _load(self) -> None:
-        if self.path.exists():
-            try:
-                with open(self.path, "r", encoding="utf-8") as f:
-                    self.data = json.load(f)
-            except Exception:
-                self.data = {}
-
-    async def add_pivot(
-        self,
-        base: str,
-        timeframe: str,
-        label: str,
-        raw_ticker: str,
-        close_time_utc: datetime,
-    ) -> None:
-        entry = {
-            "label": label.upper(),
-            "raw_ticker": raw_ticker,
-            "tf": timeframe,
-            "close_time_utc": ensure_iso(close_time_utc),
+def parse_zigzag_message(raw_msg: str) -> Dict[str, Any]:
+    """
+    解析 TradingView 发来的 ZigZag 文本消息。
+    期望格式：
+        ZigZag HL | ETHUSDT.P | TF=1 | pivot bar close (UTC)=2025-11-28 18:05
+    返回：
+        {
+          "label": "HL",
+          "raw_ticker": "ETHUSDT.P",
+          "symbol_base": "ETH",
+          "timeframe": "1",
+          "pivot_close_time_utc": "2025-11-28 18:05",
         }
-        async with self._lock:
-            if base not in self.data:
-                self.data[base] = {}
-            if timeframe not in self.data[base]:
-                self.data[base][timeframe] = []
+    """
+    text = raw_msg.strip()
+    if not text:
+        raise ValueError("empty message")
 
-            bucket = self.data[base][timeframe]
-            dedup_key = (entry["label"], entry["close_time_utc"])
-            bucket = [
-                x
-                for x in bucket
-                if (x.get("label"), x.get("close_time_utc")) != dedup_key
-            ]
-            bucket.append(entry)
-            if len(bucket) > 10:
-                bucket = bucket[-10:]
-            self.data[base][timeframe] = bucket
-            await self._persist()
+    parts = [p.strip() for p in text.split("|")]
+    if len(parts) < 4:
+        raise ValueError(f"invalid message format, need 4 parts, got {len(parts)}: {text}")
 
-    async def _persist(self) -> None:
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = self.path.with_suffix(".tmp")
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(self.data, f, ensure_ascii=False, indent=2)
-        tmp.replace(self.path)
+    # 第一段: ZigZag HL
+    first = parts[0]
+    first_tokens = first.split()
+    if len(first_tokens) < 2:
+        raise ValueError(f"invalid first part: {first}")
+    # 允许 "ZigZag++ HL" / "ZigZag HL" 等，只取最后一个 token 当 label
+    label = first_tokens[-1].upper()
+    if label not in ("HH", "HL", "LH", "LL"):
+        raise ValueError(f"invalid zigzag label: {label}")
 
+    # 第二段: ETHUSDT.P
+    raw_ticker = parts[1]
+    if not raw_ticker:
+        raise ValueError("empty ticker")
+    symbol_base = extract_symbol_base(raw_ticker)
 
-class DirectionStore:
-    """Persist last basic direction per base symbol."""
+    # 第三段: TF=1
+    tf_part = parts[2]
+    if "TF=" not in tf_part:
+        raise ValueError(f"invalid TF part: {tf_part}")
+    tf_str = tf_part.split("TF=", 1)[1].strip()
+    if not tf_str:
+        raise ValueError(f"empty timeframe in: {tf_part}")
 
-    def __init__(self, path: Path):
-        self.path = path
-        self.data: Dict[str, Dict[str, str]] = {}
-        self._lock = asyncio.Lock()
-        self._load()
+    # 第四段: pivot bar close (UTC)=2025-11-28 18:05
+    time_part = parts[3]
+    if "=" not in time_part:
+        raise ValueError(f"invalid time part: {time_part}")
+    pivot_close_time_utc = time_part.split("=", 1)[1].strip()
+    if not pivot_close_time_utc:
+        raise ValueError(f"empty pivot close time in: {time_part}")
 
-    def _load(self) -> None:
-        if self.path.exists():
-            try:
-                with open(self.path, "r", encoding="utf-8") as f:
-                    self.data = json.load(f)
-            except Exception:
-                self.data = {}
-
-    async def set_direction(self, base: str, direction: str) -> None:
-        entry = {
-            "direction": direction.lower(),
-            "updated_at": ensure_iso(datetime.utcnow().replace(tzinfo=timezone.utc)),
-        }
-        async with self._lock:
-            self.data[base] = entry
-            await self._persist()
-
-    async def _persist(self) -> None:
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = self.path.with_suffix(".tmp")
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(self.data, f, ensure_ascii=False, indent=2)
-        tmp.replace(self.path)
+    return {
+        "label": label,
+        "raw_ticker": raw_ticker,
+        "symbol_base": symbol_base,
+        "timeframe": tf_str,
+        "pivot_close_time_utc": pivot_close_time_utc,
+    }
 
 
-def parse_pivot_from_text(text: str) -> Optional[Tuple[str, str, str, datetime]]:
-    """Parse pivot payload from plain text like 'ZigZag HL | ETHUSDT.P | TF=1 | pivot bar close (UTC)=2025-11-28 18:05'."""
-    label_match = re.search(r"ZigZag\s+(HH|HL|LH|LL)", text, re.IGNORECASE)
-    tf_match = re.search(r"TF\s*=\s*([0-9]+)", text, re.IGNORECASE)
-    time_match = re.search(r"pivot\s+bar\s+close\s*\(UTC\)\s*=\s*([^|]+)", text, re.IGNORECASE)
-    parts = [p.strip() for p in text.split("|") if p.strip()]
-    raw_ticker = None
-    for part in parts:
-        if "." in part or part.isalpha():
-            raw_ticker = part
-            break
-    if not (label_match and tf_match and time_match and raw_ticker):
-        return None
-    label = label_match.group(1).upper()
-    timeframe = normalize_timeframe(tf_match.group(1))
-    close_time = parse_utc_time(time_match.group(1))
-    return label, raw_ticker, timeframe, close_time
+# =========================
+# FastAPI 事件 & 路由
+# =========================
+
+@app.on_event("startup")
+async def on_startup():
+    print("[zigzag-webhook] Starting up, loading pivots from file...")
+    load_pivots_from_file()
+    print(f"[zigzag-webhook] Loaded pivots for symbols: {list(pivots_store.keys())}")
 
 
-def parse_direction_from_text(text: str) -> Optional[Tuple[str, str]]:
-    """Parse direction payload from plain text like 'buy | ETHUSDT.P'."""
-    tokens = [t.strip() for t in text.split("|") if t.strip()]
-    if not tokens:
-        return None
-    direction = tokens[0].lower()
-    if direction not in ("buy", "sell"):
-        return None
-    raw_ticker = tokens[1] if len(tokens) > 1 else None
-    return direction, raw_ticker
+@app.post("/zigzag")
+async def receive_zigzag(request: Request):
+    """
+    TradingView Webhook 入口：
+    - 支持两种方式：
+      1) 发送 JSON: {"message": "ZigZag HL | ETHUSDT.P | TF=1 | pivot bar close (UTC)=..."}
+      2) 直接发送纯文本 "ZigZag HL | ETHUSDT.P | TF=1 | pivot bar close (UTC)=..."
 
+    返回：
+        {"status": "ok"} 或错误信息
+    """
+    # 先尝试按 JSON 解析
+    raw_body = await request.body()
 
-async def handle_webhook(request: web.Request) -> web.Response:
-    """Handle incoming webhook requests."""
-    app = request.app
-    pivot_store: PivotStore = app["pivot_store"]
-    direction_store: DirectionStore = app["direction_store"]
+    text_message = None
 
-    raw_text = ""
-    payload: Dict[str, Any] = {}
+    # 尝试 JSON
     try:
-        payload = await request.json()
+        data = json.loads(raw_body.decode("utf-8"))
+        if isinstance(data, dict) and "message" in data:
+            text_message = str(data["message"])
     except Exception:
+        # 不是 JSON，后面当纯文本处理
+        pass
+
+    # 如果没有 message 字段，就当纯文本
+    if text_message is None:
         try:
-            raw_text = await request.text()
-        except Exception:
-            raw_text = ""
+            text_message = raw_body.decode("utf-8")
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=f"invalid body: {e}")
 
-    event_type = payload.get("type") if isinstance(payload, dict) else None
-    logger = logging.getLogger(__name__)
+    text_message = text_message.strip()
+    if not text_message:
+        raise HTTPException(status_code=400, detail="empty message")
 
-    # Pivot handling
-    if (isinstance(payload, dict) and payload.get("label")) or (
-        isinstance(payload, dict) and event_type in ("pivot", "zigzag")
-    ):
-        try:
-            label = str(payload.get("label")).upper()
-            raw_ticker = payload.get("ticker") or payload.get("raw_ticker")
-            if not raw_ticker:
-                raise ValueError("Missing ticker/raw_ticker")
-            timeframe = normalize_timeframe(
-                payload.get("tf")
-                or payload.get("timeframe")
-                or payload.get("resolution")
-                or payload.get("tf_minutes")
-            )
-            close_time_raw = payload.get("close_time_utc") or payload.get(
-                "pivot_bar_close"
-            )
-            if not close_time_raw:
-                raise ValueError("Missing close_time_utc")
-            close_time = parse_utc_time(str(close_time_raw))
-            base = extract_base_symbol(raw_ticker)
-            await pivot_store.add_pivot(base, timeframe, label, raw_ticker, close_time)
-            logger.info(
-                "pivot stored | base=%s | tf=%s | label=%s | close=%s | raw=%s",
-                base,
-                timeframe,
-                label,
-                ensure_iso(close_time),
-                raw_ticker,
-            )
-            return web.json_response(
-                {"status": "ok", "type": "pivot", "base": base, "timeframe": timeframe}
-            )
-        except Exception as exc:
-            logger.error("pivot parse failed: %s", exc)
-            return web.json_response({"error": str(exc)}, status=400)
+    try:
+        parsed = parse_zigzag_message(text_message)
+    except ValueError as e:
+        # 返回 400，让你在 TV 日志里能看到具体错误
+        raise HTTPException(status_code=400, detail=str(e))
 
-    if raw_text:
-        pivot = parse_pivot_from_text(raw_text)
-        if pivot:
-            label, raw_ticker, timeframe, close_time = pivot
-            base = extract_base_symbol(raw_ticker)
-            await pivot_store.add_pivot(base, timeframe, label, raw_ticker, close_time)
-            logger.info(
-                "pivot stored | base=%s | tf=%s | label=%s | close=%s | raw=%s",
-                base,
-                timeframe,
-                label,
-                ensure_iso(close_time),
-                raw_ticker,
-            )
-            return web.json_response(
-                {"status": "ok", "type": "pivot", "base": base, "timeframe": timeframe}
-            )
+    pivot = {
+        "label": parsed["label"],
+        "raw_ticker": parsed["raw_ticker"],
+        "symbol_base": parsed["symbol_base"],
+        "timeframe": parsed["timeframe"],
+        "pivot_close_time_utc": parsed["pivot_close_time_utc"],
+        "received_at_utc": _now_utc_iso(),
+        "raw_message": text_message,
+    }
 
-    # Direction handling
-    if isinstance(payload, dict) and payload.get("direction"):
-        try:
-            direction = str(payload.get("direction")).lower()
-            if direction not in ("buy", "sell"):
-                raise ValueError("direction must be buy/sell")
-            raw_ticker = payload.get("ticker") or payload.get("raw_ticker")
-            if not raw_ticker:
-                raise ValueError("Missing ticker/raw_ticker")
-            base = extract_base_symbol(raw_ticker)
-            await direction_store.set_direction(base, direction)
-            logger.info(
-                "direction stored | base=%s | direction=%s", base, direction.upper()
-            )
-            return web.json_response(
-                {"status": "ok", "type": "direction", "base": base, "direction": direction}
-            )
-        except Exception as exc:
-            logger.error("direction parse failed: %s", exc)
-            return web.json_response({"error": str(exc)}, status=400)
+    await add_pivot(parsed["symbol_base"], parsed["timeframe"], pivot)
 
-    if raw_text:
-        direction = parse_direction_from_text(raw_text)
-        if direction:
-            direction_value, raw_ticker = direction
-            if not raw_ticker:
-                return web.json_response(
-                    {"error": "Missing ticker in direction payload"}, status=400
-                )
-            base = extract_base_symbol(raw_ticker)
-            await direction_store.set_direction(base, direction_value)
-            logger.info(
-                "direction stored | base=%s | direction=%s",
-                base,
-                direction_value.upper(),
-            )
-            return web.json_response(
-                {
-                    "status": "ok",
-                    "type": "direction",
-                    "base": base,
-                    "direction": direction_value,
-                }
-            )
-
-    logger.warning("unrecognized payload: %s | %s", payload, raw_text)
-    return web.json_response({"error": "Unrecognized payload"}, status=400)
-
-
-async def handle_health(request: web.Request) -> web.Response:
-    return web.json_response({"status": "ok"})
-
-
-def create_app() -> web.Application:
-    setup_logging()
-    pivot_path = resolve_path(os.getenv("ZIGZAG_PIVOT_FILE", "zigzag_pivots.json"))
-    direction_path = resolve_path(
-        os.getenv("WEBHOOK_BASIC_DIRECTION_FILE", "webhook_basic_direction.json")
+    print(
+        f"[zigzag-webhook] New pivot: "
+        f"{pivot['symbol_base']} TF={pivot['timeframe']} "
+        f"{pivot['label']} @ {pivot['pivot_close_time_utc']}"
     )
-    app = web.Application()
-    app["pivot_store"] = PivotStore(pivot_path)
-    app["direction_store"] = DirectionStore(direction_path)
-    app.router.add_post("/webhook", handle_webhook)
-    app.router.add_get("/health", handle_health)
-    return app
+
+    return JSONResponse({"status": "ok"})
 
 
-def main() -> None:
-    app = create_app()
-    host = os.getenv("WEBHOOK_HOST", "0.0.0.0")
-    port = int(os.getenv("WEBHOOK_PORT", "8080"))
-    logging.getLogger(__name__).info("Starting webhook server on %s:%s", host, port)
-    web.run_app(app, host=host, port=port)
+@app.get("/pivots")
+async def get_pivots():
+    """
+    简单的调试接口：
+    GET /pivots
+    返回当前内存里的所有 pivot（和文件内容基本一致）。
+    """
+    async with store_lock:
+        data = {
+            "version": 1,
+            "pivots": pivots_store,
+        }
+    return JSONResponse(data)
 
 
 if __name__ == "__main__":
-    main()
+    # 让你可以直接用 python3 运行，不用手动敲 uvicorn
+    import uvicorn
+
+    host = os.environ.get("ZIGZAG_WEBHOOK_HOST", "0.0.0.0")
+    port_str = os.environ.get("ZIGZAG_WEBHOOK_PORT", "8000")
+    try:
+        port = int(port_str)
+    except ValueError:
+        port = 8000
+
+    print(f"[zigzag-webhook] Listening on {host}:{port}, pivots file = {PIVOTS_FILE_PATH}")
+    uvicorn.run("zigzag_webhook_server:app", host=host, port=port, reload=False)
