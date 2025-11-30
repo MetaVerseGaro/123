@@ -136,6 +136,15 @@ def merge_config(args, cfg: dict):
         setattr(args, "max_position_count", int(basic["max_position_count"]))
     if basic.get("basic_release_timeout_minutes") is not None:
         setattr(args, "basic_release_timeout_minutes", int(basic["basic_release_timeout_minutes"]))
+    if basic.get("webhook_sl") is not None:
+        setattr(args, "webhook_sl", bool(basic["webhook_sl"]))
+        os.environ["WEBHOOK_SL"] = str(basic["webhook_sl"]).lower()
+    if basic.get("webhook_sl_fast") is not None:
+        setattr(args, "webhook_sl_fast", bool(basic["webhook_sl_fast"]))
+        os.environ["WEBHOOK_SL_FAST"] = str(basic["webhook_sl_fast"]).lower()
+    if basic.get("webhook_reverse") is not None:
+        setattr(args, "webhook_reverse", bool(basic["webhook_reverse"]))
+        os.environ["WEBHOOK_REVERSE"] = str(basic["webhook_reverse"]).lower()
     # Feature toggles to env (ZigZag 视作进阶风险的一部分，优先 risk.advanced.zigzag，兼容顶层 zigzag)
     zig = adv.get("zigzag", {}) if isinstance(adv, dict) else cfg.get("zigzag", {})
     flags = cfg.get("flags", {})
@@ -157,6 +166,10 @@ def merge_config(args, cfg: dict):
         os.environ["ZIGZAG_TIMEFRAME"] = str(zig["zigzag_timeframe"])
     if zig.get("zigzag_warmup_candles") is not None:
         os.environ["ZIGZAG_WARMUP_CANDLES"] = str(zig["zigzag_warmup_candles"])
+    if zig.get("pivot_file") is not None:
+        os.environ["ZIGZAG_PIVOT_FILE"] = str(zig["pivot_file"])
+    if basic.get("webhook_basic_direction_file") is not None:
+        os.environ["WEBHOOK_BASIC_DIRECTION_FILE"] = str(basic["webhook_basic_direction_file"])
     # Notifications
     notify = cfg.get("notifications", {})
     if notify.get("enable_notifications") is not None:
@@ -242,7 +255,12 @@ async def main():
         max_position_count=getattr(args, "max_position_count", 0),
         basic_release_timeout_minutes=getattr(args, "basic_release_timeout_minutes", 0),
         enable_advanced_risk=getattr(args, "enable_advanced_risk", True),
-        enable_basic_risk=getattr(args, "enable_basic_risk", True)
+        enable_basic_risk=getattr(args, "enable_basic_risk", True),
+        webhook_sl=getattr(args, "webhook_sl", False),
+        webhook_sl_fast=getattr(args, "webhook_sl_fast", False),
+        webhook_reverse=getattr(args, "webhook_reverse", False),
+        zigzag_pivot_file=os.getenv("ZIGZAG_PIVOT_FILE"),
+        webhook_basic_direction_file=os.getenv("WEBHOOK_BASIC_DIRECTION_FILE")
     )
 
     # Create and run the bot
