@@ -310,6 +310,26 @@ class LighterClient(BaseExchangeClient):
             self.logger.log(f"Unable to fetch BBO via REST fallback: {e}", "ERROR")
             raise
 
+    async def get_last_traded_price(self, contract_id: str) -> Optional[Decimal]:
+        """Fetch last traded/mark price for the market."""
+        order_api = lighter.OrderApi(self.api_client)
+        try:
+            await self._throttle_rest()
+            ob = await order_api.order_book_details(market_id=contract_id)
+            detail = None
+            if ob and getattr(ob, "order_book_details", None):
+                detail = ob.order_book_details[0]
+            if detail is None:
+                return None
+            last_price = getattr(detail, "last_price", None) or getattr(detail, "mark_price", None) or getattr(detail, "index_price", None)
+            return Decimal(str(last_price)) if last_price is not None else None
+        except Exception as e:
+            if self._is_rate_limit_error(e):
+                self.logger.log(f"[RATE_LIMIT] get_last_traded_price: {e}", "WARNING")
+                await self._handle_rate_limit_backoff()
+            self.logger.log(f"[PRICE] Unable to fetch last traded price: {e}", "WARNING")
+            return None
+
     async def _submit_order_with_retry(self, order_params: Dict[str, Any]) -> OrderResult:
         """Submit an order with Lighter using official SDK, with rate-limit backoff but no extra throttling."""
         # Ensure client is initialized
@@ -415,8 +435,10 @@ class LighterClient(BaseExchangeClient):
 
         attempt = 0
         desired_price = price
+        max_attempts = 15
+        bumped_quantity = False
 
-        while True:
+        while attempt < max_attempts:
             attempt += 1
             maker_price = await self._calculate_post_only_price(side, desired_price)
 
@@ -451,6 +473,24 @@ class LighterClient(BaseExchangeClient):
                 )
 
             # If post-only rejected (or other error), log and retry with safer price
+            err_msg = order_result.error_message or ""
+            if "invalid order base or quote amount" in err_msg:
+                # Likely below min notional; bump to configured min once to self-heal
+                min_qty = getattr(self.config, "min_order_size", None)
+                try:
+                    min_qty = Decimal(str(min_qty)) if min_qty is not None else None
+                except Exception:
+                    min_qty = None
+                if min_qty and quantity < min_qty and not bumped_quantity:
+                    bumped_quantity = True
+                    quantity = self._normalize_quantity(min_qty)
+                    self.logger.log(
+                        f"[POST_ONLY] Adjust quantity to min {quantity} due to invalid order amount",
+                        "WARNING"
+                    )
+                    await asyncio.sleep(0.1)
+                    continue
+
             self.logger.log(
                 f"[POST_ONLY] Attempt {attempt} failed ({order_result.error_message}). "
                 f"Retrying with adjusted price.", "WARNING"
@@ -464,6 +504,11 @@ class LighterClient(BaseExchangeClient):
                 desired_price = maker_price + self.config.tick_size
 
             await asyncio.sleep(0.3)
+
+        return OrderResult(
+            success=False,
+            error_message=f"Post-only order failed after {max_attempts} attempts: {order_result.error_message}"
+        )
 
     async def place_reduce_only_close_order(self, quantity: Decimal, side: str) -> OrderResult:
         """Place a reduce-only post-only close order using current BBO as reference."""
@@ -598,13 +643,28 @@ class LighterClient(BaseExchangeClient):
             if self.current_order is not None:
                 order_status = self.current_order.status
 
+        # Fallback when WS update not yet set
+        if self.current_order is None:
+            try:
+                self.current_order = OrderInfo(
+                    order_id=str(order_result.order_id),
+                    side=direction,
+                    size=quantity,
+                    price=order_result.price,
+                    status=order_status,
+                    filled_size=Decimal(0),
+                    remaining_size=quantity
+                )
+            except Exception:
+                self.current_order = None
+
         return OrderResult(
             success=True,
-            order_id=self.current_order.order_id,
+            order_id=str(self.current_order.order_id) if self.current_order else str(order_result.order_id),
             side=direction,
             size=quantity,
             price=order_result.price,
-            status=self.current_order.status
+            status=self.current_order.status if self.current_order else order_status
         )
 
     async def _get_active_close_orders(self, contract_id: str) -> int:
@@ -1016,3 +1076,37 @@ class LighterClient(BaseExchangeClient):
                 self.logger.log(f"[RATE_LIMIT] fetch_history_candles: {e}", "WARNING")
                 await self._handle_rate_limit_backoff()
             raise
+
+    async def fetch_candle_by_close_time(self, timeframe: str, close_time_ms: int) -> Optional[Tuple[Decimal, Decimal]]:
+        """Fetch a single candle ending at close_time_ms (UTC ms)."""
+        candle_api = lighter.CandlestickApi(self.api_client)
+        try:
+            await self._throttle_rest(weight=50)
+            tf_sec = 60
+            if timeframe.endswith("h"):
+                tf_sec = int(timeframe[:-1]) * 3600
+            elif timeframe.endswith("m"):
+                tf_sec = int(timeframe[:-1]) * 60
+            elif timeframe.endswith("s"):
+                tf_sec = int(timeframe[:-1])
+            start_ms = close_time_ms - tf_sec * 1000 * 5
+            resp = await candle_api.candlesticks(
+                market_id=self.config.contract_id,
+                resolution=timeframe,
+                start_timestamp=start_ms,
+                end_timestamp=close_time_ms,
+                count_back=5,
+                set_timestamp_to_end=True,
+            )
+            if resp and getattr(resp, "candlesticks", None):
+                for candle in resp.candlesticks:
+                    ts_val = getattr(candle, "timestamp", None) or getattr(candle, "close_timestamp", None)
+                    if ts_val is not None and int(ts_val) == int(close_time_ms):
+                        return Decimal(str(candle.high)), Decimal(str(candle.low))
+            return None
+        except Exception as e:
+            if self._is_rate_limit_error(e):
+                self.logger.log(f"[RATE_LIMIT] fetch_candle_by_close_time: {e}", "WARNING")
+                await self._handle_rate_limit_backoff()
+            self.logger.log(f"[ZIGZAG] fetch_candle_by_close_time failed: {e}", "WARNING")
+            return None
