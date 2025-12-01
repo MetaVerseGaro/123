@@ -12,6 +12,9 @@ yarn-debug.log*
 yarn-error.log*
 pnpm-debug.log*
 lerna-debug.log*
+botA.out
+botB.out
+webhook.out
 
 node_modules
 dist
@@ -28,6 +31,8 @@ dist-ssr
 *.njsproj
 *.sln
 *.sw?
+zigzag_pivots.json
+webhook_basic_direction.json
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
