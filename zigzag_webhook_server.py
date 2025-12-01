@@ -60,14 +60,18 @@ def setup_logging() -> None:
 
 
 def extract_base_symbol(ticker: str) -> str:
-    """Extract base symbol prefix (letters before first non-letter)."""
-    base = []
+    """Extract base symbol: strip common quote suffixes like USDT/USD/USDC after letter run."""
+    letters = []
     for ch in ticker:
         if ch.isalpha():
-            base.append(ch)
+            letters.append(ch)
         else:
             break
-    return ("".join(base) or ticker).upper()
+    candidate = "".join(letters) or ticker
+    for quote in ("USDT", "USD", "USDC", "PERP"):
+        if candidate.upper().endswith(quote) and len(candidate) > len(quote):
+            return candidate.upper()[:-len(quote)]
+    return candidate.upper()
 
 
 def parse_utc_time(value: str) -> datetime:
@@ -381,6 +385,7 @@ def create_app() -> web.Application:
 def main() -> None:
     app = create_app()
     host = os.getenv("WEBHOOK_HOST", "0.0.0.0")
+    # Default 8080 for non-privileged runs; override with WEBHOOK_PORT (e.g., 80/443 behind sudo或反代)
     port = int(os.getenv("WEBHOOK_PORT", "8080"))
     logging.getLogger(__name__).info("Starting webhook server on %s:%s", host, port)
     web.run_app(app, host=host, port=port)
