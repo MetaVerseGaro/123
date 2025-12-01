@@ -46,6 +46,7 @@ class TradingConfig:
     webhook_reverse: bool = False
     zigzag_pivot_file: Optional[str] = None
     webhook_basic_direction_file: Optional[str] = None
+    max_fast_close_qty: Optional[Decimal] = None
 
     @property
     def close_order_side(self) -> str:
@@ -161,6 +162,14 @@ class TradingBot:
         self.webhook_reverse_pending: bool = False
         self.webhook_block_trading: bool = False
         self.webhook_unwind_last_ts: float = 0.0
+        # fast close chunk size for fast reverse/fast webhook stop
+        try:
+            cfg_fast_close = getattr(config, "max_fast_close_qty", None)
+            env_fast_close = os.getenv("MAX_FAST_CLOSE_QTY", None)
+            val = cfg_fast_close if cfg_fast_close not in (None, "", 0) else env_fast_close
+            self.max_fast_close_qty = Decimal(str(val)) if val not in (None, "") else Decimal("0.5")
+        except Exception:
+            self.max_fast_close_qty = Decimal("0.5")
         # Risk control
 # Risk control
         self.risk_pct = Decimal(os.getenv("RISK_PCT", "0.5"))
@@ -828,6 +837,9 @@ class TradingBot:
         """Refresh native stop-loss according to current position and dynamic SL."""
         if not self.enable_dynamic_sl:
             return
+        # 慢反手过程中不自动下动态止损，待方向确认后再处理
+        if self.pending_reverse_state in ("waiting_next_pivot", "unwinding"):
+            return
         try:
             pos_signed = await self._get_position_signed_cached()
         except Exception as e:
@@ -986,6 +998,27 @@ class TradingBot:
         else:
             await self._schedule_slow_reverse(new_direction, pivot_price)
 
+    async def _close_position_in_chunks(self, close_side: str, allow_reverse_after: bool = False) -> Decimal:
+        """Close position using chunked reduce-only orders to avoid oversized single orders."""
+        remaining = abs(await self._get_position_signed_cached())
+        max_chunk = self.max_fast_close_qty if self.max_fast_close_qty and self.max_fast_close_qty > 0 else remaining
+        loops = 0
+        while remaining > 0 and loops < 20:
+            chunk = min(remaining, max_chunk)
+            try:
+                await self.exchange_client.reduce_only_close_with_retry(chunk, close_side)
+            except Exception as exc:
+                self.logger.log(f"[FAST-CLOSE] Chunk close failed: {exc}", "WARNING")
+            await asyncio.sleep(0.5)
+            new_remaining = abs(await self._get_position_signed_cached())
+            if new_remaining < remaining:
+                remaining = new_remaining
+            else:
+                loops += 1
+                if loops % 3 == 0:
+                    await asyncio.sleep(1)
+        return remaining
+
     async def _reverse_position(self, new_direction: str, pivot_price: Decimal):
         """Fast reverse: cancel orders, close position, flip direction, re-enter."""
         if self.reversing:
@@ -1009,12 +1042,13 @@ class TradingBot:
         pos_abs = abs(pos_signed)
         if pos_abs > 0:
             close_side = 'sell' if pos_signed > 0 else 'buy'
-            try:
-                await self.exchange_client.reduce_only_close_with_retry(pos_abs, close_side)
-            except Exception as e:
-                self.logger.log(f"[REV] Failed to close existing position: {e}", "ERROR")
-                self.reversing = False
-                return
+            remaining = await self._close_position_in_chunks(close_side, allow_reverse_after=True)
+            if remaining >= self.min_order_size:
+                self.logger.log(f"[REV] Unable to fully close position, remaining {remaining}", "WARNING")
+                # Proceed but note residual
+            else:
+                # Residual below min order size is tolerated
+                pass
 
         # Update direction and reset timers
         self.config.direction = new_direction
@@ -1022,6 +1056,8 @@ class TradingBot:
         self.dynamic_stop_price = None
         self.dynamic_stop_direction = None
         self.last_open_order_time = 0
+        # Ensure new direction can place orders
+        self._set_stop_new_orders(False)
 
         # Refresh stop loss for new direction
         if self.enable_dynamic_sl:
@@ -1031,7 +1067,9 @@ class TradingBot:
             await self.send_notification(f"[DIRECTION] Switched to {new_direction.upper()} (fast reverse)")
 
         # Immediately place a new open order in new direction
-        await self._place_and_monitor_open_order()
+        placed = await self._place_and_monitor_open_order()
+        if not placed:
+            self.logger.log("[REV] Failed to place new open order after fast reverse (stop_new_orders?)", "WARNING")
         self.reversing = False
 
     async def _schedule_slow_reverse(self, new_direction: str, pivot_price: Decimal):
@@ -1108,6 +1146,9 @@ class TradingBot:
                     await self.send_notification(f"[DIRECTION] Switched to {self.config.direction.upper()} (slow reverse complete)")
                 if self.enable_dynamic_sl:
                     await self._refresh_stop_loss(force=True)
+                placed = await self._place_and_monitor_open_order()
+                if not placed:
+                    self.logger.log("[REV-SLOW] Failed to place new open after slow reverse", "WARNING")
             return
 
         close_side = 'sell' if pos_signed > 0 else 'buy'
@@ -1563,6 +1604,15 @@ class TradingBot:
         webhook_dir = str(entry.get("direction", "")).lower()
         if webhook_dir not in ("buy", "sell"):
             return
+        # Ignore stale signals older than 20 minutes
+        updated_at = entry.get("updated_at")
+        if updated_at:
+            try:
+                ts = datetime.fromisoformat(str(updated_at).replace("Z", "+00:00")).timestamp()
+                if now - ts > 20 * 60:
+                    return
+            except Exception:
+                pass
         self.webhook_latest_direction = webhook_dir
         if webhook_dir == self.config.direction and not self.webhook_stop_mode:
             if self.webhook_block_trading:
@@ -1609,7 +1659,7 @@ class TradingBot:
             close_side = "sell" if pos_signed > 0 else "buy"
             if self.webhook_stop_mode == "fast":
                 try:
-                    await self.exchange_client.reduce_only_close_with_retry(pos_abs, close_side)
+                    await self._close_position_in_chunks(close_side)
                 except Exception as exc:
                     self.logger.log(f"[WEBHOOK] Fast stop close failed: {exc}", "ERROR")
                 return True
