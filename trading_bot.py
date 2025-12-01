@@ -716,6 +716,8 @@ class TradingBot:
         """Fetch OHLC candle that ends at the given UTC close time."""
         target_ms = int(close_time.replace(tzinfo=timezone.utc).timestamp() * 1000)
         tf = self.zigzag_timeframe
+        tf_ms = int(self.zigzag_timeframe_sec or 60) * 1000
+        tolerance_ms = max(1000, tf_ms // 2)
         if hasattr(self.exchange_client, "fetch_candle_by_close_time"):
             try:
                 candle = await self.exchange_client.fetch_candle_by_close_time(
@@ -736,12 +738,21 @@ class TradingBot:
                 candles = await self.exchange_client.fetch_history_candles(limit=300, timeframe=tf)
                 for c in candles:
                     ts_val = self._get_candle_close_ts(c)
-                    if ts_val is not None and int(ts_val) == target_ms:
-                        high_val = getattr(c, "high", None) if not isinstance(c, dict) else c.get("high")
-                        low_val = getattr(c, "low", None) if not isinstance(c, dict) else c.get("low")
-                        if high_val is None or low_val is None:
-                            continue
-                        return Decimal(str(high_val)), Decimal(str(low_val))
+                    if ts_val is None:
+                        continue
+                    try:
+                        ts_ms = int(ts_val)
+                    except Exception:
+                        continue
+                    if ts_ms < 1_000_000_000_000:
+                        ts_ms *= 1000
+                    if abs(ts_ms - target_ms) > tolerance_ms:
+                        continue
+                    high_val = getattr(c, "high", None) if not isinstance(c, dict) else c.get("high")
+                    low_val = getattr(c, "low", None) if not isinstance(c, dict) else c.get("low")
+                    if high_val is None or low_val is None:
+                        continue
+                    return Decimal(str(high_val)), Decimal(str(low_val))
             except Exception as exc:
                 self.logger.log(f"[ZIGZAG] fetch_history_candles failed: {exc}", "WARNING")
         return None
