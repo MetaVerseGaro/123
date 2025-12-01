@@ -29,3 +29,4 @@
   sudo kill 12345
   # 或强制：sudo kill -9 12345
   ```
+2025-12-01 08:15:40 | WARNING | [LIGHTER][ETH] [POST_ONLY] Attempt 15353 failed (Order creation error: HTTP response body: code=21706 message='invalid order base or quote amount' additional_properties={}). Retrying with adjusted price.
