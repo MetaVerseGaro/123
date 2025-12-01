@@ -150,6 +150,8 @@ class TradingBot:
         self._last_pivot_poll: float = 0.0
         default_interval = float(self.zigzag_timeframe_sec or 60)
         self._pivot_poll_interval: float = float(os.getenv("PIVOT_POLL_INTERVAL_SEC", str(int(default_interval))))
+        self._webhook_poll_interval: float = float(os.getenv("WEBHOOK_POLL_INTERVAL_SEC", "5"))
+        self._last_webhook_poll: float = 0.0
         self.webhook_sl = bool(getattr(config, "webhook_sl", False) or str(os.getenv("WEBHOOK_SL", "false")).lower() == "true")
         self.webhook_sl_fast = bool(getattr(config, "webhook_sl_fast", False) or str(os.getenv("WEBHOOK_SL_FAST", "false")).lower() == "true")
         self.webhook_reverse = bool(getattr(config, "webhook_reverse", False) or str(os.getenv("WEBHOOK_REVERSE", "false")).lower() == "true")
@@ -274,14 +276,18 @@ class TradingBot:
         return path
 
     def _extract_symbol_base(self, ticker: str) -> str:
-        """Extract base symbol prefix (letters before the first non-letter)."""
+        """Extract base symbol, trimming common quote suffixes after the leading letters."""
         base_chars = []
         for ch in ticker:
             if ch.isalpha():
                 base_chars.append(ch)
             else:
                 break
-        return ("".join(base_chars) or ticker).upper()
+        candidate = "".join(base_chars) or ticker
+        for quote in ("USDT", "USD", "USDC", "PERP"):
+            if candidate.upper().endswith(quote) and len(candidate) > len(quote):
+                return candidate.upper()[:-len(quote)]
+        return candidate.upper()
 
     def _normalize_timeframe_key(self, tf: str) -> str:
         """Normalize timeframe to minutes string for pivot store matching."""
@@ -1504,7 +1510,7 @@ class TradingBot:
                     self.basic_full_since = None
 
                 if self.webhook_sl:
-                    await self._poll_webhook_direction()
+                    await self._poll_webhook_direction(force=True)
 
                 return mismatch_detected
 
@@ -1534,12 +1540,24 @@ class TradingBot:
         except Exception as exc:
             self.logger.log(f"[WEBHOOK] Fetch active orders for cancel failed: {exc}", "WARNING")
 
-    async def _poll_webhook_direction(self):
+    async def _poll_webhook_direction(self, force: bool = False):
         """Poll basic webhook direction file and trigger stop/reverse when needed."""
         if not self.webhook_sl:
             return
+        now = time.time()
+        if (not force) and (now - self._last_webhook_poll) < self._webhook_poll_interval:
+            return
+        self._last_webhook_poll = now
         data = self._load_json_file(self.basic_direction_file)
-        entry = data.get(self.symbol_base) if isinstance(data, dict) else None
+        entry = None
+        if isinstance(data, dict):
+            entry = data.get(self.symbol_base)
+            if entry is None:
+                # Fallback: accept keys like ETHUSDT/ETHUSD when symbol_base is ETH
+                for k, v in data.items():
+                    if isinstance(k, str) and k.upper().startswith(self.symbol_base):
+                        entry = v
+                        break
         if not entry:
             return
         webhook_dir = str(entry.get("direction", "")).lower()
@@ -1557,6 +1575,10 @@ class TradingBot:
         """Handle webhook stop/reverse directive."""
         if self.webhook_stop_mode and self.webhook_target_direction == webhook_dir:
             return
+        self.logger.log(
+            f"[WEBHOOK] Signal received: {webhook_dir.upper()} (mode={'FAST' if self.webhook_sl_fast else 'SLOW'})",
+            "INFO",
+        )
         self.webhook_block_trading = True
         self._set_stop_new_orders(True)
         self.webhook_target_direction = webhook_dir
@@ -1835,6 +1857,8 @@ class TradingBot:
             while not self.shutdown_requested:
                 try:
                     await self._maybe_send_daily_pnl()
+                    if self.webhook_sl:
+                        await self._poll_webhook_direction()
                     # Webhook slow/fast stop handling takes priority
                     if self.webhook_sl and self.webhook_stop_mode:
                         handled_webhook = await self._handle_webhook_stop_tasks()
