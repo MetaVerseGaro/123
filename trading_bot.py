@@ -842,6 +842,13 @@ class TradingBot:
         entries = self._load_pivots_for_config()
         if not entries:
             return
+        # 标记已有 pivot，避免启动后重复通知
+        for entry in entries:
+            try:
+                key = (entry["close_time"].isoformat(), entry["label"])
+                self._processed_pivot_keys.add(key)
+            except Exception:
+                continue
         # 仅根据最近 pivot 判向并获取匹配方向的最近止损位，减少 OHLC 查询
         direction, stop_entry = self._determine_initial_direction_and_stop(entries)
         if direction and self.enable_advanced_risk and self.stop_loss_enabled and self.enable_zigzag:
@@ -1831,8 +1838,8 @@ class TradingBot:
 
         self.stop_loss_triggered = True
         msg = f"\n\nWARNING: [{self.config.exchange.upper()}_{self.config.ticker.upper()}]\n"
-        msg += "Fixed stop-loss triggered. Cancelling open orders and closing position.\n"
-        msg += "触发固定价格止损，正在撤单并平掉当前仓位。\n"
+        msg += "Stop-loss triggered. Cancelling open orders and closing position (continue running).\n"
+        msg += "触发止损，正在撤单并平掉当前仓位，将继续运行。\n"
         await self.send_notification(msg.lstrip())
 
         try:
@@ -1878,8 +1885,11 @@ class TradingBot:
                 except Exception as fallback_err:
                     self.logger.log(f"Stop-loss fallback order failed: {fallback_err}", "ERROR")
 
-        self.shutdown_requested = True
-        await self.graceful_shutdown("Fixed stop-loss executed")
+        # Reset stop-loss state to allow continued trading
+        self.current_sl_order_id = None
+        self.dynamic_stop_price = None
+        self.dynamic_stop_direction = None
+        self.stop_loss_triggered = False
 
     async def send_notification(self, message: str):
         if not self.enable_notifications:
@@ -1905,6 +1915,12 @@ class TradingBot:
         self.last_error_notified_msg = message
         self.last_error_notified_ts = now
         await self.send_notification(message)
+
+    async def _notify_direction(self, prefix: str = "[DIRECTION]"):
+        """Notify current direction once (used at startup)."""
+        if not self.enable_notifications:
+            return
+        await self.send_notification(f"{prefix} Current direction {self.config.direction.upper()}")
 
     async def run(self):
         """Main trading loop."""
@@ -1942,6 +1958,7 @@ class TradingBot:
 
             if self.enable_notifications:
                 await self.send_notification(f"[START] {self.config.exchange.upper()} {self.config.ticker} bot started.")
+                await self._notify_direction()
             # Main trading loop
             while not self.shutdown_requested:
                 try:
