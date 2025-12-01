@@ -336,6 +336,37 @@ class TradingBot:
         except Exception:
             return None
 
+    def _determine_initial_direction_and_stop(self, entries: List[Dict[str, Any]]) -> Tuple[Optional[str], Optional[Dict[str, Any]]]:
+        """From latest pivots determine initial direction and nearest stop pivot (minimal OHLC fetch)."""
+        if not entries:
+            return None, None
+        entries_desc = sorted(entries, key=lambda x: x["close_time"], reverse=True)
+        direction: Optional[str] = None
+        stop_entry: Optional[Dict[str, Any]] = None
+        for entry in entries_desc:
+            label = entry.get("label")
+            if not label:
+                continue
+            if direction is None:
+                if label in ("HH", "HL"):
+                    direction = "buy"
+                    if label in ("HL", "LL"):
+                        stop_entry = entry
+                        break
+                elif label in ("LL", "LH"):
+                    direction = "sell"
+                    if label in ("HH", "LH"):
+                        stop_entry = entry
+                        break
+                continue
+            if direction == "buy" and label in ("HL", "LL"):
+                stop_entry = entry
+                break
+            if direction == "sell" and label in ("HH", "LH"):
+                stop_entry = entry
+                break
+        return direction, stop_entry
+
     def _load_json_file(self, path: Path) -> Optional[Dict]:
         """Load JSON content from a file if it exists."""
         try:
@@ -811,13 +842,21 @@ class TradingBot:
         entries = self._load_pivots_for_config()
         if not entries:
             return
-        pivot_points = await self._build_pivot_points(entries)
-        for key, pivot in pivot_points:
-            self._processed_pivot_keys.add(key)
-            await self._handle_pivot_event(pivot, notify=False)
-        await self._set_initial_direction_from_pivots([p for _, p in pivot_points])
-        if self.enable_dynamic_sl and (self.last_confirmed_high or self.last_confirmed_low):
-            await self._refresh_stop_loss(force=True)
+        # 仅根据最近 pivot 判向并获取匹配方向的最近止损位，减少 OHLC 查询
+        direction, stop_entry = self._determine_initial_direction_and_stop(entries)
+        if direction and self.enable_advanced_risk and self.stop_loss_enabled and self.enable_zigzag:
+            if direction != self.config.direction:
+                self.config.direction = direction
+                self.current_direction = direction
+                self.logger.log(f"[INIT] Direction set to {direction.upper()} via recent pivots (fast init)", "INFO")
+            if stop_entry:
+                pivot_point = await self._build_pivot_point(stop_entry)
+                if pivot_point:
+                    self._update_confirmed_pivots(pivot_point)
+                    key = (pivot_point.close_time.isoformat(), pivot_point.label)
+                    self._processed_pivot_keys.add(key)
+                    if self.enable_dynamic_sl:
+                        await self._refresh_stop_loss(force=True)
 
     async def _notify_recent_pivots(self):
         """Send notification with recent pivots (latest first)."""
