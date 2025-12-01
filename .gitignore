@@ -33,6 +33,8 @@ dist-ssr
 *.sw?
 zigzag_pivots.json
 webhook_basic_direction.json
+botA.json
+botB.json
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
