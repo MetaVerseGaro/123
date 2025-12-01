@@ -41,7 +41,7 @@
       "enable": true,                       # 基础风险：最大持仓/基础释放（与进阶风险建议二选一）
       "max_position_count": 30,             # 最大持仓 = quantity * max_position_count
       "basic_release_timeout_minutes": 10,   # 满仓持续 N 分钟后释放
-      "webhook_sl": false,                  # TradingView buy/sell 基础风控是否触发止损
+      "webhook_sl": true,                  # TradingView buy/sell 基础风控是否触发止损
       "webhook_sl_fast": false,              # true=立即全平并撤单；false=停新+撤单，按节奏慢慢平
       "webhook_reverse": true              # 止损完成后是否自动反向开仓
     }
