@@ -512,12 +512,28 @@ class LighterClient(BaseExchangeClient):
 
     async def place_reduce_only_close_order(self, quantity: Decimal, side: str) -> OrderResult:
         """Place a reduce-only post-only close order using current BBO as reference."""
+        quantity = self._normalize_quantity(quantity)
+        min_qty = getattr(self.config, "min_order_size", None)
+        try:
+            min_qty = Decimal(str(min_qty)) if min_qty is not None else None
+        except Exception:
+            min_qty = None
+        if min_qty and quantity < min_qty:
+            quantity = min_qty
         maker_price = await self._calculate_post_only_price(side, None)
         return await self.place_limit_order(self.config.contract_id, quantity, maker_price, side, reduce_only=True)
 
     async def reduce_only_close_with_retry(self, quantity: Decimal, side: str, timeout_sec: float = 5.0,
                                            max_attempts: int = 5) -> OrderResult:
         """Retry reduce-only post-only close; cancel after timeout and re-post until filled or attempts exhausted."""
+        quantity = self._normalize_quantity(quantity)
+        min_qty = getattr(self.config, "min_order_size", None)
+        try:
+            min_qty = Decimal(str(min_qty)) if min_qty is not None else None
+        except Exception:
+            min_qty = None
+        if min_qty and quantity < min_qty:
+            quantity = min_qty
         attempt = 0
         while attempt < max_attempts:
             attempt += 1
