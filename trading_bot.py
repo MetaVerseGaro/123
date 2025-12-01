@@ -148,6 +148,8 @@ class TradingBot:
         self.basic_direction_file = self._resolve_path(dir_path_cfg or os.getenv('WEBHOOK_BASIC_DIRECTION_FILE', 'webhook_basic_direction.json'))
         self.recent_pivots: deque[PivotPoint] = deque(maxlen=12)
         self._processed_pivot_keys: Set[Tuple[str, str]] = set()
+        # Cache built pivot points to avoid repeated OHLC fetches for the same pivot
+        self._pivot_point_cache: Dict[Tuple[str, str], PivotPoint] = {}
         self._last_pivot_poll: float = 0.0
         default_interval = float(self.zigzag_timeframe_sec or 60)
         self._pivot_poll_interval: float = float(os.getenv("PIVOT_POLL_INTERVAL_SEC", str(int(default_interval))))
@@ -806,10 +808,15 @@ class TradingBot:
         """Convert raw entries into pivot points with processed keys."""
         result: List[Tuple[Tuple[str, str], PivotPoint]] = []
         for entry in entries:
-            pivot = await self._build_pivot_point(entry)
+            key = (entry["close_time"].isoformat(), entry["label"])
+            if key in self._pivot_point_cache:
+                pivot = self._pivot_point_cache[key]
+            else:
+                pivot = await self._build_pivot_point(entry)
+                if pivot:
+                    self._pivot_point_cache[key] = pivot
             if not pivot:
                 continue
-            key = (pivot.close_time.isoformat(), pivot.label)
             result.append((key, pivot))
         result.sort(key=lambda x: x[1].close_time)
         return result
@@ -868,7 +875,12 @@ class TradingBot:
                 self.current_direction = direction
                 self.logger.log(f"[INIT] Direction set to {direction.upper()} via recent pivots (fast init)", "INFO")
             if stop_entry:
-                pivot_point = await self._build_pivot_point(stop_entry)
+                key = (stop_entry["close_time"].isoformat(), stop_entry["label"])
+                pivot_point = self._pivot_point_cache.get(key)
+                if not pivot_point:
+                    pivot_point = await self._build_pivot_point(stop_entry)
+                    if pivot_point:
+                        self._pivot_point_cache[key] = pivot_point
                 if pivot_point:
                     self._update_confirmed_pivots(pivot_point)
                     key = (pivot_point.close_time.isoformat(), pivot_point.label)
