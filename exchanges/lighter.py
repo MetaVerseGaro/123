@@ -1106,6 +1106,8 @@ class LighterClient(BaseExchangeClient):
             elif timeframe.endswith("s"):
                 tf_sec = int(timeframe[:-1])
             start_ms = close_time_ms - tf_sec * 1000 * 5
+            tolerance_ms = max(1000, (tf_sec * 1000) // 2)
+            target_ms = int(close_time_ms)
             resp = await candle_api.candlesticks(
                 market_id=self.config.contract_id,
                 resolution=timeframe,
@@ -1117,8 +1119,17 @@ class LighterClient(BaseExchangeClient):
             if resp and getattr(resp, "candlesticks", None):
                 for candle in resp.candlesticks:
                     ts_val = getattr(candle, "timestamp", None) or getattr(candle, "close_timestamp", None)
-                    if ts_val is not None and int(ts_val) == int(close_time_ms):
-                        return Decimal(str(candle.high)), Decimal(str(candle.low))
+                    if ts_val is None:
+                        continue
+                    try:
+                        ts_ms = int(ts_val)
+                    except Exception:
+                        continue
+                    if ts_ms < 1_000_000_000_000:
+                        ts_ms *= 1000
+                    if abs(ts_ms - target_ms) > tolerance_ms:
+                        continue
+                    return Decimal(str(candle.high)), Decimal(str(candle.low))
             return None
         except Exception as e:
             if self._is_rate_limit_error(e):
