@@ -7,6 +7,7 @@
     "direction": "buy",            # 初始方向（ENABLE_ZIGZAG=false 时使用）
     "quantity": 0.01,
     "min_order_size": 0.005,       # 最小下单量（按交易所/交易对填写）
+    "max_fast_close_qty": 0.5      # 快反/快止损单次最大平仓手数
     "take_profit": 0.02,           # 止盈百分比，0.01 表示 0.01%
     "wait_time": 450,              # 下单间隔（秒，后续节奏优化可替换）
     "max_orders": 40,              # 最大活跃挂单数（临时沿用，后续节奏改造可移除）
