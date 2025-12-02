@@ -7,17 +7,61 @@ import time
 import json
 import asyncio
 import traceback
+import sys
+import random
 from pathlib import Path
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Optional, Dict, List, Tuple, Set, Any
-from collections import deque
+from collections import deque, OrderedDict
 
 from exchanges import ExchangeFactory
 from helpers import TradingLogger
 from helpers.lark_bot import LarkBot
 from helpers.telegram_bot import TelegramBot
+
+
+class _AsyncCache:
+    """Lightweight async cache with TTL and debug logging."""
+
+    def __init__(self, logger: TradingLogger, debug: bool = False):
+        self._store: Dict[str, Tuple[float, float, Any]] = {}
+        self.logger = logger
+        self.debug = debug
+
+    def invalidate(self, *keys: str):
+        for key in keys:
+            self._store.pop(key, None)
+            if self.debug:
+                self.logger.log(f"[CACHE] invalidate {key}", "DEBUG")
+
+    async def get(self, key: str, ttl: float, fetcher, force: bool = False):
+        now = time.time()
+        if (not force) and key in self._store:
+            ts, cache_ttl, val = self._store[key]
+            if now - ts < cache_ttl:
+                if self.debug:
+                    self.logger.log(f"[CACHE] hit {key}", "DEBUG")
+                return val
+        if self.debug:
+            self.logger.log(f"[CACHE] miss {key}", "DEBUG")
+        val = await fetcher()
+        self._store[key] = (now, ttl, val)
+        return val
+
+    def peek(self, key: str, max_age: float):
+        """Non-blocking read; return value if not older than max_age."""
+        now = time.time()
+        if key not in self._store:
+            return None
+        ts, ttl, val = self._store[key]
+        if now - ts < max_age:
+            return val
+        return None
+
+    def keys(self) -> List[str]:
+        return list(self._store.keys())
 
 
 @dataclass
@@ -96,6 +140,24 @@ class TradingBot:
         except ValueError as e:
             raise ValueError(f"Failed to create exchange client: {e}")
 
+        # Cache helper
+        debug_flag = ("--debug" in sys.argv) or (str(os.getenv("DEBUG_CACHE", "false")).lower() == "true")
+        self.cache = _AsyncCache(self.logger, debug=debug_flag)
+        # TTL settings (seconds)
+        self.ttl_bbo = float(os.getenv("TTL_BBO_SEC", "0.3"))
+        self.ttl_bbo_cache = float(os.getenv("BBO_CACHE_TTL_S", "0.5"))
+        self.bbo_force_timeout = float(os.getenv("BBO_FORCE_TIMEOUT_MS", "150")) / 1000.0
+        self.ttl_last_price = float(os.getenv("TTL_LAST_PRICE_SEC", "0.5"))
+        self.ttl_active_orders = float(os.getenv("TTL_ACTIVE_ORDERS_SEC", "2"))
+        self.ttl_position = float(os.getenv("TTL_POSITION_SEC", "1.5"))
+        # Balance TTL is short (3-5s) and does not reuse equity TTL
+        self.ttl_balance = float(os.getenv("TTL_BALANCE_SEC", "4"))
+        self.ttl_equity = float(os.getenv("TTL_EQUITY_SEC", "60"))
+        self.ttl_order_info = float(os.getenv("TTL_ORDER_INFO_SEC", "1.5"))
+        self.pivot_debounce_ms = int(os.getenv("PIVOT_DEBOUNCE_MS", "150"))
+        self._last_pivot_reload_ts: float = 0.0
+        self._pivot_reload_in_progress: bool = False
+
         # Trading state
         self.active_close_orders = []
         self.last_close_orders = 0
@@ -119,6 +181,9 @@ class TradingBot:
         self._equity_cache: Optional[Decimal] = None
         self._equity_cache_ts: float = 0.0
         self._equity_cache_ttl: float = 60.0  # seconds
+        self._equity_last_nonzero: Optional[Decimal] = None
+        self._last_stop_eval_price: Optional[Decimal] = None
+        self._pivot_file_mtime: float = 0.0
         self.net_failure_count: int = 0
         self.last_error_notified_msg: Optional[str] = None
         self.last_error_notified_ts: float = 0.0
@@ -234,24 +299,94 @@ class TradingBot:
         self._setup_websocket_handlers()
 
     def _invalidate_order_cache(self):
-        self._orders_cache = None
-        self._orders_cache_ts = 0.0
+        self.cache.invalidate(f"orders:{self.config.contract_id}")
 
     def _invalidate_position_cache(self):
-        self._position_cache = None
-        self._position_cache_ts = 0.0
+        self.cache.invalidate(f"position:{self.config.contract_id}")
+
+    def _invalidate_order_info_cache(self, order_id: Optional[str] = None):
+        if order_id:
+            self.cache.invalidate(f"order_info:{order_id}")
+        else:
+            # Broad invalidation (used after bulk cancel)
+            keys = [k for k in self.cache.keys() if k.startswith("order_info:")]
+            if keys:
+                self.cache.invalidate(*keys)
+
+    async def _get_bbo_cached(self, force: bool = False) -> Tuple[Decimal, Decimal]:
+        key = f"bbo:{self.config.contract_id}"
+        async def fetch_bbo():
+            return await self.exchange_client.fetch_bbo_prices(self.config.contract_id)
+
+        if force:
+            try:
+                val = await asyncio.wait_for(fetch_bbo(), timeout=self.bbo_force_timeout)
+                if self.cache.debug:
+                    self.logger.log("[CACHE] BBO force ok", "DEBUG")
+                return val
+            except (asyncio.TimeoutError, asyncio.CancelledError, ConnectionError):
+                cached = self.cache.peek(key, self.ttl_bbo_cache)
+                if cached:
+                    if self.cache.debug:
+                        self.logger.log("[CACHE] BBO timeout→cached", "DEBUG")
+                    return cached
+                if self.cache.debug:
+                    self.logger.log("[CACHE] BBO timeout→no-cache", "DEBUG")
+                raise
+        return await self.cache.get(
+            key,
+            self.ttl_bbo,
+            fetch_bbo,
+            force=False
+        )
+
+    async def _get_last_trade_price_cached(self, best_bid: Optional[Decimal] = None, best_ask: Optional[Decimal] = None, force: bool = False) -> Optional[Decimal]:
+        key = f"last_price:{self.config.contract_id}"
+
+        async def _fetch():
+            # Prefer given bid/ask if provided
+            if best_bid is not None and best_ask is not None:
+                try:
+                    return (Decimal(best_bid) + Decimal(best_ask)) / 2
+                except Exception:
+                    pass
+            try:
+                bid, ask = await self._get_bbo_cached(force=force)
+                return (bid + ask) / 2
+            except Exception as exc:
+                self.logger.log(f"[PRICE] Fallback trade price failed: {exc}", "WARNING")
+                return None
+
+        return await self.cache.get(key, self.ttl_last_price, _fetch, force=force)
 
     async def _get_active_orders_cached(self) -> list:
-        orders = await self.exchange_client.get_active_orders(self.config.contract_id)
-        self._orders_cache = orders
-        self._orders_cache_ts = time.time()
-        return orders
+        key = f"orders:{self.config.contract_id}"
+        return await self.cache.get(
+            key,
+            self.ttl_active_orders,
+            lambda: self.exchange_client.get_active_orders(self.config.contract_id)
+        )
 
-    async def _get_position_signed_cached(self) -> Decimal:
-        pos_signed = await self.exchange_client.get_account_positions()
-        self._position_cache = pos_signed
-        self._position_cache_ts = time.time()
-        return pos_signed
+    async def _get_position_signed_cached(self, force: bool = False) -> Decimal:
+        key = f"position:{self.config.contract_id}"
+        return await self.cache.get(
+            key,
+            self.ttl_position,
+            lambda: self.exchange_client.get_account_positions(),
+            force=force
+        )
+
+    def _order_ws_available(self) -> bool:
+        return bool(getattr(self.exchange_client, "ws_manager", None)) or bool(getattr(self.exchange_client, "order_ws_enabled", False))
+
+    async def _get_order_info_cached(self, order_id: str, force: bool = False):
+        key = f"order_info:{order_id}"
+        return await self.cache.get(
+            key,
+            self.ttl_order_info,
+            lambda: self.exchange_client.get_order_info(order_id),
+            force=force
+        )
 
 
     def _set_stop_new_orders(self, enable: bool):
@@ -339,27 +474,29 @@ class TradingBot:
             return None
 
     def _determine_initial_direction_and_stop(self, entries: List[Dict[str, Any]]) -> Tuple[Optional[str], Optional[Dict[str, Any]]]:
-        """From latest pivots determine initial direction and nearest stop pivot (minimal OHLC fetch)."""
+        """From latest pivots determine direction via first HH/LL, then nearest stop pivot for that direction."""
         if not entries:
             return None, None
         entries_desc = sorted(entries, key=lambda x: x["close_time"], reverse=True)
         direction: Optional[str] = None
         stop_entry: Optional[Dict[str, Any]] = None
+        # First pass: find the most recent HH/LL to set direction
         for entry in entries_desc:
             label = entry.get("label")
             if not label:
                 continue
-            if direction is None:
-                if label in ("HH", "HL"):
-                    direction = "buy"
-                    if label in ("HL", "LL"):
-                        stop_entry = entry
-                        break
-                elif label in ("LL", "LH"):
-                    direction = "sell"
-                    if label in ("HH", "LH"):
-                        stop_entry = entry
-                        break
+            if label == "HH":
+                direction = "buy"
+                break
+            if label == "LL":
+                direction = "sell"
+                break
+        if direction is None:
+            return None, None
+        # Second pass: find nearest stop pivot matching direction
+        for entry in entries_desc:
+            label = entry.get("label")
+            if not label:
                 continue
             if direction == "buy" and label in ("HL", "LL"):
                 stop_entry = entry
@@ -374,11 +511,52 @@ class TradingBot:
         try:
             if not path.exists():
                 return None
+            try:
+                self._pivot_file_mtime = path.stat().st_mtime
+            except Exception:
+                pass
             with open(path, "r", encoding="utf-8") as f:
                 return json.load(f)
         except Exception as exc:
             self.logger.log(f"[WEBHOOK] Failed to load {path}: {exc}", "WARNING")
             return None
+
+    def _persist_pivot_price(self, entry: Dict[str, Any], price: Decimal):
+        """Persist price into pivot store to avoid future REST fetch."""
+        try:
+            store = self._load_json_file(self.zigzag_pivot_file) or {}
+            base_bucket = store.get(self.symbol_base, {}) if isinstance(store, dict) else {}
+            tf_bucket = base_bucket.get(self.zigzag_timeframe_key) or base_bucket.get(str(self.zigzag_timeframe_key))
+            if not tf_bucket:
+                return
+            updated = False
+            for item in tf_bucket:
+                try:
+                    label = str(item.get("label")).upper()
+                    close_raw = item.get("close_time_utc") or item.get("pivot_bar_close") or item.get("close_time")
+                    close_dt = self._parse_pivot_time(str(close_raw)) if close_raw else None
+                    if close_dt and close_dt == entry["close_time"] and label == entry["label"]:
+                        # store per-exchange price to avoid ticker drift
+                        exchange_key = entry.get("raw_ticker") or self.config.exchange
+                        price_key = f"price_{exchange_key}"
+                        item[price_key] = str(price)
+                        updated = True
+                        break
+                except Exception:
+                    continue
+            if updated:
+                # Write back
+                self.zigzag_pivot_file.parent.mkdir(parents=True, exist_ok=True)
+                tmp = self.zigzag_pivot_file.with_suffix(".tmp")
+                with open(tmp, "w", encoding="utf-8") as f:
+                    json.dump(store, f, ensure_ascii=False, indent=2, default=str)
+                tmp.replace(self.zigzag_pivot_file)
+                try:
+                    self._pivot_file_mtime = self.zigzag_pivot_file.stat().st_mtime
+                except Exception:
+                    pass
+        except Exception as exc:
+            self.logger.log(f"[ZIGZAG] persist pivot price failed: {exc}", "WARNING")
 
     async def graceful_shutdown(self, reason: str = "Unknown"):
         """Perform graceful shutdown of the trading bot."""
@@ -455,6 +633,10 @@ class TradingBot:
                 else:
                     self.logger.log(f"[{order_type}] [{order_id}] {status} "
                                     f"{message.get('size')} @ {message.get('price')}", "INFO")
+                # Invalidate caches on any order event
+                self._invalidate_order_cache()
+                self._invalidate_position_cache()
+                self._invalidate_order_info_cache(order_id)
 
             except Exception as e:
                 self.logger.log(f"Error handling order update: {e}", "ERROR")
@@ -496,49 +678,73 @@ class TradingBot:
     async def _get_equity_snapshot(self) -> Optional[Decimal]:
         """Fetch equity with fallbacks."""
         now_ts = time.time()
-        if self._equity_cache is not None and (now_ts - self._equity_cache_ts) < self._equity_cache_ttl:
+        if self._equity_cache is not None and (now_ts - self._equity_cache_ts) < self.ttl_equity:
             return self._equity_cache
-        equity = None
-        if hasattr(self.exchange_client, "get_account_equity"):
-            try:
-                equity = await self.exchange_client.get_account_equity()
-            except Exception as e:
-                self.logger.log(f"[RISK] get_account_equity failed: {e}", "WARNING")
-        if equity is None and hasattr(self.exchange_client, "get_available_balance"):
-            try:
-                equity = await self.exchange_client.get_available_balance()
-            except Exception as e:
-                self.logger.log(f"[RISK] get_available_balance failed: {e}", "WARNING")
-        if equity is None:
-            try:
-                pos_signed = await self._get_position_signed_cached()
-                best_bid, best_ask = await self.exchange_client.fetch_bbo_prices(self.config.contract_id)
-                mid_price = (best_bid + best_ask) / 2
-                equity = abs(pos_signed) * mid_price
-            except Exception as e:
-                self.logger.log(f"[RISK] equity fallback failed: {e}", "ERROR")
-                equity = None
-        if equity is not None:
-            self._equity_cache = equity
-            self._equity_cache_ts = now_ts
+
+        async def _fetch_equity():
+            equity_val = None
+            if hasattr(self.exchange_client, "get_account_equity"):
+                try:
+                    equity_val = await self.exchange_client.get_account_equity()
+                except Exception as e:
+                    self.logger.log(f"[RISK] get_account_equity failed: {e}", "WARNING")
+            if equity_val is None:
+                try:
+                    pos_signed = await self._get_position_signed_cached(force=True)
+                    best_bid, best_ask = await self._get_bbo_cached()
+                    mid_price = (best_bid + best_ask) / 2
+                    equity_val = abs(pos_signed) * mid_price
+                except Exception as e:
+                    self.logger.log(f"[RISK] equity fallback failed: {e}", "ERROR")
+                    equity_val = None
+            return equity_val
+
+        equity = await self.cache.get("equity", self.ttl_equity, _fetch_equity, force=False)
+        if equity is None or equity <= 0:
+            self.cache.invalidate("equity")
+            return self._equity_last_nonzero
+        self._equity_cache = equity
+        self._equity_cache_ts = now_ts
+        self._equity_last_nonzero = equity
         return equity
 
+    async def _get_balance_snapshot(self) -> Optional[Decimal]:
+        """Fetch balance with short TTL; reuse equity failure semantics."""
+        key = "balance"
+
+        async def _fetch_balance():
+            bal = None
+            if hasattr(self.exchange_client, "get_available_balance"):
+                try:
+                    bal = await self.exchange_client.get_available_balance()
+                except Exception as e:
+                    self.logger.log(f"[RISK] get_available_balance failed: {e}", "WARNING")
+            return bal
+
+        bal = await self.cache.get(key, self.ttl_balance, _fetch_balance, force=False)
+        if bal is None or bal <= 0:
+            self.cache.invalidate(key)
+            return self._equity_last_nonzero
+        return bal
+
     async def _maybe_send_daily_pnl(self):
-        """Send daily PnL at 20:00 UTC+8 (12:00 UTC)."""
+        """Send daily PnL at 20:00 UTC+8 (12:00 UTC) via Telegram only."""
         if not (self.enable_notifications and self.daily_pnl_report):
+            return
+        telegram_token = os.getenv("TELEGRAM_BOT_TOKEN")
+        telegram_chat_id = os.getenv("TELEGRAM_CHAT_ID")
+        if not (telegram_token and telegram_chat_id):
             return
         now = time.gmtime()
         current_date = f"{now.tm_year:04d}-{now.tm_mon:02d}-{now.tm_mday:02d}"
         equity = await self._get_equity_snapshot()
         now_ts = time.time()
-        # 重置日基准
         if self.last_daily_pnl_date != current_date:
             self.daily_pnl_baseline = equity
             self.last_daily_pnl_date = current_date
             self.last_daily_sent_date = None
             self.last_pnl_fetch_ts = 0.0
             return
-        # 仅在 12:00 UTC 时段发送一次，并在发送前尝试获取最新 PnL（调用一次）
         if now.tm_hour == 12 and self.last_daily_sent_date != current_date:
             if hasattr(self.exchange_client, "get_account_pnl"):
                 if now_ts - self.last_pnl_fetch_ts > 300:
@@ -550,11 +756,13 @@ class TradingBot:
                     except Exception as e:
                         self.logger.log(f"[PNL] get_account_pnl failed: {e}", "WARNING")
             if equity is None or self.daily_pnl_baseline is None:
-                await self.send_notification("[PNL] Daily PnL unavailable (missing equity data)")
+                with TelegramBot(telegram_token, telegram_chat_id) as tg_bot:
+                    tg_bot.send_text("[PNL] Daily PnL unavailable (missing equity data)")
             else:
                 pnl = equity - self.daily_pnl_baseline
                 msg = f"[PNL] {current_date} Equity: {equity} | PnL: {pnl}"
-                await self.send_notification(msg)
+                with TelegramBot(telegram_token, telegram_chat_id) as tg_bot:
+                    tg_bot.send_text(msg)
             self.last_daily_sent_date = current_date
 
     async def _place_take_profit_order(self, quantity: Decimal, filled_price: Decimal) -> bool:
@@ -578,7 +786,7 @@ class TradingBot:
 
         # Lighter: adaptive maker pricing with retries when price is better than target
         while True:
-            best_bid, best_ask = await self.exchange_client.fetch_bbo_prices(self.config.contract_id)
+            best_bid, best_ask = await self._get_bbo_cached(force=True)
             if close_side == 'sell':
                 desired_price = max(target_price, best_ask + self.config.tick_size)
                 has_better = desired_price > target_price
@@ -720,44 +928,88 @@ class TradingBot:
         tf = self.zigzag_timeframe
         tf_ms = int(self.zigzag_timeframe_sec or 60) * 1000
         tolerance_ms = max(1000, tf_ms // 2)
-        if hasattr(self.exchange_client, "fetch_candle_by_close_time"):
-            try:
-                candle = await self.exchange_client.fetch_candle_by_close_time(
-                    timeframe=tf,
-                    close_time_ms=target_ms
-                )
-                if candle:
-                    if isinstance(candle, tuple) and len(candle) == 2:
-                        return candle
-                    high_val = getattr(candle, "high", None) if not isinstance(candle, dict) else candle.get("high")
-                    low_val = getattr(candle, "low", None) if not isinstance(candle, dict) else candle.get("low")
-                    if high_val is not None and low_val is not None:
+        cache_key = (self.config.exchange, self.config.ticker, tf, target_ms)
+        now_ts = time.time()
+        if not hasattr(self, "_candle_lru"):
+            self._candle_lru = {}
+        if not hasattr(self, "_candle_lru_order"):
+            self._candle_lru_order = OrderedDict()
+        # TTL reuse: align with pivot file (approx 30 min)
+        candle_ttl = float(os.getenv("CANDLE_CACHE_TTL_SEC", "1800"))
+        cached = self._candle_lru.get(cache_key)
+        if cached:
+            ts, val = cached
+            if now_ts - ts < candle_ttl:
+                # move to end
+                self._candle_lru_order.pop(cache_key, None)
+                self._candle_lru_order[cache_key] = True
+                if self.cache.debug:
+                    self.logger.log("[CACHE] candle hit", "DEBUG")
+                return val
+            else:
+                self._candle_lru.pop(cache_key, None)
+                self._candle_lru_order.pop(cache_key, None)
+        if not hasattr(self, "_candle_pending"):
+            self._candle_pending = {}
+        if cache_key in self._candle_pending:
+            if self.cache.debug:
+                self.logger.log("[CACHE] candle join pending", "DEBUG")
+            return await self._candle_pending[cache_key]
+        async def _do_fetch():
+            if hasattr(self.exchange_client, "fetch_candle_by_close_time"):
+                try:
+                    candle = await self.exchange_client.fetch_candle_by_close_time(
+                        timeframe=tf,
+                        close_time_ms=target_ms
+                    )
+                    if candle:
+                        if isinstance(candle, tuple) and len(candle) == 2:
+                            return candle
+                        high_val = getattr(candle, "high", None) if not isinstance(candle, dict) else candle.get("high")
+                        low_val = getattr(candle, "low", None) if not isinstance(candle, dict) else candle.get("low")
+                        if high_val is not None and low_val is not None:
+                            return Decimal(str(high_val)), Decimal(str(low_val))
+                except Exception as exc:
+                    self.logger.log(f"[ZIGZAG] fetch_candle_by_close_time failed: {exc}", "WARNING")
+            if hasattr(self.exchange_client, "fetch_history_candles"):
+                try:
+                    candles = await self.exchange_client.fetch_history_candles(limit=300, timeframe=tf)
+                    for c in candles:
+                        ts_val = self._get_candle_close_ts(c)
+                        if ts_val is None:
+                            continue
+                        try:
+                            ts_ms = int(ts_val)
+                        except Exception:
+                            continue
+                        if ts_ms < 1_000_000_000_000:
+                            ts_ms *= 1000
+                        if abs(ts_ms - target_ms) > tolerance_ms:
+                            continue
+                        high_val = getattr(c, "high", None) if not isinstance(c, dict) else c.get("high")
+                        low_val = getattr(c, "low", None) if not isinstance(c, dict) else c.get("low")
+                        if high_val is None or low_val is None:
+                            continue
                         return Decimal(str(high_val)), Decimal(str(low_val))
-            except Exception as exc:
-                self.logger.log(f"[ZIGZAG] fetch_candle_by_close_time failed: {exc}", "WARNING")
-        if hasattr(self.exchange_client, "fetch_history_candles"):
-            try:
-                candles = await self.exchange_client.fetch_history_candles(limit=300, timeframe=tf)
-                for c in candles:
-                    ts_val = self._get_candle_close_ts(c)
-                    if ts_val is None:
-                        continue
-                    try:
-                        ts_ms = int(ts_val)
-                    except Exception:
-                        continue
-                    if ts_ms < 1_000_000_000_000:
-                        ts_ms *= 1000
-                    if abs(ts_ms - target_ms) > tolerance_ms:
-                        continue
-                    high_val = getattr(c, "high", None) if not isinstance(c, dict) else c.get("high")
-                    low_val = getattr(c, "low", None) if not isinstance(c, dict) else c.get("low")
-                    if high_val is None or low_val is None:
-                        continue
-                    return Decimal(str(high_val)), Decimal(str(low_val))
-            except Exception as exc:
-                self.logger.log(f"[ZIGZAG] fetch_history_candles failed: {exc}", "WARNING")
-        return None
+                except Exception as exc:
+                    self.logger.log(f"[ZIGZAG] fetch_history_candles failed: {exc}", "WARNING")
+            return None
+
+        fut = asyncio.create_task(_do_fetch())
+        self._candle_pending[cache_key] = fut
+        try:
+            candle = await fut
+            if candle:
+                # maintain LRU size 128
+                self._candle_lru[cache_key] = (now_ts, candle)
+                self._candle_lru_order.pop(cache_key, None)
+                self._candle_lru_order[cache_key] = True
+                while len(self._candle_lru_order) > 128:
+                    oldest, _ = self._candle_lru_order.popitem(last=False)
+                    self._candle_lru.pop(oldest, None)
+            return candle
+        finally:
+            self._candle_pending.pop(cache_key, None)
 
     def _load_pivots_for_config(self) -> List[Dict[str, Any]]:
         """Load pivot entries for current symbol/timeframe from persisted store."""
@@ -778,10 +1030,18 @@ class TradingBot:
                 close_dt = self._parse_pivot_time(str(close_raw)) if close_raw else None
                 if not label or close_dt is None:
                     continue
+                # prefer exchange-specific stored price
+                price_val = None
+                exchange_key = raw_ticker
+                if exchange_key:
+                    price_val = item.get(f"price_{exchange_key}")
+                if price_val is None:
+                    price_val = item.get("price") or item.get("high") or item.get("low")
                 pivots.append({
                     "label": label,
                     "raw_ticker": raw_ticker,
                     "close_time": close_dt,
+                    "price": Decimal(str(price_val)) if price_val is not None else None,
                 })
             except Exception:
                 continue
@@ -790,12 +1050,15 @@ class TradingBot:
 
     async def _build_pivot_point(self, entry: Dict[str, Any]) -> Optional[PivotPoint]:
         """Build PivotPoint with price derived from exchange OHLC data."""
-        candle = await self._fetch_candle_for_time(entry["close_time"])
-        if not candle:
-            self.logger.log(f"[ZIGZAG] Missing OHLC for pivot at {entry['close_time']}", "WARNING")
-            return None
-        high, low = candle
-        price = high if entry["label"] in ("HH", "LH") else low
+        price = entry.get("price")
+        if price is None:
+            candle = await self._fetch_candle_for_time(entry["close_time"])
+            if not candle:
+                self.logger.log(f"[ZIGZAG] Missing OHLC for pivot at {entry['close_time']}", "WARNING")
+                return None
+            high, low = candle
+            price = high if entry["label"] in ("HH", "LH") else low
+            self._persist_pivot_price(entry, price)
         return PivotPoint(
             label=entry["label"],
             price=price,
@@ -809,6 +1072,11 @@ class TradingBot:
         result: List[Tuple[Tuple[str, str], PivotPoint]] = []
         for entry in entries:
             key = (entry["close_time"].isoformat(), entry["label"])
+            # Skip fully processed pivots to avoid repeated OHLC fetch
+            if key in self._processed_pivot_keys:
+                if key in self._pivot_point_cache:
+                    result.append((key, self._pivot_point_cache[key]))
+                continue
             if key in self._pivot_point_cache:
                 pivot = self._pivot_point_cache[key]
             else:
@@ -826,12 +1094,25 @@ class TradingBot:
         if not self.enable_zigzag:
             return
         now = time.time()
-        if (not force) and (now - self._last_pivot_poll < self._pivot_poll_interval):
+        current_mtime = 0.0
+        try:
+            if self.zigzag_pivot_file.exists():
+                current_mtime = self.zigzag_pivot_file.stat().st_mtime
+        except Exception:
+            current_mtime = 0.0
+        if (not force) and (now - self._last_pivot_poll < self._pivot_poll_interval) and (current_mtime == self._pivot_file_mtime):
             return
         self._last_pivot_poll = now
         entries = self._load_pivots_for_config()
         if not entries:
             return
+        # Debounce rapid successive file writes
+        if current_mtime and current_mtime != self._pivot_file_mtime:
+            await asyncio.sleep(self.pivot_debounce_ms / 1000)
+            try:
+                current_mtime = self.zigzag_pivot_file.stat().st_mtime
+            except Exception:
+                current_mtime = self._pivot_file_mtime
         pivot_points = await self._build_pivot_points(entries)
         for key, pivot in pivot_points:
             if key in self._processed_pivot_keys:
@@ -910,7 +1191,7 @@ class TradingBot:
         if self.pending_reverse_state in ("waiting_next_pivot", "unwinding"):
             return
         try:
-            pos_signed = await self._get_position_signed_cached()
+            pos_signed = await self._get_position_signed_cached(force=force)
         except Exception as e:
             self.logger.log(f"[SL] Failed to fetch position for refresh: {e}", "WARNING")
             return
@@ -928,12 +1209,20 @@ class TradingBot:
             return
 
         direction = "buy" if pos_signed > 0 else "sell"
+        if self.current_direction and self.current_direction != direction:
+            direction = self.current_direction
         prev_stop = self.dynamic_stop_price
         if self.dynamic_stop_direction and self.dynamic_stop_direction != direction:
             self.dynamic_stop_price = None
         struct_stop = self._compute_dynamic_stop(direction)
         if struct_stop is None:
             return
+
+        if (not force) and self._last_stop_eval_price is not None:
+            if abs(struct_stop - self._last_stop_eval_price) < self.config.tick_size:
+                if self.cache.debug:
+                    self.logger.log("[SL] Dynamic stop debounced (no meaningful change)", "DEBUG")
+                return
 
         dyn_stop = struct_stop
         if self.dynamic_stop_price is not None:
@@ -949,6 +1238,7 @@ class TradingBot:
 
         self.dynamic_stop_price = dyn_stop
         self.dynamic_stop_direction = direction
+        self._last_stop_eval_price = dyn_stop
         await self._place_stop_loss_native(pos_abs, dyn_stop, 'sell' if direction == "buy" else 'buy')
         if self.enable_notifications and prev_stop != self.dynamic_stop_price:
             try:
@@ -973,6 +1263,10 @@ class TradingBot:
                 await self.exchange_client.cancel_order(order.order_id)
             if self.config.direction == "sell" and order.price >= stop_price:
                 await self.exchange_client.cancel_order(order.order_id)
+        self._invalidate_order_cache()
+        if active_orders:
+            for order in active_orders:
+                self._invalidate_order_info_cache(order.get("order_id", None) if isinstance(order, dict) else getattr(order, "order_id", None))
 
     async def _run_redundancy_check(self, direction: str, pos_signed: Decimal):
         """Re-evaluate redundancy and update stop_new_orders state."""
@@ -980,7 +1274,7 @@ class TradingBot:
             return
         try:
             position_amt = abs(pos_signed)
-            best_bid, best_ask = await self.exchange_client.fetch_bbo_prices(self.config.contract_id)
+            best_bid, best_ask = await self._get_bbo_cached()
             mid_price = (best_bid + best_ask) / 2
             # Need avg entry price; fallback: mid_price
             avg_price = mid_price
@@ -1125,6 +1419,8 @@ class TradingBot:
         self.dynamic_stop_price = None
         self.dynamic_stop_direction = None
         self.last_open_order_time = 0
+        self._invalidate_position_cache()
+        self._invalidate_order_cache()
         # Ensure new direction can place orders
         self._set_stop_new_orders(False)
 
@@ -1211,6 +1507,8 @@ class TradingBot:
                 self.pending_original_direction = None
                 self._set_stop_new_orders(False)
                 self.last_open_order_time = 0
+                self._invalidate_position_cache()
+                self._invalidate_order_cache()
                 if self.enable_notifications:
                     await self.send_notification(f"[DIRECTION] Switched to {self.config.direction.upper()} (slow reverse complete)")
                 if self.enable_dynamic_sl:
@@ -1234,6 +1532,9 @@ class TradingBot:
             # Risk gate: stop new orders when flag is set
             if self.stop_new_orders or self.webhook_block_trading:
                 return False
+            # Force refresh BBO/last before placing orders
+            await self._get_bbo_cached(force=True)
+            await self._get_last_trade_price_cached(force=True)
             # Reset state before placing order
             self.order_filled_event.clear()
             self.current_order_status = 'OPEN'
@@ -1245,6 +1546,8 @@ class TradingBot:
                 self.config.quantity,
                 self.config.direction
             )
+            if order_result and order_result.order_id:
+                self._invalidate_order_info_cache(order_result.order_id)
 
             if not order_result.success:
                 return False
@@ -1256,6 +1559,7 @@ class TradingBot:
                     await asyncio.wait_for(self.order_filled_event.wait(), timeout=10)
                 except asyncio.TimeoutError:
                     pass
+            await asyncio.sleep(0.25)
 
             # Handle order result
             handled = await self._handle_order_result(order_result)
@@ -1263,6 +1567,8 @@ class TradingBot:
                 await self._refresh_stop_loss()
             if handled:
                 self.last_new_order_time = time.time()
+                self._invalidate_order_cache()
+                self._invalidate_position_cache()
             return handled
 
         except Exception as e:
@@ -1302,7 +1608,10 @@ class TradingBot:
             if self.config.exchange == "lighter":
                 current_order_status = getattr(self.exchange_client.current_order, "status", None)
             if current_order_status is None:
-                order_info = await self.exchange_client.get_order_info(order_id)
+                if not self._order_ws_available():
+                    order_info = await self._get_order_info_cached(order_id)
+                else:
+                    order_info = await self.exchange_client.get_order_info(order_id)
                 current_order_status = getattr(order_info, "status", None)
             if current_order_status is None:
                 current_order_status = order_result.status or "OPEN"
@@ -1316,7 +1625,10 @@ class TradingBot:
                 if self.config.exchange == "lighter":
                     current_order_status = self.exchange_client.current_order.status
                 else:
-                    order_info = await self.exchange_client.get_order_info(order_id)
+                    if not self._order_ws_available():
+                        order_info = await self._get_order_info_cached(order_id)
+                    else:
+                        order_info = await self.exchange_client.get_order_info(order_id)
                     if order_info is not None:
                         current_order_status = order_info.status
                 new_order_price = await self.exchange_client.get_order_price(self.config.direction)
@@ -1356,8 +1668,12 @@ class TradingBot:
                         try:
                             await asyncio.wait_for(self.order_canceled_event.wait(), timeout=5)
                         except asyncio.TimeoutError:
-                            order_info = await self.exchange_client.get_order_info(order_id)
+                            if not self._order_ws_available():
+                                order_info = await self._get_order_info_cached(order_id, force=True)
+                            else:
+                                order_info = await self.exchange_client.get_order_info(order_id)
                             self.order_filled_amount = order_info.filled_size
+                self._invalidate_order_info_cache(order_id)
 
             if self.order_filled_amount > 0:
                 close_side = self.config.close_order_side
@@ -1401,21 +1717,15 @@ class TradingBot:
                 # Get positions
                 position_signed = await self._get_position_signed_cached()
                 position_amt = abs(position_signed)
-                # Equity from exchange if available
-                equity = None
-                if hasattr(self.exchange_client, "get_account_equity"):
-                    try:
-                        equity = await self.exchange_client.get_account_equity()
-                        # available_balance fallback
-                        if equity is None and hasattr(self.exchange_client, "get_available_balance"):
-                            equity = await self.exchange_client.get_available_balance()
-                    except Exception as e:
-                        self.logger.log(f"[RISK] get_account_equity failed: {e}", "WARNING")
+                equity = await self._get_equity_snapshot()
                 # Fallback equity proxy
-                best_bid, best_ask = await self.exchange_client.fetch_bbo_prices(self.config.contract_id)
+                best_bid, best_ask = await self._get_bbo_cached()
                 mid_price = (best_bid + best_ask) / 2
                 if equity is None:
-                    equity = position_amt * mid_price
+                    if position_amt > 0:
+                        equity = position_amt * mid_price
+                    else:
+                        equity = self._equity_last_nonzero or self._equity_cache
 
                 # Calculate active closing amount
                 active_close_amount = sum(
@@ -1496,7 +1806,7 @@ class TradingBot:
                     mismatch_detected = True
 
                 # Risk gating: stop new orders if equity < threshold
-                if equity < self.stop_new_orders_equity_threshold:
+                if equity is not None and equity < self.stop_new_orders_equity_threshold:
                     self.logger.log(f"[RISK] Equity below threshold ({equity}<{self.stop_new_orders_equity_threshold}), slow unwind.", "ERROR")
                     if self.enable_notifications:
                         await self.send_notification(f"[RISK] Equity below threshold {equity} < {self.stop_new_orders_equity_threshold}, stop new and unwind.")
@@ -1520,7 +1830,7 @@ class TradingBot:
                     await self.graceful_shutdown("Equity below threshold - unwound")
                     mismatch_detected = True
 
-                if self.enable_advanced_risk and self.stop_loss_enabled:
+                if self.enable_advanced_risk and self.stop_loss_enabled and equity is not None:
                     # Redundancy calculation for stop-new-orders gating
                     avg_price = mid_price
                     if hasattr(self.exchange_client, "get_position_detail"):
@@ -1597,7 +1907,7 @@ class TradingBot:
                                             if o.side == self.config.close_order_side
                                         ]
                                         if close_orders:
-                                            best_bid, best_ask = await self.exchange_client.fetch_bbo_prices(self.config.contract_id)
+                                            best_bid, best_ask = await self._get_bbo_cached()
                                             mid_price = (best_bid + best_ask) / 2
                                             farthest = sorted(
                                                 close_orders,
@@ -1636,6 +1946,7 @@ class TradingBot:
             try:
                 await self.exchange_client.cancel_all_orders()
                 self._invalidate_order_cache()
+                self._invalidate_order_info_cache()
                 return
             except Exception as exc:
                 self.logger.log(f"[WEBHOOK] cancel_all_orders failed: {exc}", "WARNING")
@@ -1770,7 +2081,7 @@ class TradingBot:
             next_close_order = picker(self.active_close_orders, key=lambda o: o["price"])
             next_close_price = next_close_order["price"]
 
-            best_bid, best_ask = await self.exchange_client.fetch_bbo_prices(self.config.contract_id)
+            best_bid, best_ask = await self._get_bbo_cached(force=True)
             if best_bid <= 0 or best_ask <= 0 or best_bid >= best_ask:
                 raise ValueError("No bid/ask data available")
 
@@ -1799,7 +2110,7 @@ class TradingBot:
             except Exception:
                 pass
         try:
-            bid, ask = await self.exchange_client.fetch_bbo_prices(self.config.contract_id)
+            bid, ask = await self._get_bbo_cached()
             return (bid + ask) / 2
         except Exception as exc:
             self.logger.log(f"[PRICE] Fallback trade price failed: {exc}", "WARNING")
@@ -1813,11 +2124,11 @@ class TradingBot:
         best_ask = None
 
         await self._sync_external_pivots()
-        best_bid, best_ask = await self.exchange_client.fetch_bbo_prices(self.config.contract_id)
+        best_bid, best_ask = await self._get_bbo_cached(force=True)
         if best_bid <= 0 or best_ask <= 0 or best_bid >= best_ask:
             raise ValueError("No bid/ask data available")
 
-        trade_price = await self._get_last_trade_price(best_bid, best_ask)
+        trade_price = await self._get_last_trade_price_cached(best_bid, best_ask, force=True)
 
         if self.enable_dynamic_sl and self.dynamic_stop_price is not None and (not self.stop_loss_triggered):
             if self.config.direction == "buy" and best_bid <= self.dynamic_stop_price:
@@ -1872,6 +2183,8 @@ class TradingBot:
                     await self.exchange_client.cancel_order(order.order_id)
                 except Exception as cancel_err:
                     self.logger.log(f"Failed to cancel order {order.order_id}: {cancel_err}", "WARNING")
+            self._invalidate_order_cache()
+            self._invalidate_order_info_cache()
         except Exception as e:
             self.logger.log(f"Error fetching active orders during stop-loss: {e}", "ERROR")
 
@@ -1908,10 +2221,14 @@ class TradingBot:
                 except Exception as fallback_err:
                     self.logger.log(f"Stop-loss fallback order failed: {fallback_err}", "ERROR")
 
+            self._invalidate_position_cache()
+            await asyncio.sleep(0.25)
+
         # Reset stop-loss state to allow continued trading
         self.current_sl_order_id = None
         self.dynamic_stop_price = None
         self.dynamic_stop_direction = None
+        self._last_stop_eval_price = None
         self.stop_loss_triggered = False
 
     async def send_notification(self, message: str):
