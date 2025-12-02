@@ -124,6 +124,7 @@ class PivotStore:
         self.path = path
         self.data: Dict[str, Dict[str, list]] = {}
         self._lock = asyncio.Lock()
+        self._last_mtime: float = 0.0
         self._load()
 
     def _load(self) -> None:
@@ -131,8 +132,20 @@ class PivotStore:
             try:
                 with open(self.path, "r", encoding="utf-8") as f:
                     self.data = json.load(f)
+                self._last_mtime = self.path.stat().st_mtime
             except Exception:
                 self.data = {}
+
+    async def reload_if_changed(self) -> None:
+        """Reload from disk if mtime changed (external edits)."""
+        if self.path.exists():
+            try:
+                current = self.path.stat().st_mtime
+            except Exception:
+                return
+            if current != self._last_mtime:
+                async with self._lock:
+                    self._load()
 
     async def add_pivot(
         self,
@@ -245,6 +258,7 @@ async def handle_webhook(request: web.Request) -> web.Response:
     app = request.app
     pivot_store: PivotStore = app["pivot_store"]
     direction_store: DirectionStore = app["direction_store"]
+    await pivot_store.reload_if_changed()
 
     raw_text = ""
     payload: Dict[str, Any] = {}
