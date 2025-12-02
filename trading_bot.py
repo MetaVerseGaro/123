@@ -701,15 +701,14 @@ class TradingBot:
                     equity_val = await self.exchange_client.get_account_equity()
                 except Exception as e:
                     self.logger.log(f"[RISK] get_account_equity failed: {e}", "WARNING")
-            if equity_val is None:
+            if equity_val is None and hasattr(self.exchange_client, "get_available_balance"):
                 try:
-                    pos_signed = await self._get_position_signed_cached(force=True)
-                    best_bid, best_ask = await self._get_bbo_cached()
-                    mid_price = (best_bid + best_ask) / 2
-                    equity_val = abs(pos_signed) * mid_price
+                    equity_val = await self.exchange_client.get_available_balance()
                 except Exception as e:
-                    self.logger.log(f"[RISK] equity fallback failed: {e}", "ERROR")
-                    equity_val = None
+                    self.logger.log(f"[RISK] get_available_balance as equity fallback failed: {e}", "WARNING")
+            if equity_val is None:
+                # If we still have nothing, fall back to last known good equity
+                return self._equity_last_nonzero
             return equity_val
 
         equity = await self.cache.get("equity", self.ttl_equity, _fetch_equity, force=False)
@@ -1270,6 +1269,10 @@ class TradingBot:
             return
         try:
             position_amt = abs(pos_signed)
+            if position_amt == 0:
+                self._set_stop_new_orders(False)
+                self.redundancy_insufficient_since = None
+                return
             best_bid, best_ask = await self._get_bbo_cached()
             mid_price = (best_bid + best_ask) / 2
             # Need avg entry price; fallback: mid_price
@@ -1809,31 +1812,6 @@ class TradingBot:
                     error_message += f"current position: {position_amt} | active closing amount: {active_close_amount} | "f"Order quantity: {len(self.active_close_orders)}\n"
                     self.logger.log(error_message, "ERROR")
                     await self.send_notification(error_message.lstrip())
-                    mismatch_detected = True
-
-                # Risk gating: stop new orders if equity < threshold
-                if equity is not None and equity < self.stop_new_orders_equity_threshold:
-                    self.logger.log(f"[RISK] Equity below threshold ({equity}<{self.stop_new_orders_equity_threshold}), slow unwind.", "ERROR")
-                    if self.enable_notifications:
-                        await self.send_notification(f"[RISK] Equity below threshold {equity} < {self.stop_new_orders_equity_threshold}, stop new and unwind.")
-                    self._set_stop_new_orders(True)
-                    try:
-                        active_orders = await self._get_active_orders_cached()
-                        for order in active_orders:
-                            await self.exchange_client.cancel_order(order.order_id)
-                    except Exception as e:
-                        self.logger.log(f"[RISK] Cancel orders during low equity unwind failed: {e}", "WARNING")
-                    try:
-                        while position_amt > 0:
-                            close_side = 'sell' if position_signed > 0 else 'buy'
-                            release_qty = min(self.config.quantity, position_amt)
-                            await self.exchange_client.reduce_only_close_with_retry(release_qty, close_side)
-                            await asyncio.sleep(0.5)
-                            position_signed = await self._get_position_signed_cached()
-                            position_amt = abs(position_signed)
-                    except Exception as e:
-                        self.logger.log(f"[RISK] Unwind during low equity failed: {e}", "ERROR")
-                    await self.graceful_shutdown("Equity below threshold - unwound")
                     mismatch_detected = True
 
                 if self.enable_advanced_risk and self.stop_loss_enabled and equity is not None:
