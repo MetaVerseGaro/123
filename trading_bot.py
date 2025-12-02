@@ -537,7 +537,7 @@ class TradingBot:
                     close_dt = self._parse_pivot_time(str(close_raw)) if close_raw else None
                     if close_dt and close_dt == entry["close_time"] and label == entry["label"]:
                         # store per-exchange price to avoid ticker drift
-                        exchange_key = entry.get("raw_ticker") or self.config.exchange
+                        exchange_key = self.config.exchange or entry.get("raw_ticker")
                         price_key = f"price_{exchange_key}"
                         item[price_key] = str(price)
                         updated = True
@@ -1032,9 +1032,13 @@ class TradingBot:
                     continue
                 # prefer exchange-specific stored price
                 price_val = None
-                exchange_key = raw_ticker
-                if exchange_key:
-                    price_val = item.get(f"price_{exchange_key}")
+                exch_key = self.config.exchange
+                if exch_key:
+                    price_val = item.get(f"price_{exch_key}")
+                if price_val is None:
+                    # fallback to raw_ticker-based key for backward compatibility
+                    if raw_ticker:
+                        price_val = item.get(f"price_{raw_ticker}")
                 if price_val is None:
                     price_val = item.get("price") or item.get("high") or item.get("low")
                 pivots.append({
