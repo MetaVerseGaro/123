@@ -1439,6 +1439,8 @@ class TradingBot:
 
     async def _schedule_slow_reverse(self, new_direction: str, pivot_price: Decimal):
         """Slow reverse: pause new opens, observe next pivot before acting."""
+        if self.pending_reverse_state == "waiting_next_pivot" and self.pending_reverse_direction == new_direction:
+            return  # already waiting; avoid duplicate log/spam
         self.logger.log(f"[REV-SLOW] Observe next pivot for potential reverse to {new_direction.upper()} via ZigZag at {pivot_price}", "WARNING")
         self.pending_reverse_direction = new_direction
         self.pending_reverse_state = "waiting_next_pivot"
@@ -2138,11 +2140,12 @@ class TradingBot:
         # Immediate reverse on break of confirmed high/low (trade price +/- buffer ticks)
         if self.enable_zigzag and self.enable_auto_reverse and trade_price is not None:
             buffer = self.break_buffer_ticks * self.config.tick_size
-            if self.last_confirmed_high is not None and trade_price >= (self.last_confirmed_high + buffer):
+            can_reverse = not (self.pending_reverse_state or self.pending_reverse_direction or self.reversing)
+            if can_reverse and self.last_confirmed_high is not None and trade_price >= (self.last_confirmed_high + buffer):
                 if self.config.direction == "sell":
                     await self._handle_reverse_signal("buy", Decimal(trade_price))
                     return stop_trading, pause_trading, stop_loss_triggered, best_bid, best_ask
-            if self.last_confirmed_low is not None and trade_price <= (self.last_confirmed_low - buffer):
+            if can_reverse and self.last_confirmed_low is not None and trade_price <= (self.last_confirmed_low - buffer):
                 if self.config.direction == "buy":
                     await self._handle_reverse_signal("sell", Decimal(trade_price))
                     return stop_trading, pause_trading, stop_loss_triggered, best_bid, best_ask
