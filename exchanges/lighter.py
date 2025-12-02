@@ -6,6 +6,7 @@ import os
 import asyncio
 import time
 import logging
+import random
 from decimal import Decimal, ROUND_HALF_UP
 from typing import Dict, Any, List, Optional, Tuple
 
@@ -38,6 +39,17 @@ class LighterClient(BaseExchangeClient):
         self.api_key_private_key = os.getenv('API_KEY_PRIVATE_KEY')
         self.account_index = int(os.getenv('LIGHTER_ACCOUNT_INDEX', '0'))
         self.api_key_index = int(os.getenv('LIGHTER_API_KEY_INDEX', '0'))
+        self.enable_candle_key_pool = str(os.getenv('ENABLE_CANDLE_KEY_POOL', 'false')).lower() == 'true'
+        pool_env = os.getenv('LIGHTER_API_KEY_INDEX_POOL', '')
+        self.api_key_index_pool = [self.api_key_index]
+        if self.enable_candle_key_pool:
+            try:
+                if pool_env:
+                    parsed = [int(x.strip()) for x in pool_env.split(",") if x.strip() != ""]
+                    if parsed:
+                        self.api_key_index_pool = parsed
+            except Exception:
+                self.api_key_index_pool = [self.api_key_index]
         self.base_url = "https://mainnet.zklighter.elliot.ai"
 
         if not self.api_key_private_key:
@@ -60,32 +72,54 @@ class LighterClient(BaseExchangeClient):
         self.current_order_client_id = None
         self.current_order = None
         self._order_id_seed = int(time.time() * 1000)
-        # Request throttling and rate-limit backoff
-        self._rest_min_interval = float(os.getenv("LIGHTER_REST_MIN_INTERVAL", "0.3"))
-        self._last_rest_ts = 0.0
-        self._rate_limit_backoff = float(os.getenv("LIGHTER_BACKOFF_START", "0.5"))
-        self._rate_limit_backoff_max = float(os.getenv("LIGHTER_BACKOFF_MAX", "8"))
+        self._candle_api_clients = []
+        self._candle_client_cursor = 0
+        # Request throttling and rate-limit backoff (HF/LF separated)
+        self._hf_min_interval = float(os.getenv("LIGHTER_HF_MIN_INTERVAL", "0.15"))
+        self._hf_backoff = float(os.getenv("LIGHTER_HF_BACKOFF_START", "0.15"))
+        self._hf_backoff_max = float(os.getenv("LIGHTER_HF_BACKOFF_MAX", "1.0"))
+        self._hf_last_ts = 0.0
 
-    async def _throttle_rest(self, weight: float = 1.0):
-        """Enforce minimal interval between REST calls to avoid rate limits. Weight scales interval."""
-        interval = self._rest_min_interval * max(weight, 1.0)
+        self._lf_min_interval = float(os.getenv("LIGHTER_LF_MIN_INTERVAL", "0.4"))
+        self._lf_backoff = float(os.getenv("LIGHTER_LF_BACKOFF_START", "0.4"))
+        self._lf_backoff_max = float(os.getenv("LIGHTER_LF_BACKOFF_MAX", "45"))
+        self._lf_last_ts = 0.0
+
+    async def _throttle_rest_hf(self, weight: float = 1.0):
+        """HF throttle: small interval with linear backoff up to 1s."""
+        interval = self._hf_min_interval * max(weight, 1.0)
         now = time.time()
-        wait = interval - (now - self._last_rest_ts)
+        wait = interval - (now - self._hf_last_ts)
         if wait > 0:
             await asyncio.sleep(wait)
-        self._last_rest_ts = time.time()
+        self._hf_last_ts = time.time()
+
+    async def _throttle_rest_lf(self, weight: float = 1.0):
+        """LF throttle: longer interval with jitter and exponential backoff."""
+        interval = self._lf_min_interval * max(weight, 1.0)
+        now = time.time()
+        wait = interval - (now - self._lf_last_ts)
+        if wait > 0:
+            jitter = random.uniform(0.9, 1.1)
+            await asyncio.sleep(wait * jitter)
+        self._lf_last_ts = time.time()
 
     def _reset_rate_limit_backoff(self):
-        self._rate_limit_backoff = float(os.getenv("LIGHTER_BACKOFF_START", "0.5"))
+        self._hf_backoff = float(os.getenv("LIGHTER_HF_BACKOFF_START", "0.15"))
+        self._lf_backoff = float(os.getenv("LIGHTER_LF_BACKOFF_START", "0.4"))
 
     def _is_rate_limit_error(self, err) -> bool:
         msg = str(err).lower()
         status = getattr(err, "status", None)
         return (status == 429 or "too many request" in msg or "rate limit" in msg or "429" in msg)
 
-    async def _handle_rate_limit_backoff(self):
-        await asyncio.sleep(self._rate_limit_backoff)
-        self._rate_limit_backoff = min(self._rate_limit_backoff * 2, self._rate_limit_backoff_max)
+    async def _handle_rate_limit_backoff_hf(self):
+        await asyncio.sleep(self._hf_backoff)
+        self._hf_backoff = min(self._hf_backoff + self._hf_min_interval, self._hf_backoff_max)
+
+    async def _handle_rate_limit_backoff_lf(self):
+        await asyncio.sleep(self._lf_backoff)
+        self._lf_backoff = min(self._lf_backoff * 2, self._lf_backoff_max)
 
     def _validate_config(self) -> None:
         """Validate Lighter configuration."""
@@ -152,6 +186,15 @@ class LighterClient(BaseExchangeClient):
         try:
             # Initialize shared API client
             self.api_client = ApiClient(configuration=Configuration(host=self.base_url))
+            # Build candle API client pool (round-robin across key indexes if provided)
+            self._candle_api_clients = []
+            if self.enable_candle_key_pool:
+                for idx in self.api_key_index_pool:
+                    cfg = Configuration(host=self.base_url)
+                    cfg.api_key_prefix['ApiKeyIndex'] = str(idx)
+                    self._candle_api_clients.append(ApiClient(configuration=cfg))
+            if not self._candle_api_clients:
+                self._candle_api_clients.append(self.api_client)
 
             # Initialize Lighter client
             await self._initialize_lighter_client()
@@ -290,7 +333,7 @@ class LighterClient(BaseExchangeClient):
 
         # Fallback to REST when WS unavailable
         try:
-            await self._throttle_rest()
+            await self._throttle_rest_hf()
             order_api = lighter.OrderApi(self.api_client)
             ob = await order_api.order_book_details(market_id=contract_id)
             if not ob or not ob.order_book_details:
@@ -306,7 +349,7 @@ class LighterClient(BaseExchangeClient):
         except Exception as e:
             if self._is_rate_limit_error(e):
                 self.logger.log(f"[RATE_LIMIT] fetch_bbo_prices fallback: {e}", "WARNING")
-                await self._handle_rate_limit_backoff()
+                await self._handle_rate_limit_backoff_hf()
             self.logger.log(f"Unable to fetch BBO via REST fallback: {e}", "ERROR")
             raise
 
@@ -314,7 +357,7 @@ class LighterClient(BaseExchangeClient):
         """Fetch last traded/mark price for the market."""
         order_api = lighter.OrderApi(self.api_client)
         try:
-            await self._throttle_rest()
+            await self._throttle_rest_hf()
             ob = await order_api.order_book_details(market_id=contract_id)
             detail = None
             if ob and getattr(ob, "order_book_details", None):
@@ -326,7 +369,7 @@ class LighterClient(BaseExchangeClient):
         except Exception as e:
             if self._is_rate_limit_error(e):
                 self.logger.log(f"[RATE_LIMIT] get_last_traded_price: {e}", "WARNING")
-                await self._handle_rate_limit_backoff()
+                await self._handle_rate_limit_backoff_hf()
             self.logger.log(f"[PRICE] Unable to fetch last traded price: {e}", "WARNING")
             return None
 
@@ -1065,9 +1108,11 @@ class LighterClient(BaseExchangeClient):
 
     async def fetch_history_candles(self, limit: int = 200, timeframe: str = "1m"):
         """Fetch historical candles for warmup (default 200 x 1m)."""
-        candle_api = lighter.CandlestickApi(self.api_client)
+        api_client = self._candle_api_clients[self._candle_client_cursor % len(self._candle_api_clients)]
+        self._candle_client_cursor += 1
+        candle_api = lighter.CandlestickApi(api_client)
         try:
-            await self._throttle_rest(weight=50)
+            await self._throttle_rest_lf(weight=50)
             now_ms = int(time.time() * 1000)
             # timeframe 杞锛屾寜 limit 璁＄畻寮€濮嬫椂闂?            tf_sec = 60
             if timeframe.endswith("h"):
@@ -1090,14 +1135,16 @@ class LighterClient(BaseExchangeClient):
         except Exception as e:
             if self._is_rate_limit_error(e):
                 self.logger.log(f"[RATE_LIMIT] fetch_history_candles: {e}", "WARNING")
-                await self._handle_rate_limit_backoff()
+                await self._handle_rate_limit_backoff_lf()
             raise
 
     async def fetch_candle_by_close_time(self, timeframe: str, close_time_ms: int) -> Optional[Tuple[Decimal, Decimal]]:
         """Fetch a single candle ending at close_time_ms (UTC ms)."""
-        candle_api = lighter.CandlestickApi(self.api_client)
+        api_client = self._candle_api_clients[self._candle_client_cursor % len(self._candle_api_clients)]
+        self._candle_client_cursor += 1
+        candle_api = lighter.CandlestickApi(api_client)
         try:
-            await self._throttle_rest(weight=50)
+            await self._throttle_rest_lf(weight=50)
             tf_sec = 60
             if timeframe.endswith("h"):
                 tf_sec = int(timeframe[:-1]) * 3600
@@ -1134,6 +1181,6 @@ class LighterClient(BaseExchangeClient):
         except Exception as e:
             if self._is_rate_limit_error(e):
                 self.logger.log(f"[RATE_LIMIT] fetch_candle_by_close_time: {e}", "WARNING")
-                await self._handle_rate_limit_backoff()
+                await self._handle_rate_limit_backoff_lf()
             self.logger.log(f"[ZIGZAG] fetch_candle_by_close_time failed: {e}", "WARNING")
             return None
