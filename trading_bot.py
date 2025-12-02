@@ -248,7 +248,9 @@ class TradingBot:
         self.basic_full_since: Optional[float] = None
         self.redundancy_insufficient_since: Optional[float] = None
         self.last_new_order_time = time.time()
-        self.last_release_attempt = 0
+        self.last_release_attempt = 0  # legacy; kept for backward compatibility
+        self.last_release_attempt_advanced = 0.0
+        self.last_release_attempt_basic = 0.0
         self.last_stop_new_notify = False
         self.pending_reverse_direction: Optional[str] = None
         self.pending_reverse_state: Optional[str] = None  # None | waiting_next_pivot | unwinding
@@ -1933,45 +1935,82 @@ class TradingBot:
                     and (time.time() - self.basic_full_since > self.basic_release_timeout_minutes * 60)
                 )
                 if should_release_advanced or should_release_basic:
-                    interval = self.release_timeout_minutes if should_release_advanced else self.basic_release_timeout_minutes
-                    if time.time() - self.last_release_attempt > interval * 60:
-                        self.last_release_attempt = time.time()
-                        try:
-                            release_qty = min(self.config.quantity, position_amt)
-                            if release_qty > 0:
-                                close_side = self.config.close_order_side
-                                release_result = await self.exchange_client.reduce_only_close_with_retry(
-                                    release_qty, close_side, timeout_sec=5.0, max_attempts=5
-                                )
-                                if release_result.success:
-                                    self._invalidate_position_cache()
-                                    # 取消一笔最远的 TP 单，其余挂单不动
-                                    try:
-                                        active_orders_for_cancel = await self._get_active_orders_cached()
-                                        close_orders = [
-                                            o for o in active_orders_for_cancel
-                                            if o.side == self.config.close_order_side
-                                        ]
-                                        if close_orders:
-                                            best_bid, best_ask = await self._get_bbo_cached()
-                                            mid_price = (best_bid + best_ask) / 2
-                                            farthest = sorted(
-                                                close_orders,
-                                                key=lambda o: abs(Decimal(o.price) - Decimal(mid_price)),
-                                                reverse=True
-                                            )[0]
-                                            await self.exchange_client.cancel_order(farthest.order_id)
-                                            self._invalidate_order_cache()
-                                    except Exception as e_cancel:
-                                        self.logger.log(f"[RISK] Release cancel TP failed: {e_cancel}", "WARNING")
-                                    if self.enable_notifications:
-                                        await self.send_notification(
-                                            f"[RISK] Released {release_qty} after sustained stop-new (advanced)"
-                                            if should_release_advanced
-                                            else f"[RISK-BASIC] Released {release_qty} after sustained full position"
-                                        )
-                        except Exception as e:
-                            self.logger.log(f"[RISK] Release attempt failed: {e}", "WARNING")
+                    now_ts = time.time()
+                    if should_release_advanced:
+                        interval = self.release_timeout_minutes
+                        if now_ts - self.last_release_attempt_advanced > interval * 60:
+                            self.last_release_attempt_advanced = now_ts
+                            try:
+                                release_qty = min(self.config.quantity, position_amt)
+                                if release_qty > 0:
+                                    close_side = self.config.close_order_side
+                                    release_result = await self.exchange_client.reduce_only_close_with_retry(
+                                        release_qty, close_side, timeout_sec=5.0, max_attempts=5
+                                    )
+                                    if release_result.success:
+                                        self._invalidate_position_cache()
+                                        # 取消一笔最远的 TP 单，其余挂单不动
+                                        try:
+                                            active_orders_for_cancel = await self._get_active_orders_cached()
+                                            close_orders = [
+                                                o for o in active_orders_for_cancel
+                                                if o.side == self.config.close_order_side
+                                            ]
+                                            if close_orders:
+                                                best_bid, best_ask = await self._get_bbo_cached()
+                                                mid_price = (best_bid + best_ask) / 2
+                                                farthest = sorted(
+                                                    close_orders,
+                                                    key=lambda o: abs(Decimal(o.price) - Decimal(mid_price)),
+                                                    reverse=True
+                                                )[0]
+                                                await self.exchange_client.cancel_order(farthest.order_id)
+                                                self._invalidate_order_cache()
+                                        except Exception as e_cancel:
+                                            self.logger.log(f"[RISK] Release cancel TP failed: {e_cancel}", "WARNING")
+                                        if self.enable_notifications:
+                                            await self.send_notification(
+                                                f"[RISK] Released {release_qty} after sustained stop-new (advanced)"
+                                            )
+                            except Exception as e:
+                                self.logger.log(f"[RISK] Release attempt failed: {e}", "WARNING")
+                    elif should_release_basic:
+                        interval = self.basic_release_timeout_minutes
+                        if now_ts - self.last_release_attempt_basic > interval * 60:
+                            self.last_release_attempt_basic = now_ts
+                            try:
+                                release_qty = min(self.config.quantity, position_amt)
+                                if release_qty > 0:
+                                    close_side = self.config.close_order_side
+                                    release_result = await self.exchange_client.reduce_only_close_with_retry(
+                                        release_qty, close_side, timeout_sec=5.0, max_attempts=5
+                                    )
+                                    if release_result.success:
+                                        self._invalidate_position_cache()
+                                        try:
+                                            active_orders_for_cancel = await self._get_active_orders_cached()
+                                            close_orders = [
+                                                o for o in active_orders_for_cancel
+                                                if o.side == self.config.close_order_side
+                                            ]
+                                            if close_orders:
+                                                best_bid, best_ask = await self._get_bbo_cached()
+                                                mid_price = (best_bid + best_ask) / 2
+                                                farthest = sorted(
+                                                    close_orders,
+                                                    key=lambda o: abs(Decimal(o.price) - Decimal(mid_price)),
+                                                    reverse=True
+                                                )[0]
+                                                await self.exchange_client.cancel_order(farthest.order_id)
+                                                self._invalidate_order_cache()
+                                        except Exception as e_cancel:
+                                            self.logger.log(f"[RISK] Release cancel TP failed: {e_cancel}", "WARNING")
+                                        if self.enable_notifications:
+                                            await self.send_notification(
+                                                f"[RISK-BASIC] Released {release_qty} after sustained full position"
+                                            )
+                            except Exception as e:
+                                self.logger.log(f"[RISK] Release attempt failed: {e}", "WARNING")
                 if self.enable_basic_risk and self.max_position_limit is not None and position_amt < self.max_position_limit:
                     self.basic_full_since = None
 
