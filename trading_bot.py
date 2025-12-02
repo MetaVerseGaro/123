@@ -313,6 +313,17 @@ class TradingBot:
             if keys:
                 self.cache.invalidate(*keys)
 
+    def _price_breaches_stop(self, stop_price: Optional[Decimal], direction: str, price: Decimal) -> bool:
+        """Return True if an order price is beyond the allowed stop boundary."""
+        if stop_price is None:
+            return False
+        dir_l = str(direction).lower()
+        if dir_l == "buy":
+            return price <= stop_price
+        if dir_l == "sell":
+            return price >= stop_price
+        return False
+
     async def _get_bbo_cached(self, force: bool = False) -> Tuple[Decimal, Decimal]:
         key = f"bbo:{self.config.contract_id}"
         async def fetch_bbo():
@@ -1188,12 +1199,12 @@ class TradingBot:
         await self.send_notification("\n".join(lines))
 
     async def _refresh_stop_loss(self, force: bool = False):
-        """Refresh native stop-loss according to current position and dynamic SL."""
+        """Refresh stop-loss tracking and optionally place native SL orders."""
         if not self.enable_dynamic_sl:
             return
-        # 慢反手过程中不自动下动态止损，待方向确认后再处理
-        if self.pending_reverse_state in ("waiting_next_pivot", "unwinding"):
-            return
+        slow_reverse_phase = self.pending_reverse_state in ("waiting_next_pivot", "unwinding")
+        allow_native_sl = (not (self.enable_auto_reverse and not self.auto_reverse_fast)) and (not slow_reverse_phase)
+
         try:
             pos_signed = await self._get_position_signed_cached(force=force)
         except Exception as e:
@@ -1211,6 +1222,14 @@ class TradingBot:
             self.dynamic_stop_price = None
             self.dynamic_stop_direction = None
             return
+
+        # Slow reverse/slow mode: keep tracking but avoid native SL orders
+        if self.current_sl_order_id and not allow_native_sl:
+            try:
+                await self.exchange_client.cancel_order(self.current_sl_order_id)
+            except Exception:
+                pass
+            self.current_sl_order_id = None
 
         direction = "buy" if pos_signed > 0 else "sell"
         if self.current_direction and self.current_direction != direction:
@@ -1243,7 +1262,8 @@ class TradingBot:
         self.dynamic_stop_price = dyn_stop
         self.dynamic_stop_direction = direction
         self._last_stop_eval_price = dyn_stop
-        await self._place_stop_loss_native(pos_abs, dyn_stop, 'sell' if direction == "buy" else 'buy')
+        if allow_native_sl:
+            await self._place_stop_loss_native(pos_abs, dyn_stop, 'sell' if direction == "buy" else 'buy')
         if self.enable_notifications and prev_stop != self.dynamic_stop_price:
             try:
                 await self.send_notification(f"[SL] Dynamic stop updated from {prev_stop} to {self.dynamic_stop_price} for {direction.upper()}")
@@ -1257,16 +1277,28 @@ class TradingBot:
         except Exception as e:
             self.logger.log(f"[SL] Cancel open orders beyond stop failed: {e}", "WARNING")
 
-    async def _cancel_open_orders_beyond_stop(self, stop_price: Decimal):
-        """Cancel open-side orders that sit beyond the new stop price."""
+    async def _cancel_open_orders_beyond_stop(self, stop_price: Optional[Decimal]):
+        """Cancel open-side orders that sit beyond the stop boundary."""
+        if stop_price is None:
+            return
+        dir_l = str(self.config.direction).lower()
         active_orders = await self._get_active_orders_cached()
         for order in active_orders:
-            if order.side != self.config.direction:
+            side_raw = order.side if not isinstance(order, dict) else order.get("side")
+            side = str(side_raw).lower() if side_raw is not None else None
+            price = order.price if not isinstance(order, dict) else order.get("price")
+            order_id = order.order_id if not isinstance(order, dict) else order.get("order_id")
+            try:
+                price_dec = Decimal(price)
+            except Exception:
                 continue
-            if self.config.direction == "buy" and order.price <= stop_price:
-                await self.exchange_client.cancel_order(order.order_id)
-            if self.config.direction == "sell" and order.price >= stop_price:
-                await self.exchange_client.cancel_order(order.order_id)
+            if side != dir_l:
+                continue
+            if self._price_breaches_stop(stop_price, dir_l, price_dec):
+                try:
+                    await self.exchange_client.cancel_order(order_id)
+                except Exception as exc:
+                    self.logger.log(f"[SL] Cancel open order {order_id} beyond stop failed: {exc}", "WARNING")
         self._invalidate_order_cache()
         if active_orders:
             for order in active_orders:
@@ -1541,6 +1573,14 @@ class TradingBot:
             # Force refresh BBO/last before placing orders
             await self._get_bbo_cached(force=True)
             await self._get_last_trade_price_cached(force=True)
+            # Prevent placing new opens beyond stop boundary
+            dir_l = str(self.config.direction).lower()
+            stop_threshold = self.dynamic_stop_price if (self.enable_dynamic_sl and self.dynamic_stop_price is not None) else None
+            if stop_threshold is not None:
+                candidate_price = await self.exchange_client.get_order_price(self.config.direction)
+                if self._price_breaches_stop(stop_threshold, dir_l, Decimal(candidate_price)):
+                    self.logger.log(f"[OPEN] Skip new order: price {candidate_price} breaches stop {stop_threshold}", "WARNING")
+                    return False
             # Reset state before placing order
             self.order_filled_event.clear()
             self.current_order_status = 'OPEN'
@@ -2336,6 +2376,14 @@ class TradingBot:
                                 'price': order.price,
                                 'size': order.size
                             })
+
+                    # Enforce no open-side orders beyond current stop threshold
+                    effective_stop = self.dynamic_stop_price if (self.enable_dynamic_sl and self.dynamic_stop_price is not None) else None
+                    if effective_stop is not None:
+                        try:
+                            await self._cancel_open_orders_beyond_stop(effective_stop)
+                        except Exception as e:
+                            self.logger.log(f"[SL] Cancel open orders beyond stop (loop) failed: {e}", "WARNING")
 
                     # Periodic logging
                     mismatch_detected = await self._log_status_periodically()
