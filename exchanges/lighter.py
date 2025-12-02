@@ -104,6 +104,13 @@ class LighterClient(BaseExchangeClient):
             await asyncio.sleep(wait * jitter)
         self._lf_last_ts = time.time()
 
+    async def _throttle_rest(self, weight: float = 1.0):
+        """Compatibility wrapper: choose HF for light calls, LF for heavy (weight>=10)."""
+        if weight >= 10:
+            await self._throttle_rest_lf(weight=1.0)
+        else:
+            await self._throttle_rest_hf(weight=weight)
+
     def _reset_rate_limit_backoff(self):
         self._hf_backoff = float(os.getenv("LIGHTER_HF_BACKOFF_START", "0.15"))
         self._lf_backoff = float(os.getenv("LIGHTER_LF_BACKOFF_START", "0.4"))
@@ -120,6 +127,13 @@ class LighterClient(BaseExchangeClient):
     async def _handle_rate_limit_backoff_lf(self):
         await asyncio.sleep(self._lf_backoff)
         self._lf_backoff = min(self._lf_backoff * 2, self._lf_backoff_max)
+
+    async def _handle_rate_limit_backoff(self, heavy: bool = False):
+        """Compatibility wrapper: heavy=True uses LF backoff."""
+        if heavy:
+            await self._handle_rate_limit_backoff_lf()
+        else:
+            await self._handle_rate_limit_backoff_hf()
 
     def _validate_config(self) -> None:
         """Validate Lighter configuration."""
