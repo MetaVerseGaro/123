@@ -23,7 +23,7 @@
       "enable_stop_loss": true,            # 止损总开关（关闭则仅记录 ZigZag，不止损/冗余/自动反手）
       "risk_pct": 0.5,                     # 风险敞口百分比
       "release_timeout_minutes": 10,       # 冗余不足持续 N 分钟后释放
-      "stop_new_orders_equity_threshold": 50, # 低于该 equity 停新并缓步平仓退出
+      "stop_new_orders_equity_threshold": 30, # 低于该 equity 停新并缓步平仓退出
       "zigzag": {
         "enable_zigzag": true,             # 是否启用 ZigZag 判向
         "enable_auto_reverse": true,       # 是否自动反手
