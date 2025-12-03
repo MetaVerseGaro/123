@@ -22,11 +22,12 @@
 ```
 
 ## 2) 启动 sidecar
-在仓库根目录执行（无需再手动输入交易所/交易对）：
+在仓库根目录执行（nohup 后台，日志写到本地文件）：
 ```bash
-python bbo_sidecar.py
+mkdir -p logs
+nohup python bbo_sidecar.py > logs/bbo_sidecar.log 2>&1 &
 # 使用其他配置文件：
-# SIDECAR_CONFIG=./another.json python bbo_sidecar.py
+# SIDECAR_CONFIG=./another.json nohup python bbo_sidecar.py > logs/bbo_sidecar.log 2>&1 &
 # 临时覆盖节奏：
 # export BBO_PUBLISH_INTERVAL_SEC=0.25
 # export BBO_SIDECAR_REST_INTERVAL_SEC=5
@@ -55,6 +56,7 @@ export SHARED_BBO_FILE=/tmp/shared_bbo.json
 - `BBO_PUBLISH_INTERVAL_SEC=0.25`：降低磁盘写频率。
 - `BBO_SIDECAR_REST_INTERVAL_SEC=5`：WS 正常时几乎不用 REST；WS 失效时最多每 5s 才拉一次。
 - `SHARED_BBO_CLEANUP_SEC=30`：保持文件小，避免频繁磁盘 I/O。
+- `log_retention_days`（配置在 `botA.json.sidecar`，示例为 1 天）：建议配合 `find logs -name 'bbo_sidecar.log*' -mtime +1 -delete` 定期清理 nohup 日志。
 
 ## 6) 日志与排查
 - sidecar 控制台日志前缀 `[BBO-SIDECAR]`（读写失败、REST 兜底、启动/停止）。
