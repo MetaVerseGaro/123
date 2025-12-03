@@ -237,6 +237,18 @@ async def main():
         sys.exit(1)
     dotenv.load_dotenv(args.env_file)
 
+    # 友好提示：当前 SHARED_BBO_FILE（若未设置则尝试从 config.sidecar 取值）
+    shared_bbo = os.getenv("SHARED_BBO_FILE")
+    if (not shared_bbo) and cfg and isinstance(cfg, dict):
+        sidecar_cfg = cfg.get("sidecar", {})
+        shared_bbo = sidecar_cfg.get("shared_bbo_file") if isinstance(sidecar_cfg, dict) else None
+        if shared_bbo:
+            os.environ["SHARED_BBO_FILE"] = str(shared_bbo)
+    if shared_bbo:
+        print(f"[INFO] SHARED_BBO_FILE = {shared_bbo}")
+    else:
+        print("[INFO] SHARED_BBO_FILE 未设置（将仅使用本进程的 WS/REST）")
+
     # Create configuration
     config = TradingConfig(
         ticker=args.ticker.upper(),
