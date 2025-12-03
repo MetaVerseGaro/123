@@ -69,5 +69,6 @@
     "rest_interval_sec": 5,                     # WS 缺失/过期时 REST 兜底的最小间隔
     "shared_bbo_max_age_sec": 1.5,              # 共享 BBO 新鲜度判定
     "shared_bbo_cleanup_sec": 30                # 清理共享文件中过期键
+    "log_retention_days": 1                     # sidecar 日志保留天数（配合 nohup 输出文件定期清理）
   }
 }
