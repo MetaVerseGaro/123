@@ -405,8 +405,12 @@ class TradingBot:
     def _read_shared_bbo(self) -> Optional[Tuple[Decimal, Decimal]]:
         """Read BBO from shared sidecar file if fresh; prune stale entries."""
         if not self.shared_bbo_file:
+            if self.cache.debug:
+                self.logger.log("[SHARED-BBO] skipped: SHARED_BBO_FILE not set", "DEBUG")
             return None
         if not self.shared_bbo_file.exists():
+            if self.cache.debug:
+                self.logger.log(f"[SHARED-BBO] skipped: {self.shared_bbo_file} not found", "DEBUG")
             return None
         now_ts = time.time()
         try:
@@ -455,9 +459,16 @@ class TradingBot:
                         result = (bid, ask)
             except Exception:
                 result = None
+        else:
+            if self.cache.debug:
+                self.logger.log(f"[SHARED-BBO] miss: key {key} not in cache file", "DEBUG")
 
         if changed:
             self._save_shared_bbo_data(payload)
+        if self.cache.debug and result is None:
+            self.logger.log("[SHARED-BBO] miss or stale, will use WS/REST", "DEBUG")
+        if self.cache.debug and result is not None:
+            self.logger.log(f"[SHARED-BBO] hit @ ts={ts_val}", "DEBUG")
         return result
 
     def _write_shared_bbo(self, bid: Decimal, ask: Decimal):
