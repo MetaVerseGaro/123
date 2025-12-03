@@ -167,6 +167,15 @@ class TradingBot:
         self._last_pivot_reload_ts: float = 0.0
         self._pivot_reload_in_progress: bool = False
         self._zigzag_last_bbo_ts: float = 0.0
+        # Shared BBO cache (sidecar) support
+        self.shared_bbo_file: Optional[Path] = None
+        shared_bbo_path = os.getenv("SHARED_BBO_FILE", "").strip()
+        if shared_bbo_path:
+            self.shared_bbo_file = Path(shared_bbo_path).expanduser().resolve()
+        self.shared_bbo_max_age = float(os.getenv("SHARED_BBO_MAX_AGE_SEC", "1.5"))
+        # Sidecar BBO cache cleanup interval (keep file small on t3.micro)
+        self.shared_bbo_cleanup_sec = float(os.getenv("SHARED_BBO_CLEANUP_SEC", "30"))
+        self._shared_bbo_last_write_ts: float = 0.0
 
         # Trading state
         self.active_close_orders = []
@@ -370,6 +379,139 @@ class TradingBot:
             except Exception as exc:
                 self.logger.log(f"[ZIGZAG-TIMING] Cancel order {oid} failed: {exc}", "WARNING")
 
+    def _shared_bbo_key(self) -> str:
+        """Build the shared BBO key for the current contract."""
+        contract_key = self.config.contract_id or self.config.ticker
+        return f"{self.config.exchange}:{contract_key}"
+
+    def _save_shared_bbo_data(self, data: Dict[str, Any]):
+        """Persist shared BBO data atomically, cleaning up on errors."""
+        if not self.shared_bbo_file:
+            return
+        try:
+            self.shared_bbo_file.parent.mkdir(parents=True, exist_ok=True)
+            tmp = self.shared_bbo_file.with_suffix(".tmp")
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False)
+            tmp.replace(self.shared_bbo_file)
+        except Exception as exc:
+            if self.cache.debug:
+                self.logger.log(f"[SHARED-BBO] save failed: {exc}", "WARNING")
+
+    def _read_shared_bbo(self) -> Optional[Tuple[Decimal, Decimal]]:
+        """Read BBO from shared sidecar file if fresh; prune stale entries."""
+        if not self.shared_bbo_file:
+            return None
+        if not self.shared_bbo_file.exists():
+            return None
+        now_ts = time.time()
+        try:
+            with open(self.shared_bbo_file, "r", encoding="utf-8") as f:
+                payload = json.load(f)
+        except Exception as exc:
+            if self.cache.debug:
+                self.logger.log(f"[SHARED-BBO] read failed: {exc}", "WARNING")
+            return None
+
+        if not isinstance(payload, dict):
+            return None
+
+        changed = False
+        cutoff = now_ts - self.shared_bbo_cleanup_sec
+        keys_to_drop = []
+        for k, v in payload.items():
+            ts_val = 0.0
+            try:
+                ts_val = float(v.get("ts", 0)) if isinstance(v, dict) else 0.0
+            except Exception:
+                ts_val = 0.0
+            too_old = (ts_val <= 0) or (ts_val < cutoff)
+            # Extra guard: if a writer keeps a stale value alive forever, still drop it after a long grace window
+            if not too_old and ts_val > 0:
+                try:
+                    too_old = (now_ts - ts_val) > max(self.shared_bbo_cleanup_sec, self.shared_bbo_max_age * 6)
+                except Exception:
+                    too_old = False
+            if too_old:
+                keys_to_drop.append(k)
+        for k in keys_to_drop:
+            payload.pop(k, None)
+            changed = True
+
+        key = self._shared_bbo_key()
+        entry = payload.get(key)
+        result: Optional[Tuple[Decimal, Decimal]] = None
+        if isinstance(entry, dict):
+            try:
+                ts_val = float(entry.get("ts", 0) or 0.0)
+                if (now_ts - ts_val) <= self.shared_bbo_max_age:
+                    bid = Decimal(str(entry.get("bid")))
+                    ask = Decimal(str(entry.get("ask")))
+                    if bid > 0 and ask > 0 and bid < ask:
+                        result = (bid, ask)
+            except Exception:
+                result = None
+
+        if changed:
+            self._save_shared_bbo_data(payload)
+        return result
+
+    def _write_shared_bbo(self, bid: Decimal, ask: Decimal):
+        """Persist BBO to shared sidecar file with simple rate limit and cleanup."""
+        if not self.shared_bbo_file:
+            return
+        now_ts = time.time()
+        # Simple throttle to avoid excessive disk writes
+        if (now_ts - self._shared_bbo_last_write_ts) < max(0.1, self.shared_bbo_max_age / 2):
+            return
+        self._shared_bbo_last_write_ts = now_ts
+        payload: Dict[str, Any] = {}
+        try:
+            if self.shared_bbo_file.exists():
+                with open(self.shared_bbo_file, "r", encoding="utf-8") as f:
+                    payload = json.load(f) or {}
+        except Exception:
+            payload = {}
+
+        if not isinstance(payload, dict):
+            payload = {}
+
+        cutoff = now_ts - self.shared_bbo_cleanup_sec
+        keys_to_drop = []
+        for k, v in payload.items():
+            ts_val = 0.0
+            try:
+                ts_val = float(v.get("ts", 0)) if isinstance(v, dict) else 0.0
+            except Exception:
+                ts_val = 0.0
+            if ts_val <= 0 or ts_val < cutoff:
+                keys_to_drop.append(k)
+        for k in keys_to_drop:
+            payload.pop(k, None)
+
+        # Avoid clobbering fresh data from another process when nothing changed
+        existing = payload.get(self._shared_bbo_key())
+        if isinstance(existing, dict):
+            try:
+                exist_ts = float(existing.get("ts", 0) or 0)
+                exist_bid = Decimal(str(existing.get("bid")))
+                exist_ask = Decimal(str(existing.get("ask")))
+                if (
+                    exist_bid == bid
+                    and exist_ask == ask
+                    and (now_ts - exist_ts) < (self.shared_bbo_max_age / 2)
+                ):
+                    return
+            except Exception:
+                pass
+
+        payload[self._shared_bbo_key()] = {
+            "bid": str(bid),
+            "ask": str(ask),
+            "ts": now_ts,
+        }
+        self._save_shared_bbo_data(payload)
+
     async def _fetch_ws_bbo(self) -> Optional[Tuple[Decimal, Decimal]]:
         """
         Try to fetch BBO from WS-backed helper if exchange client provides one.
@@ -426,9 +568,21 @@ class TradingBot:
         async def fetch_bbo():
             return await self.exchange_client.fetch_bbo_prices(self.config.contract_id)
 
+        # Try shared sidecar first to reuse BBO across processes (keeps REST load lower than double-pulling)
+        shared = self._read_shared_bbo()
+        if shared:
+            return shared
+
+        # Prefer WS snapshot if available
+        ws_bbo = await self._fetch_ws_bbo()
+        if ws_bbo:
+            self._write_shared_bbo(ws_bbo[0], ws_bbo[1])
+            return ws_bbo
+
         if force:
             try:
                 val = await asyncio.wait_for(fetch_bbo(), timeout=self.bbo_force_timeout)
+                self._write_shared_bbo(val[0], val[1])
                 if self.cache.debug:
                     self.logger.log("[CACHE] BBO force ok", "DEBUG")
                 return val
@@ -441,17 +595,14 @@ class TradingBot:
                 if self.cache.debug:
                     self.logger.log("[CACHE] BBO timeout→no-cache", "DEBUG")
                 raise
-        # Prefer WS snapshot if available (unless force forces REST refresh)
-        if not force:
-            ws_bbo = await self._fetch_ws_bbo()
-            if ws_bbo:
-                return ws_bbo
-        return await self.cache.get(
+        prices = await self.cache.get(
             key,
             self.ttl_bbo,
             fetch_bbo,
             force=False
         )
+        self._write_shared_bbo(prices[0], prices[1])
+        return prices
 
     async def _get_bbo_for_zigzag(self, force: bool = False) -> Tuple[Decimal, Decimal]:
         """
