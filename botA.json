@@ -1,5 +1,5 @@
 {
-  "env_file": "acc1.env",          # 环境文件
+  "env_file": "acc1.env",          # 环境文件（sidecar 也会读取，以加载交易所密钥）
   "exchange": "lighter",           # 交易所
 
   "trading": {
@@ -7,13 +7,13 @@
     "direction": "buy",            # 初始方向（仅 grid 或未启用 ZigZag 时使用）
     "quantity": 0.005,
     "min_order_size": 0.005,       # 最小下单量（按交易所/交易对填写）
-    "max_fast_close_qty": 0.5,     # 单笔最大下单量；zigzag_timing 入/离场拆单、快反/快止损均用此上限
+    "max_fast_close_qty": 0.5,     # 单笔最大下单量；zigzag_timing 拆单、快反/快止损均用此上限
     "take_profit": 0.02,           # 止盈百分比，0.01 表示 0.01%
     "wait_time": 450,              # grid 下单间隔（秒）
     "max_orders": 40,              # grid 最大活跃挂单数
     "grid_step": -100,             # grid 步长百分比，负值表示不限制
-    "stop_price": -1,              # 停止交易价格，-1 关闭
-    "pause_price": -1,             # 暂停价格，-1 关闭
+    "stop_price": -1,              # 停止交易价格；-1 关闭
+    "pause_price": -1,             # 暂停价格；-1 关闭
     "boost": false,                # 是否开启 boost 模式（仅 aster/backpack）
     "trading_mode": "zigzag_timing" # 交易模式：grid（默认）/ zigzag_timing（破位择时，post-only 拆单）
   },
@@ -28,9 +28,9 @@
       "zigzag": {
         "enable_zigzag": true,             # zigzag_timing 必开
         "enable_auto_reverse": false,      # zigzag_timing 内部已有破位逻辑，关闭原网格反手
-        "auto_reverse_fast": false,        # zigzag_timing 不使用网格反手
+        "auto_reverse_fast": false,        # zigzag_timing 不使用网格快反
         "zigzag_depth": 15,
-        "zigzag_deviation": 5,             # ZigZag 偏离（%）
+        "zigzag_deviation": 5,             # ZigZag 偏离率
         "zigzag_backstep": 2,              # ZigZag backstep
         "zigzag_timeframe": "1m",          # ZigZag 聚合周期
         "zigzag_warmup_candles": 200,      # ZigZag 预热根数
@@ -40,11 +40,11 @@
     },
     "basic": {
       "enable": false,                       # 建议 zigzag_timing 关闭基础风险；如启用请确保不与进阶冲突
-      "max_position_count": 30,             # 最大持仓 = quantity * max_position_count
-      "basic_release_timeout_minutes": 10,  # 满仓持续 N 分钟后释放
-      "webhook_sl": false,                  # TradingView buy/sell 基础风控是否触发止损
-      "webhook_sl_fast": false,             # true=立即全平并撤单；false=停新+撤单，按节奏慢慢平
-      "webhook_reverse": false              # 止损完成后是否自动反向开仓
+      "max_position_count": 30,              # 最大持仓 = quantity * max_position_count
+      "basic_release_timeout_minutes": 10,   # 满仓持续 N 分钟后释放
+      "webhook_sl": false,                   # TradingView buy/sell 基础风控是否触发止损
+      "webhook_sl_fast": false,              # true=立即全平并撤单；false=停新+撤单，按节奏慢慢平
+      "webhook_reverse": false               # 止损完成后是否自动反向开仓
     }
   },
 
@@ -56,10 +56,18 @@
   "env": {
     "LOG_FILE_PREFIX": "botA_",             # 日志前缀
     "LOG_RETENTION_DAYS": "1",              # 日志保留天数
-    "LIGHTER_REST_MIN_INTERVAL": "0.5",     # REST 最小间隔
-    "LIGHTER_BACKOFF_START": "1.0",         # 退避起始
+    "LIGHTER_REST_MIN_INTERVAL": "0.3",     # REST 最小间隔
+    "LIGHTER_BACKOFF_START": "0.5",         # 退避起点
     "LIGHTER_BACKOFF_MAX": "8",             # 退避最大
     "ZIGZAG_PIVOT_FILE": "zigzag_pivots.json",
     "WEBHOOK_BASIC_DIRECTION_FILE": "webhook_basic_direction.json"
+  },
+
+  "sidecar": {
+    "shared_bbo_file": "/tmp/shared_bbo.json",  # sidecar 写入/读取的共享 BBO 文件
+    "publish_interval_sec": 0.25,               # 写盘节奏（t3.micro 友好）
+    "rest_interval_sec": 5,                     # WS 缺失/过期时 REST 兜底的最小间隔
+    "shared_bbo_max_age_sec": 1.5,              # 共享 BBO 新鲜度判定
+    "shared_bbo_cleanup_sec": 30                # 清理共享文件中过期键
   }
 }
