@@ -202,9 +202,10 @@ async def run_sidecar():
         return
     await asyncio.sleep(2)  # let WS warm up
 
+    contract_key = cfg.contract_id if cfg.contract_id not in ("", None) else cfg.ticker
     shared = SharedBBO(
         Path(shared_file).expanduser().resolve(),
-        key=f"{exchange}:{cfg.contract_id}",
+        key=f"{exchange}:{contract_key}",
         max_age=settings["max_age"],
         cleanup_sec=settings["cleanup"],
     )
