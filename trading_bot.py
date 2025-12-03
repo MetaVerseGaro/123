@@ -155,7 +155,9 @@ class TradingBot:
         self.bbo_force_timeout = float(os.getenv("BBO_FORCE_TIMEOUT_MS", "150")) / 1000.0
         self.ttl_last_price = float(os.getenv("TTL_LAST_PRICE_SEC", "0.5"))
         self.ttl_active_orders = float(os.getenv("TTL_ACTIVE_ORDERS_SEC", "2"))
+        self.ttl_active_orders_idle = float(os.getenv("TTL_ACTIVE_ORDERS_IDLE_SEC", "6"))
         self.ttl_position = float(os.getenv("TTL_POSITION_SEC", "1.5"))
+        self.ttl_position_idle = float(os.getenv("TTL_POSITION_IDLE_SEC", "6"))
         # Balance TTL is short (3-5s) and does not reuse equity TTL
         self.ttl_balance = float(os.getenv("TTL_BALANCE_SEC", "4"))
         self.ttl_equity = float(os.getenv("TTL_EQUITY_SEC", "60"))
@@ -548,9 +550,22 @@ class TradingBot:
 
     async def _get_active_orders_cached(self) -> list:
         key = f"orders:{self.config.contract_id}"
+        ttl = self.ttl_active_orders
+        if self.zigzag_timing_enabled:
+            needs_fast = bool(
+                self.pending_entry
+                or self.direction_lock
+                or self.redundancy_insufficient_since
+                or self.pending_reverse_state
+                or self.pending_reverse_direction
+                or self.webhook_stop_mode
+                or self.stop_new_orders is False  # preparing for opens
+            )
+            if not needs_fast:
+                ttl = max(self.ttl_active_orders_idle, self.ttl_active_orders)
         return await self.cache.get(
             key,
-            self.ttl_active_orders,
+            ttl,
             lambda: self.exchange_client.get_active_orders(self.config.contract_id)
         )
 
@@ -957,9 +972,21 @@ class TradingBot:
 
     async def _get_position_signed_cached(self, force: bool = False) -> Decimal:
         key = f"position:{self.config.contract_id}"
+        ttl = self.ttl_position
+        if self.zigzag_timing_enabled:
+            needs_fast = bool(
+                self.pending_entry
+                or self.direction_lock
+                or self.redundancy_insufficient_since
+                or self.pending_reverse_state
+                or self.pending_reverse_direction
+                or self.webhook_stop_mode
+            )
+            if not needs_fast:
+                ttl = max(self.ttl_position_idle, self.ttl_position)
         return await self.cache.get(
             key,
-            self.ttl_position,
+            ttl,
             lambda: self.exchange_client.get_account_positions(),
             force=force
         )
@@ -1890,8 +1917,7 @@ class TradingBot:
             return
 
         direction = "buy" if pos_signed > 0 else "sell"
-        if self.current_direction and self.current_direction != direction:
-            direction = self.current_direction
+        # Prefer actual position sign; only fallback to current_direction when flat (handled above)
         prev_stop = self.dynamic_stop_price
         if self.dynamic_stop_direction and self.dynamic_stop_direction != direction:
             self.dynamic_stop_price = None
