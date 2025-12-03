@@ -8,7 +8,7 @@
     "quantity": 0.005,
     "min_order_size": 0.005,       # 最小下单量（按交易所/交易对填写）
     "max_fast_close_qty": 0.5,      # 快反/快止损单次最大平仓手数
-    "take_profit": 0.02,           # 止盈百分比，0.01 表示 0.01%
+    "take_profit": 0.03,           # 止盈百分比，0.01 表示 0.01%
     "wait_time": 450,              # 下单间隔（秒，后续节奏优化可替换）
     "max_orders": 40,              # 最大活跃挂单数（临时沿用，后续节奏改造可移除）
     "grid_step": -100,             # 网格步长百分比，负值表示不限制
@@ -19,14 +19,14 @@
 
   "risk": {
     "advanced": {
-      "enable": false,                      # 进阶风险：冗余/SL/ZigZag/自动反手
-      "enable_stop_loss": false,            # 止损总开关（关闭则仅记录 ZigZag，不止损/冗余/自动反手）
+      "enable": true,                      # 进阶风险：冗余/SL/ZigZag/自动反手
+      "enable_stop_loss": true,            # 止损总开关（关闭则仅记录 ZigZag，不止损/冗余/自动反手）
       "risk_pct": 2.0,                     # 风险敞口百分比
       "release_timeout_minutes": 10,       # 冗余不足持续 N 分钟后释放
       "stop_new_orders_equity_threshold": 30, # 低于该 equity 停新并缓步平仓退出
       "zigzag": {
-        "enable_zigzag": false,             # 是否启用 ZigZag 判向
-        "enable_auto_reverse": false,       # 是否自动反手
+        "enable_zigzag": true,             # 是否启用 ZigZag 判向
+        "enable_auto_reverse": true,       # 是否自动反手
         "auto_reverse_fast": false,         # true=破位立即反手；false=等待下一确认点
         "zigzag_depth": 15,
         "zigzag_deviation": 5,             # ZigZag 偏离（%）
@@ -38,12 +38,12 @@
       }
     },
     "basic": {
-      "enable": true,                       # 基础风险：最大持仓/基础释放（与进阶风险建议二选一）
+      "enable": false,                       # 基础风险：最大持仓/基础释放（与进阶风险建议二选一）
       "max_position_count": 50,             # 最大持仓 = quantity * max_position_count
       "basic_release_timeout_minutes": 10,   # 满仓持续 N 分钟后释放
-      "webhook_sl": true,                  # TradingView buy/sell 基础风控是否触发止损
+      "webhook_sl": false,                  # TradingView buy/sell 基础风控是否触发止损
       "webhook_sl_fast": false,              # true=立即全平并撤单；false=停新+撤单，按节奏慢慢平
-      "webhook_reverse": true              # 止损完成后是否自动反向开仓
+      "webhook_reverse": false              # 止损完成后是否自动反向开仓
     }
   },
 
