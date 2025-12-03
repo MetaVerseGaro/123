@@ -116,6 +116,7 @@ def merge_config(args, cfg: dict):
     set_from(trading, "stop_price", Decimal)
     set_from(trading, "pause_price", Decimal)
     set_from(trading, "min_order_size", Decimal, target="min_order_size")
+    set_from(trading, "trading_mode", str, target="trading_mode")
     if "boost" in trading:
         setattr(args, "boost", bool(trading["boost"]))
     # Risk control env
@@ -254,6 +255,7 @@ async def main():
         min_order_size=getattr(args, "min_order_size", None),
         max_position_count=getattr(args, "max_position_count", 0),
         basic_release_timeout_minutes=getattr(args, "basic_release_timeout_minutes", 0),
+        trading_mode=getattr(args, "trading_mode", "grid"),
         enable_advanced_risk=getattr(args, "enable_advanced_risk", True),
         enable_basic_risk=getattr(args, "enable_basic_risk", True),
         webhook_sl=getattr(args, "webhook_sl", False),
