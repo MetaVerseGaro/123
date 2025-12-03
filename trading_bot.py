@@ -233,6 +233,8 @@ class TradingBot:
         self._pivot_poll_interval: float = float(os.getenv("PIVOT_POLL_INTERVAL_SEC", str(int(default_interval))))
         self._webhook_poll_interval: float = float(os.getenv("WEBHOOK_POLL_INTERVAL_SEC", "5"))
         self._last_webhook_poll: float = 0.0
+        # REST throttle lanes to comply with lighter_rate_limits_official.md
+        self._rest_last_call: Dict[str, float] = {}
         self.webhook_sl = bool(getattr(config, "webhook_sl", False) or str(os.getenv("WEBHOOK_SL", "false")).lower() == "true")
         self.webhook_sl_fast = bool(getattr(config, "webhook_sl_fast", False) or str(os.getenv("WEBHOOK_SL_FAST", "false")).lower() == "true")
         self.webhook_reverse = bool(getattr(config, "webhook_reverse", False) or str(os.getenv("WEBHOOK_REVERSE", "false")).lower() == "true")
@@ -532,6 +534,43 @@ class TradingBot:
         except Exception:
             return tp_price
 
+    async def _throttle_rest(self, lane: str, min_interval: float = 1.0):
+        """
+        Best-effort REST throttling per lane (non-blocking for WS paths).
+        Keeps LF endpoints (e.g., historical candles) below ~60 req/min default cap.
+        """
+        now_ts = time.time()
+        last_ts = self._rest_last_call.get(lane, 0.0)
+        wait = min_interval - (now_ts - last_ts)
+        if wait > 0:
+            await asyncio.sleep(wait)
+        self._rest_last_call[lane] = time.time()
+
+    async def _notify_zigzag_trade(self, action: str, direction: str, qty: Decimal, price: Decimal, note: str = ""):
+        """Notify entry/exit in zigzag_timing with size and notional exposure."""
+        if not self.enable_notifications:
+            return
+        try:
+            qty_val = Decimal(qty)
+            price_val = Decimal(price)
+            exposure = qty_val * price_val
+        except Exception:
+            qty_val = qty
+            price_val = price
+            exposure = None
+        msg_parts = [
+            "[ZIGZAG-TIMING]",
+            action.upper(),
+            direction.upper(),
+            f"qty={qty_val}",
+            f"px={price_val}",
+        ]
+        if exposure is not None:
+            msg_parts.append(f"notional={exposure}")
+        if note:
+            msg_parts.append(note)
+        await self.send_notification(" ".join(str(x) for x in msg_parts))
+
     async def _cancel_zigzag_tp(self):
         """Cancel existing fixed TP order if tracked."""
         if not self.zigzag_tp_order_id:
@@ -664,8 +703,10 @@ class TradingBot:
         """Handle stop trigger: cancel TP, close position, reset state."""
         await self._cancel_zigzag_tp()
         pos_abs = abs(await self._get_position_signed_cached(force=True))
+        ref_price = best_bid if close_side.lower() == "sell" else best_ask
         if pos_abs > 0:
             await self._post_only_exit_batch(close_side, pos_abs, best_bid, best_ask, wait_sec=5.0)
+            await self._notify_zigzag_trade("exit", close_side, pos_abs, ref_price, note="stop-hit")
         self.direction_lock = None
         self.pending_entry = None
         self.zigzag_stop_price = None
@@ -716,6 +757,7 @@ class TradingBot:
             self.current_direction = direction
             self.config.direction = direction
             await self._place_zigzag_tp(direction, current_dir_qty, anchor_price, stop_price)
+            await self._notify_zigzag_trade("entry", direction, current_dir_qty, anchor_price)
         else:
             self.logger.log(
                 f"[ZIGZAG-TIMING] Entry pending ({direction}) filled {current_dir_qty}/{target_qty}",
@@ -1419,6 +1461,7 @@ class TradingBot:
             return await self._candle_pending[cache_key]
         async def _do_fetch():
             if hasattr(self.exchange_client, "fetch_candle_by_close_time"):
+                await self._throttle_rest("candle", min_interval=1.0)
                 try:
                     candle = await self.exchange_client.fetch_candle_by_close_time(
                         timeframe=tf,
@@ -1434,6 +1477,7 @@ class TradingBot:
                 except Exception as exc:
                     self.logger.log(f"[ZIGZAG] fetch_candle_by_close_time failed: {exc}", "WARNING")
             if hasattr(self.exchange_client, "fetch_history_candles"):
+                await self._throttle_rest("candle", min_interval=1.0)
                 try:
                     candles = await self.exchange_client.fetch_history_candles(limit=300, timeframe=tf)
                     for c in candles:
