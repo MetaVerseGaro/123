@@ -176,6 +176,10 @@ class TradingBot:
         # Sidecar BBO cache cleanup interval (keep file small on t3.micro)
         self.shared_bbo_cleanup_sec = float(os.getenv("SHARED_BBO_CLEANUP_SEC", "30"))
         self._shared_bbo_last_write_ts: float = 0.0
+        if self.shared_bbo_file:
+            self.logger.log(f"[INIT] Shared BBO file: {self.shared_bbo_file}", "INFO")
+        else:
+            self.logger.log("[INIT] Shared BBO file not set; using local WS/REST only", "INFO")
 
         # Trading state
         self.active_close_orders = []
