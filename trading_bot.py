@@ -1351,6 +1351,28 @@ class TradingBot:
         if notify and self.enable_notifications:
             await self._notify_recent_pivots()
 
+    async def _maybe_resume_pending_reverse_by_price(self, trade_price: Optional[Decimal]):
+        """If pending slow reverse is invalidated by price reclaim/break, resume original direction early."""
+        if self.pending_reverse_state != "waiting_next_pivot" or trade_price is None:
+            return
+        buffer = self.break_buffer_ticks * self.config.tick_size
+        if self.pending_reverse_direction == "sell" and self.last_confirmed_high is not None:
+            if trade_price >= (self.last_confirmed_high + buffer):
+                await self._resume_after_invalid_reverse()
+                if self.enable_dynamic_sl:
+                    await self._refresh_stop_loss(force=True)
+                if self.enable_notifications:
+                    await self.send_notification("[REV-SLOW] Pending reverse canceled: price reclaimed last high")
+                return
+        if self.pending_reverse_direction == "buy" and self.last_confirmed_low is not None:
+            if trade_price <= (self.last_confirmed_low - buffer):
+                await self._resume_after_invalid_reverse()
+                if self.enable_dynamic_sl:
+                    await self._refresh_stop_loss(force=True)
+                if self.enable_notifications:
+                    await self.send_notification("[REV-SLOW] Pending reverse canceled: price broke last low")
+                return
+
     async def _handle_reverse_signal(self, new_direction: str, pivot_price: Decimal):
         """Handle reverse signal based on configured mode."""
         if not self.enable_auto_reverse:
@@ -2150,6 +2172,10 @@ class TradingBot:
             raise ValueError("No bid/ask data available")
 
         trade_price = await self._get_last_trade_price_cached(best_bid, best_ask, force=True)
+
+        # If slow reverse is pending, allow price reclaim/break to invalidate without waiting next pivot
+        if trade_price is not None:
+            await self._maybe_resume_pending_reverse_by_price(Decimal(trade_price))
 
         if self.enable_dynamic_sl and self.dynamic_stop_price is not None and (not self.stop_loss_triggered):
             if self.config.direction == "buy" and best_bid <= self.dynamic_stop_price:
