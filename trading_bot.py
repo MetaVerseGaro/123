@@ -963,6 +963,64 @@ class TradingBot:
         except Exception as exc:
             self.logger.log(f"[ZIGZAG] persist pivot price failed: {exc}", "WARNING")
 
+    async def _backfill_recent_pivot_prices(self, max_each: int = 2):
+        """Backfill latest high/low pivot prices for current exchange if missing."""
+        if not self.enable_zigzag:
+            return
+        try:
+            store = self._load_json_file(self.zigzag_pivot_file) or {}
+            base_bucket = store.get(self.symbol_base, {}) if isinstance(store, dict) else {}
+            tf_bucket = base_bucket.get(self.zigzag_timeframe_key) or base_bucket.get(str(self.zigzag_timeframe_key))
+            if not tf_bucket or not isinstance(tf_bucket, list):
+                return
+            highs: List[Dict[str, Any]] = []
+            lows: List[Dict[str, Any]] = []
+            for item in reversed(tf_bucket):
+                try:
+                    label = str(item.get("label", "")).upper()
+                except Exception:
+                    continue
+                if label in ("HH", "LH") and len(highs) < max_each:
+                    highs.append(item)
+                elif label in ("LL", "HL") and len(lows) < max_each:
+                    lows.append(item)
+                if len(highs) >= max_each and len(lows) >= max_each:
+                    break
+            targets = highs + lows
+            if not targets:
+                return
+            updated = False
+            exch_key = self.config.exchange
+            for item in targets:
+                label = str(item.get("label", "")).upper()
+                if item.get(f"price_{exch_key}") is not None:
+                    continue
+                close_raw = item.get("close_time_utc") or item.get("pivot_bar_close") or item.get("close_time")
+                close_dt = self._parse_pivot_time(str(close_raw)) if close_raw else None
+                if close_dt is None:
+                    continue
+                candle = await self._fetch_candle_for_time(close_dt)
+                if not candle:
+                    continue
+                high_val, low_val = candle
+                price = high_val if label in ("HH", "LH") else low_val
+                item[f"price_{exch_key}"] = str(price)
+                updated = True
+            if updated:
+                try:
+                    self.zigzag_pivot_file.parent.mkdir(parents=True, exist_ok=True)
+                    tmp = self.zigzag_pivot_file.with_suffix(".tmp")
+                    with open(tmp, "w", encoding="utf-8") as f:
+                        json.dump(store, f, ensure_ascii=False, indent=2, default=str)
+                    tmp.replace(self.zigzag_pivot_file)
+                    self._pivot_file_mtime = self.zigzag_pivot_file.stat().st_mtime
+                    if self.cache.debug:
+                        self.logger.log("[ZIGZAG] Backfilled recent pivot prices for exchange", "DEBUG")
+                except Exception as exc:
+                    self.logger.log(f"[ZIGZAG] Backfill pivot prices persist failed: {exc}", "WARNING")
+        except Exception as exc:
+            self.logger.log(f"[ZIGZAG] Backfill recent pivot prices failed: {exc}", "WARNING")
+
     async def graceful_shutdown(self, reason: str = "Unknown"):
         """Perform graceful shutdown of the trading bot."""
         self.logger.log(f"Starting graceful shutdown: {reason}", "INFO")
@@ -2725,6 +2783,7 @@ class TradingBot:
 
             if self.enable_zigzag:
                 await self._initialize_pivots_from_store()
+                await self._backfill_recent_pivot_prices()
             if self.zigzag_timing_enabled:
                 await self._sync_direction_lock()
 
