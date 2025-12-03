@@ -12,7 +12,7 @@ import random
 from pathlib import Path
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from decimal import Decimal
+from decimal import Decimal, ROUND_HALF_UP
 from typing import Optional, Dict, List, Tuple, Set, Any
 from collections import deque, OrderedDict
 
