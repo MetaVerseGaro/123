@@ -385,7 +385,8 @@ class TradingBot:
 
     def _shared_bbo_key(self) -> str:
         """Build the shared BBO key for the current contract."""
-        contract_key = self.config.contract_id or self.config.ticker
+        cid = self.config.contract_id
+        contract_key = str(cid) if cid not in (None, "") else self.config.ticker
         return f"{self.config.exchange}:{contract_key}"
 
     def _save_shared_bbo_data(self, data: Dict[str, Any]):
