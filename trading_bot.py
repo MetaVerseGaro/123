@@ -81,6 +81,7 @@ class TradingConfig:
     pause_price: Decimal
     boost_mode: bool
     min_order_size: Optional[Decimal] = None
+    trading_mode: str = "grid"
     max_position_count: int = 0
     basic_release_timeout_minutes: int = 0
     enable_advanced_risk: bool = True
@@ -140,6 +141,10 @@ class TradingBot:
         except ValueError as e:
             raise ValueError(f"Failed to create exchange client: {e}")
 
+        # Mode: grid (default) | zigzag_timing
+        self.trading_mode = str(getattr(config, "trading_mode", None) or os.getenv("TRADING_MODE", "grid")).lower()
+        self.zigzag_timing_enabled = self.trading_mode == "zigzag_timing"
+
         # Cache helper
         debug_flag = ("--debug" in sys.argv) or (str(os.getenv("DEBUG_CACHE", "false")).lower() == "true")
         self.cache = _AsyncCache(self.logger, debug=debug_flag)
@@ -198,6 +203,13 @@ class TradingBot:
         self.enable_dynamic_sl = self.stop_loss_enabled
         self.enable_zigzag = str(os.getenv('ENABLE_ZIGZAG', 'true')).lower() == 'true'
         self.auto_reverse_fast = str(os.getenv('AUTO_REVERSE_FAST', 'true')).lower() == 'true'
+        # ZigZag timing mode state
+        self.direction_lock: Optional[str] = None
+        self.pending_entry: Optional[str] = None
+        self.zigzag_stop_price: Optional[Decimal] = None
+        self.zigzag_entry_price: Optional[Decimal] = None
+        self.zigzag_tp_order_id: Optional[str] = None
+        self.zigzag_tp_qty: Optional[Decimal] = None
         self.enable_notifications = str(os.getenv('ENABLE_NOTIFICATIONS', 'false')).lower() == 'true'
         self.daily_pnl_report = str(os.getenv('DAILY_PNL_REPORT', 'false')).lower() == 'true'
         self.current_sl_order_id: Optional[Decimal] = None
@@ -286,6 +298,14 @@ class TradingBot:
             self.enable_auto_reverse = False
         if not self.enable_auto_reverse:
             self.auto_reverse_fast = False
+        # ZigZag timing mode强制开启相关能力（不使用原网格反手逻辑）
+        if self.zigzag_timing_enabled:
+            self.stop_loss_enabled = True
+            self.enable_advanced_risk = True
+            self.enable_zigzag = True
+            self.enable_dynamic_sl = True
+            self.enable_auto_reverse = False
+            self.auto_reverse_fast = False
         # 交易所/交易对最小下单量：优先配置文件，其次 ENV 覆盖
         try:
             cfg_min = config.min_order_size if getattr(config, "min_order_size", None) not in (None, 0) else None
@@ -325,6 +345,23 @@ class TradingBot:
         if dir_l == "sell":
             return price >= stop_price
         return False
+
+    def _round_quantity(self, qty: Decimal) -> Decimal:
+        """Normalize quantity to a reasonable precision."""
+        try:
+            return Decimal(qty).quantize(Decimal("0.00000001"), rounding=ROUND_HALF_UP)
+        except Exception:
+            return Decimal(qty)
+
+    async def _cancel_order_ids(self, order_ids: List[str]):
+        """Best-effort cancel for a list of order ids."""
+        if not order_ids:
+            return
+        for oid in order_ids:
+            try:
+                await self.exchange_client.cancel_order(str(oid))
+            except Exception as exc:
+                self.logger.log(f"[ZIGZAG-TIMING] Cancel order {oid} failed: {exc}", "WARNING")
 
     async def _get_bbo_cached(self, force: bool = False) -> Tuple[Decimal, Decimal]:
         key = f"bbo:{self.config.contract_id}"
@@ -379,6 +416,360 @@ class TradingBot:
             self.ttl_active_orders,
             lambda: self.exchange_client.get_active_orders(self.config.contract_id)
         )
+
+    async def _get_directional_position(self, direction: str, force: bool = False) -> Decimal:
+        """Return absolute position in the given direction."""
+        pos = await self._get_position_signed_cached(force=force)
+        if direction == "buy":
+            return max(Decimal(0), pos)
+        return max(Decimal(0), -pos)
+
+    async def _cancel_orders_by_side(self, side: str):
+        """Cancel all active orders of a given side."""
+        try:
+            active_orders = await self._get_active_orders_cached()
+            targets = [o for o in active_orders if getattr(o, "side", "").lower() == side.lower()]
+            for order in targets:
+                try:
+                    await self.exchange_client.cancel_order(order.order_id)
+                except Exception as exc:
+                    self.logger.log(f"[ZIGZAG-TIMING] Cancel {side} order {order.order_id} failed: {exc}", "WARNING")
+            if targets:
+                self._invalidate_order_cache()
+        except Exception as exc:
+            self.logger.log(f"[ZIGZAG-TIMING] Cancel by side failed: {exc}", "WARNING")
+
+    async def _place_post_only_limit(self, side: str, quantity: Decimal, price: Decimal, reduce_only: bool = False) -> OrderResult:
+        """Place a post-only limit order with best-effort fallbacks."""
+        quantity = self._round_quantity(quantity)
+        if self.min_order_size and quantity < self.min_order_size:
+            quantity = self.min_order_size
+        if quantity <= 0:
+            return OrderResult(success=False, error_message="Invalid quantity")
+        try:
+            price = self.exchange_client.round_to_tick(price)
+        except Exception:
+            price = Decimal(price)
+
+        client = self.exchange_client
+        # Prefer explicit post-only if available
+        if hasattr(client, "place_post_only_order"):
+            try:
+                return await client.place_post_only_order(self.config.contract_id, quantity, price, side, reduce_only=reduce_only)
+            except TypeError:
+                try:
+                    return await client.place_post_only_order(self.config.contract_id, quantity, price, side)
+                except Exception as exc:
+                    self.logger.log(f"[ZIGZAG-TIMING] place_post_only_order fallback err: {exc}", "WARNING")
+            except Exception as exc:
+                self.logger.log(f"[ZIGZAG-TIMING] place_post_only_order err: {exc}", "WARNING")
+
+        if hasattr(client, "place_limit_order"):
+            try:
+                return await client.place_limit_order(self.config.contract_id, quantity, price, side, reduce_only=reduce_only)
+            except TypeError:
+                try:
+                    return await client.place_limit_order(self.config.contract_id, quantity, price, side)
+                except Exception as exc:
+                    self.logger.log(f"[ZIGZAG-TIMING] place_limit_order fallback err: {exc}", "WARNING")
+            except Exception as exc:
+                self.logger.log(f"[ZIGZAG-TIMING] place_limit_order err: {exc}", "WARNING")
+
+        # Fallback: use open/close API (may not be post-only)
+        try:
+            if reduce_only:
+                if hasattr(client, "place_close_order"):
+                    return await client.place_close_order(self.config.contract_id, quantity, price, side)
+            else:
+                if hasattr(client, "place_open_order"):
+                    return await client.place_open_order(self.config.contract_id, quantity, side)
+        except Exception as exc:
+            return OrderResult(success=False, error_message=str(exc))
+
+        return OrderResult(success=False, error_message="No supported post-only/limit order method")
+
+    async def _calc_qty_by_risk_zigzag(self, entry_price: Decimal, stop_price: Decimal) -> Optional[Decimal]:
+        """Calculate target quantity based on risk_pct and stop distance."""
+        try:
+            entry_price = Decimal(entry_price)
+            stop_price = Decimal(stop_price)
+        except Exception:
+            return None
+        unit_risk = abs(entry_price - stop_price)
+        if unit_risk <= 0:
+            return None
+        equity = await self._get_equity_snapshot()
+        if equity is None or equity <= 0:
+            return None
+        allowed_risk = equity * (self.risk_pct / Decimal(100))
+        if allowed_risk <= 0:
+            return None
+        qty = allowed_risk / unit_risk
+        if self.min_order_size:
+            qty = max(qty, self.min_order_size)
+        return self._round_quantity(qty)
+
+    def _calc_tp_price_rr2(self, entry_price: Decimal, stop_price: Decimal, direction: str) -> Optional[Decimal]:
+        """Calculate TP price at RR 1:2 from entry/stop."""
+        try:
+            entry_price = Decimal(entry_price)
+            stop_price = Decimal(stop_price)
+        except Exception:
+            return None
+        if direction == "buy":
+            risk = entry_price - stop_price
+            if risk <= 0:
+                return None
+            tp_price = entry_price + risk * 2
+        else:
+            risk = stop_price - entry_price
+            if risk <= 0:
+                return None
+            tp_price = entry_price - risk * 2
+        try:
+            return self.exchange_client.round_to_tick(tp_price)
+        except Exception:
+            return tp_price
+
+    async def _cancel_zigzag_tp(self):
+        """Cancel existing fixed TP order if tracked."""
+        if not self.zigzag_tp_order_id:
+            return
+        try:
+            await self.exchange_client.cancel_order(self.zigzag_tp_order_id)
+            self._invalidate_order_cache()
+        except Exception as exc:
+            self.logger.log(f"[ZIGZAG-TIMING] Cancel TP failed: {exc}", "WARNING")
+        finally:
+            self.zigzag_tp_order_id = None
+            self.zigzag_tp_qty = None
+
+    async def _place_zigzag_tp(self, direction: str, filled_qty: Decimal, entry_price: Decimal, stop_price: Decimal):
+        """Place fixed TP at RR 1:2 for 50% position, reduce-only post-only."""
+        await self._cancel_zigzag_tp()
+        tp_price = self._calc_tp_price_rr2(entry_price, stop_price, direction)
+        if tp_price is None:
+            return
+        qty = self._round_quantity(filled_qty / Decimal(2))
+        if self.min_order_size and qty < self.min_order_size:
+            return
+        side = "sell" if direction == "buy" else "buy"
+        res = await self._place_post_only_limit(side, qty, tp_price, reduce_only=True)
+        if res and res.success:
+            self.zigzag_tp_order_id = res.order_id
+            self.zigzag_tp_qty = qty
+            self._invalidate_order_cache()
+        else:
+            self.logger.log(f"[ZIGZAG-TIMING] Place TP failed: {getattr(res, 'error_message', '')}", "WARNING")
+
+    def _build_price_ladder(self, side: str, base_price: Decimal, max_orders: int) -> List[Decimal]:
+        """Build a simple 1-tick spaced price ladder."""
+        prices: List[Decimal] = []
+        tick = self.config.tick_size
+        for i in range(max_orders):
+            if side == "buy":
+                px = base_price - tick * i
+                if px <= 0:
+                    px = tick
+            else:
+                px = base_price + tick * i
+            try:
+                px = self.exchange_client.round_to_tick(px)
+            except Exception:
+                pass
+            prices.append(px)
+        return prices
+
+    async def _post_only_entry_batch(self, direction: str, target_qty: Decimal, best_bid: Decimal, best_ask: Decimal, wait_sec: float = 20.0) -> Tuple[Decimal, Decimal]:
+        """Post-only batch entry; returns filled_qty, final_dir_qty."""
+        if target_qty <= 0:
+            return Decimal(0), await self._get_directional_position(direction, force=True)
+        base_price = best_bid if direction == "buy" else best_ask
+        if base_price is None or base_price <= 0:
+            return Decimal(0), await self._get_directional_position(direction, force=True)
+        max_per = self.max_fast_close_qty if self.max_fast_close_qty > 0 else target_qty
+        num_orders = int((target_qty / max_per).to_integral_value(rounding=ROUND_HALF_UP))
+        if num_orders * max_per < target_qty:
+            num_orders += 1
+        prices = self._build_price_ladder(direction, base_price, max(num_orders, 1))
+        start_qty = await self._get_directional_position(direction, force=True)
+        remaining = target_qty
+        order_ids: List[str] = []
+        for px in prices:
+            if remaining <= 0:
+                break
+            qty = min(max_per, remaining)
+            res = await self._place_post_only_limit(direction, qty, px, reduce_only=False)
+            if res and res.success:
+                order_ids.append(res.order_id)
+                remaining -= qty
+        start_ts = time.time()
+        while time.time() - start_ts < wait_sec:
+            await asyncio.sleep(1)
+        await self._cancel_order_ids(order_ids)
+        await asyncio.sleep(0.1)
+        end_qty = await self._get_directional_position(direction, force=True)
+        filled = max(Decimal(0), end_qty - start_qty)
+        return filled, end_qty
+
+    async def _post_only_exit_batch(self, close_side: str, close_qty: Decimal, best_bid: Decimal, best_ask: Decimal, wait_sec: float = 5.0) -> Tuple[Decimal, Decimal]:
+        """Post-only batch exit; returns closed_qty, remaining_abs."""
+        if close_qty <= 0:
+            pos_abs = abs(await self._get_position_signed_cached(force=True))
+            return Decimal(0), pos_abs
+        base_price = best_ask if close_side.lower() == "sell" else best_bid
+        if base_price is None or base_price <= 0:
+            pos_abs = abs(await self._get_position_signed_cached(force=True))
+            return Decimal(0), pos_abs
+        max_per = self.max_fast_close_qty if self.max_fast_close_qty > 0 else close_qty
+        num_orders = int((close_qty / max_per).to_integral_value(rounding=ROUND_HALF_UP))
+        if num_orders * max_per < close_qty:
+            num_orders += 1
+        prices = self._build_price_ladder(close_side, base_price, max(num_orders, 1))
+        start_abs = abs(await self._get_position_signed_cached(force=True))
+        remaining = close_qty
+        order_ids: List[str] = []
+        for px in prices:
+            if remaining <= 0:
+                break
+            qty = min(max_per, remaining)
+            res = await self._place_post_only_limit(close_side, qty, px, reduce_only=True)
+            if res and res.success:
+                order_ids.append(res.order_id)
+                remaining -= qty
+        start_ts = time.time()
+        while time.time() - start_ts < wait_sec:
+            await asyncio.sleep(0.5)
+        await self._cancel_order_ids(order_ids)
+        await asyncio.sleep(0.1)
+        end_abs = abs(await self._get_position_signed_cached(force=True))
+        closed = max(Decimal(0), start_abs - end_abs)
+        return closed, end_abs
+
+    async def _flatten_opposite(self, new_direction: str, best_bid: Decimal, best_ask: Decimal) -> bool:
+        """Ensure opposite side positions/orders are cleared before entering new direction."""
+        opposite_side = "sell" if new_direction == "buy" else "buy"
+        await self._cancel_orders_by_side(opposite_side)
+        pos_signed = await self._get_position_signed_cached(force=True)
+        if (pos_signed > 0 and new_direction == "buy") or (pos_signed < 0 and new_direction == "sell"):
+            return True  # already aligned
+        pos_abs = abs(pos_signed)
+        if pos_abs <= (self.min_order_size or Decimal("0")):
+            return True
+        _, remaining = await self._post_only_exit_batch(opposite_side, pos_abs, best_bid, best_ask, wait_sec=5.0)
+        return remaining <= (self.min_order_size or Decimal("0"))
+
+    async def _execute_zigzag_stop(self, close_side: str, best_bid: Decimal, best_ask: Decimal):
+        """Handle stop trigger: cancel TP, close position, reset state."""
+        await self._cancel_zigzag_tp()
+        pos_abs = abs(await self._get_position_signed_cached(force=True))
+        if pos_abs > 0:
+            await self._post_only_exit_batch(close_side, pos_abs, best_bid, best_ask, wait_sec=5.0)
+        self.direction_lock = None
+        self.pending_entry = None
+        self.zigzag_stop_price = None
+        self.zigzag_entry_price = None
+        self.dynamic_stop_price = None
+        self.current_direction = None
+
+    async def _process_pending_zigzag_entry(self, best_bid: Decimal, best_ask: Decimal):
+        """Process pending zigzag entry: flatten opposite, compute qty, place batch post-only."""
+        if not self.pending_entry:
+            return
+        if self.stop_new_orders:
+            return
+        direction = self.pending_entry
+        buffer = self.break_buffer_ticks * self.config.tick_size
+        if direction == "buy":
+            if self.last_confirmed_low is None:
+                return
+            stop_price = self.last_confirmed_low - buffer
+            anchor_price = best_ask
+        else:
+            if self.last_confirmed_high is None:
+                return
+            stop_price = self.last_confirmed_high + buffer
+            anchor_price = best_bid
+        if anchor_price is None or anchor_price <= 0:
+            return
+        if self.zigzag_tp_order_id:
+            await self._cancel_zigzag_tp()
+        ok = await self._flatten_opposite(direction, best_bid, best_ask)
+        if not ok:
+            return
+        target_qty = await self._calc_qty_by_risk_zigzag(anchor_price, stop_price)
+        if target_qty is None or target_qty <= 0:
+            return
+        current_dir_qty = await self._get_directional_position(direction, force=True)
+        remaining = max(Decimal(0), target_qty - current_dir_qty)
+        if remaining >= (self.min_order_size or Decimal("0")):
+            filled, current_dir_qty = await self._post_only_entry_batch(direction, remaining, best_bid, best_ask, wait_sec=20.0)
+            if filled > 0:
+                self._invalidate_position_cache()
+        if current_dir_qty >= (target_qty - (self.min_order_size or Decimal("0"))):
+            self.direction_lock = direction
+            self.pending_entry = None
+            self.zigzag_stop_price = stop_price
+            self.zigzag_entry_price = anchor_price
+            self.dynamic_stop_price = stop_price
+            self.current_direction = direction
+            self.config.direction = direction
+            await self._place_zigzag_tp(direction, current_dir_qty, anchor_price, stop_price)
+        else:
+            self.logger.log(
+                f"[ZIGZAG-TIMING] Entry pending ({direction}) filled {current_dir_qty}/{target_qty}",
+                "INFO",
+            )
+
+    async def _sync_direction_lock(self):
+        """Keep direction_lock in sync with actual position."""
+        pos_signed = await self._get_position_signed_cached(force=True)
+        if pos_signed > 0:
+            self.direction_lock = "buy"
+        elif pos_signed < 0:
+            self.direction_lock = "sell"
+        else:
+            if not self.pending_entry:
+                self.direction_lock = None
+                self.zigzag_stop_price = None
+                self.dynamic_stop_price = None
+                await self._cancel_zigzag_tp()
+
+    async def _handle_zigzag_timing_cycle(self):
+        """Main loop for zigzag_timing mode."""
+        await self._sync_external_pivots()
+        best_bid, best_ask = await self._get_bbo_cached(force=True)
+        if best_bid <= 0 or best_ask <= 0 or best_bid >= best_ask:
+            raise ValueError("No bid/ask data available")
+        trade_price = await self._get_last_trade_price_cached(best_bid, best_ask, force=True)
+        await self._sync_direction_lock()
+
+        # Stop check (use best bid/ask)
+        active_stop = self.dynamic_stop_price if (self.enable_dynamic_sl and self.dynamic_stop_price is not None) else self.zigzag_stop_price
+        if self.direction_lock and active_stop is not None:
+            if self.direction_lock == "buy" and best_bid <= active_stop:
+                await self._execute_zigzag_stop("sell", best_bid, best_ask)
+                return
+            if self.direction_lock == "sell" and best_ask >= active_stop:
+                await self._execute_zigzag_stop("buy", best_bid, best_ask)
+                return
+
+        # Detect breakout signals
+        buffer = self.break_buffer_ticks * self.config.tick_size
+        signal = None
+        if trade_price is not None:
+            if self.last_confirmed_high is not None and trade_price >= (self.last_confirmed_high + buffer):
+                signal = "buy"
+            if self.last_confirmed_low is not None and trade_price <= (self.last_confirmed_low - buffer):
+                signal = "sell" if signal is None else signal
+        if signal:
+            if self.direction_lock and self.direction_lock == signal:
+                signal = None
+            else:
+                self.pending_entry = signal
+
+        if self.pending_entry:
+            await self._process_pending_zigzag_entry(best_bid, best_ask)
 
     async def _get_position_signed_cached(self, force: bool = False) -> Decimal:
         key = f"position:{self.config.contract_id}"
@@ -1495,7 +1886,7 @@ class TradingBot:
 
         if self.pending_reverse_direction == "sell":
             if pivot.label == "LH":
-                await self._cancel_close_orders()
+                await self._cancel_all_orders_safely()
                 self.pending_reverse_state = "unwinding"
                 return True
             if pivot.label == "HH":
@@ -1504,7 +1895,7 @@ class TradingBot:
 
         if self.pending_reverse_direction == "buy":
             if pivot.label == "HL":
-                await self._cancel_close_orders()
+                await self._cancel_all_orders_safely()
                 self.pending_reverse_state = "unwinding"
                 return True
             if pivot.label == "LL":
@@ -1542,10 +1933,18 @@ class TradingBot:
             return
 
         close_side = 'sell' if pos_signed > 0 else 'buy'
-        unwind_qty = min(self.config.quantity, pos_abs)
         try:
-            await self.exchange_client.reduce_only_close_with_retry(unwind_qty, close_side)
+            result = await self.exchange_client.reduce_only_close_with_retry(pos_abs, close_side)
             self.last_release_attempt = time.time()
+            # If exchange returns partial, log and let next loop continue closing
+            try:
+                remaining = abs(await self._get_position_signed_cached(force=True))
+                if remaining >= self.min_order_size:
+                    self.logger.log(f"[REV-SLOW] Partial close during reverse, remaining {remaining}", "WARNING")
+            except Exception:
+                pass
+            if hasattr(result, "success") and not getattr(result, "success", True):
+                self.logger.log(f"[REV-SLOW] Close during reverse reported failure: {getattr(result, 'error_message', '')}", "WARNING")
         except Exception as e:
             self.logger.log(f"[REV-SLOW] Unwind attempt failed: {e}", "WARNING")
 
@@ -2325,6 +2724,8 @@ class TradingBot:
 
             if self.enable_zigzag:
                 await self._initialize_pivots_from_store()
+            if self.zigzag_timing_enabled:
+                await self._sync_direction_lock()
 
             # Log current TradingConfig
             self.logger.log("=== Trading Configuration ===", "INFO")
@@ -2336,6 +2737,7 @@ class TradingBot:
             self.logger.log(f"Max Orders: {self.config.max_orders}", "INFO")
             self.logger.log(f"Wait Time: {self.config.wait_time}s", "INFO")
             self.logger.log(f"Exchange: {self.config.exchange}", "INFO")
+            self.logger.log(f"Trading Mode: {self.trading_mode}", "INFO")
             self.logger.log(f"Grid Step: {self.config.grid_step}%", "INFO")
             self.logger.log(f"Stop Price: {self.config.stop_price}", "INFO")
             if self.enable_dynamic_sl:
@@ -2351,6 +2753,10 @@ class TradingBot:
             while not self.shutdown_requested:
                 try:
                     await self._maybe_send_daily_pnl()
+                    if self.zigzag_timing_enabled:
+                        await self._handle_zigzag_timing_cycle()
+                        await asyncio.sleep(0.5)
+                        continue
                     if self.webhook_sl:
                         await self._poll_webhook_direction()
                     # Webhook slow/fast stop handling takes priority
