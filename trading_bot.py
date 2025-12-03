@@ -161,8 +161,10 @@ class TradingBot:
         self.ttl_equity = float(os.getenv("TTL_EQUITY_SEC", "60"))
         self.ttl_order_info = float(os.getenv("TTL_ORDER_INFO_SEC", "1.5"))
         self.pivot_debounce_ms = int(os.getenv("PIVOT_DEBOUNCE_MS", "150"))
+        self.zigzag_bbo_min_interval = float(os.getenv("ZIGZAG_BBO_MIN_INTERVAL_SEC", "1.0"))
         self._last_pivot_reload_ts: float = 0.0
         self._pivot_reload_in_progress: bool = False
+        self._zigzag_last_bbo_ts: float = 0.0
 
         # Trading state
         self.active_close_orders = []
@@ -366,6 +368,57 @@ class TradingBot:
             except Exception as exc:
                 self.logger.log(f"[ZIGZAG-TIMING] Cancel order {oid} failed: {exc}", "WARNING")
 
+    async def _fetch_ws_bbo(self) -> Optional[Tuple[Decimal, Decimal]]:
+        """
+        Try to fetch BBO from WS-backed helper if exchange client provides one.
+        Expected method names: get_ws_bbo / get_cached_bbo / get_orderbook_bbo.
+        """
+        # Direct read from ws_manager best_bid/best_ask if present
+        ws_mgr = getattr(self.exchange_client, "ws_manager", None)
+        if ws_mgr:
+            try:
+                bid_val = getattr(ws_mgr, "best_bid", None)
+                ask_val = getattr(ws_mgr, "best_ask", None)
+                if bid_val is not None and ask_val is not None:
+                    bid_d = Decimal(str(bid_val))
+                    ask_d = Decimal(str(ask_val))
+                    if bid_d > 0 and ask_d > 0 and bid_d < ask_d:
+                        return bid_d, ask_d
+            except Exception:
+                pass
+
+        candidates = ["get_ws_bbo", "get_cached_bbo", "get_orderbook_bbo"]
+        for name in candidates:
+            fn = getattr(self.exchange_client, name, None)
+            if not callable(fn):
+                continue
+            try:
+                res = fn(self.config.contract_id)
+                if asyncio.iscoroutine(res):
+                    res = await res
+            except TypeError:
+                try:
+                    res = fn()
+                    if asyncio.iscoroutine(res):
+                        res = await res
+                except Exception as e:
+                    self.logger.log(f"[WS] {name} call failed: {e}", "WARNING")
+                    continue
+            except Exception as e:
+                self.logger.log(f"[WS] {name} call failed: {e}", "WARNING")
+                continue
+            if not res or (isinstance(res, (list, tuple)) and len(res) < 2):
+                continue
+            try:
+                bid, ask = res if isinstance(res, (list, tuple)) else (res[0], res[1])  # type: ignore
+                bid_d = Decimal(str(bid))
+                ask_d = Decimal(str(ask))
+                if bid_d > 0 and ask_d > 0:
+                    return bid_d, ask_d
+            except Exception:
+                continue
+        return None
+
     async def _get_bbo_cached(self, force: bool = False) -> Tuple[Decimal, Decimal]:
         key = f"bbo:{self.config.contract_id}"
         async def fetch_bbo():
@@ -386,6 +439,11 @@ class TradingBot:
                 if self.cache.debug:
                     self.logger.log("[CACHE] BBO timeout→no-cache", "DEBUG")
                 raise
+        # Prefer WS snapshot if available (unless force forces REST refresh)
+        if not force:
+            ws_bbo = await self._fetch_ws_bbo()
+            if ws_bbo:
+                return ws_bbo
         return await self.cache.get(
             key,
             self.ttl_bbo,
@@ -393,10 +451,86 @@ class TradingBot:
             force=False
         )
 
+    async def _get_bbo_for_zigzag(self, force: bool = False) -> Tuple[Decimal, Decimal]:
+        """
+        Throttled BBO for zigzag mode: honor a min interval when idle; force refresh when in/pending position.
+        """
+        now = time.time()
+        key = f"bbo:{self.config.contract_id}"
+        if (not force) and (now - self._zigzag_last_bbo_ts < self.zigzag_bbo_min_interval):
+            cached = self.cache.peek(key, self.ttl_bbo_cache)
+            if cached:
+                return cached
+        prices = await self._get_bbo_cached(force=force)
+        self._zigzag_last_bbo_ts = time.time()
+        return prices
+
+    async def _get_ws_last_price(self) -> Optional[Decimal]:
+        """
+        Try to fetch last price from WS-backed helpers before REST.
+        Expected method names: get_ws_last_price / get_cached_last_price / get_ws_ticker.
+        """
+        candidates = ["get_ws_last_price", "get_cached_last_price", "get_ws_ticker"]
+
+        def _normalize_price(val: Any) -> Optional[Decimal]:
+            if val is None:
+                return None
+            if isinstance(val, dict):
+                for k in ("last", "last_price", "price", "mark_price", "index_price", "close"):
+                    if k in val:
+                        val = val[k]
+                        break
+            if isinstance(val, (list, tuple)) and val:
+                val = val[0]
+            try:
+                return Decimal(str(val))
+            except Exception:
+                return None
+
+        for name in candidates:
+            fn = getattr(self.exchange_client, name, None)
+            if not callable(fn):
+                continue
+            try:
+                res = fn(self.config.contract_id)
+                if asyncio.iscoroutine(res):
+                    res = await res
+            except TypeError:
+                try:
+                    res = fn()
+                    if asyncio.iscoroutine(res):
+                        res = await res
+                except Exception as e:
+                    self.logger.log(f"[WS] {name} call failed: {e}", "WARNING")
+                    continue
+            except Exception as e:
+                self.logger.log(f"[WS] {name} call failed: {e}", "WARNING")
+                continue
+            price = _normalize_price(res)
+            if price is not None and price > 0:
+                return price
+        # Fallback: derive mid from ws_manager best bid/ask if available
+        ws_mgr = getattr(self.exchange_client, "ws_manager", None)
+        if ws_mgr:
+            try:
+                bid_val = getattr(ws_mgr, "best_bid", None)
+                ask_val = getattr(ws_mgr, "best_ask", None)
+                if bid_val is not None and ask_val is not None:
+                    bid_d = Decimal(str(bid_val))
+                    ask_d = Decimal(str(ask_val))
+                    if bid_d > 0 and ask_d > 0 and bid_d < ask_d:
+                        return (bid_d + ask_d) / 2
+            except Exception:
+                pass
+        return None
+
     async def _get_last_trade_price_cached(self, best_bid: Optional[Decimal] = None, best_ask: Optional[Decimal] = None, force: bool = False) -> Optional[Decimal]:
         key = f"last_price:{self.config.contract_id}"
 
         async def _fetch():
+            ws_last = await self._get_ws_last_price()
+            if ws_last is not None:
+                return ws_last
             # Prefer given bid/ask if provided
             if best_bid is not None and best_ask is not None:
                 try:
@@ -787,10 +921,11 @@ class TradingBot:
     async def _handle_zigzag_timing_cycle(self):
         """Main loop for zigzag_timing mode."""
         await self._sync_external_pivots()
-        best_bid, best_ask = await self._get_bbo_cached(force=True)
+        need_force_bbo = bool(self.pending_entry or self.direction_lock)
+        best_bid, best_ask = await self._get_bbo_for_zigzag(force=need_force_bbo)
         if best_bid <= 0 or best_ask <= 0 or best_bid >= best_ask:
             raise ValueError("No bid/ask data available")
-        trade_price = await self._get_last_trade_price_cached(best_bid, best_ask, force=True)
+        trade_price = await self._get_last_trade_price_cached(best_bid, best_ask, force=False)
         await self._sync_direction_lock()
 
         # Stop check (use best bid/ask)
