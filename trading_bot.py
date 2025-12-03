@@ -688,15 +688,21 @@ class TradingBot:
 
     async def _flatten_opposite(self, new_direction: str, best_bid: Decimal, best_ask: Decimal) -> bool:
         """Ensure opposite side positions/orders are cleared before entering new direction."""
+        # Cancel orders that would increase exposure against the new direction
         opposite_side = "sell" if new_direction == "buy" else "buy"
         await self._cancel_orders_by_side(opposite_side)
+
         pos_signed = await self._get_position_signed_cached(force=True)
         if (pos_signed > 0 and new_direction == "buy") or (pos_signed < 0 and new_direction == "sell"):
             return True  # already aligned
+
         pos_abs = abs(pos_signed)
         if pos_abs <= (self.min_order_size or Decimal("0")):
             return True
-        _, remaining = await self._post_only_exit_batch(opposite_side, pos_abs, best_bid, best_ask, wait_sec=5.0)
+
+        # Use the correct close side based on current position sign to avoid opening on the wrong side
+        close_side = "sell" if pos_signed > 0 else "buy"
+        _, remaining = await self._post_only_exit_batch(close_side, pos_abs, best_bid, best_ask, wait_sec=5.0)
         return remaining <= (self.min_order_size or Decimal("0"))
 
     async def _execute_zigzag_stop(self, close_side: str, best_bid: Decimal, best_ask: Decimal):
@@ -822,6 +828,36 @@ class TradingBot:
             lambda: self.exchange_client.get_account_positions(),
             force=force
         )
+
+    async def _get_position_detail_prefer_ws(self) -> Optional[Tuple[Decimal, Decimal]]:
+        """
+        Prefer WS-sourced position detail if available; REST get_position_detail only when WS is unavailable.
+        Returns (signed_position, avg_price) or None if unavailable.
+        """
+        ws_candidates = [
+            "get_position_detail_ws",
+            "get_ws_position_detail",
+            "get_position_detail_from_ws",
+        ]
+        for name in ws_candidates:
+            fn = getattr(self.exchange_client, name, None)
+            if callable(fn):
+                try:
+                    res = await fn()
+                    if res and isinstance(res, (list, tuple)) and len(res) == 2:
+                        pos_val, avg_val = res
+                        return Decimal(pos_val), Decimal(avg_val)
+                except Exception as e:
+                    self.logger.log(f"[RISK] WS position detail {name} failed: {e}", "WARNING")
+                    break  # WS path failed; allow REST fallback
+
+        if hasattr(self.exchange_client, "get_position_detail"):
+            try:
+                pos_signed_detail, avg_price_detail = await self.exchange_client.get_position_detail()
+                return Decimal(pos_signed_detail), Decimal(avg_price_detail)
+            except Exception as e:
+                self.logger.log(f"[RISK] get_position_detail failed: {e}", "WARNING")
+        return None
 
     def _order_ws_available(self) -> bool:
         return bool(getattr(self.exchange_client, "ws_manager", None)) or bool(getattr(self.exchange_client, "order_ws_enabled", False))
@@ -1772,44 +1808,43 @@ class TradingBot:
             # Need avg entry price; fallback: mid_price
             avg_price = mid_price
             stop_price = self.dynamic_stop_price if (self.enable_dynamic_sl and self.dynamic_stop_price) else None
-            if hasattr(self.exchange_client, "get_position_detail"):
-                try:
-                    pos_signed_detail, avg_price_detail = await self.exchange_client.get_position_detail()
-                    if pos_signed_detail != 0:
-                        avg_price = avg_price_detail
-                except Exception as e:
-                    self.logger.log(f"[RISK] get_position_detail failed: {e}", "WARNING")
+            pos_detail = await self._get_position_detail_prefer_ws()
+            if pos_detail:
+                pos_signed_detail, avg_price_detail = pos_detail
+                if pos_signed_detail != 0:
+                    avg_price = avg_price_detail
 
             if stop_price and position_amt > 0:
                 if pos_signed > 0:
-                    potential_loss = (avg_price - stop_price) * position_amt
                     per_base_loss = (avg_price - stop_price)
                 else:
-                    potential_loss = (stop_price - avg_price) * position_amt
                     per_base_loss = (stop_price - avg_price)
-                if potential_loss < 0:
-                    potential_loss = Decimal(0)
+                if per_base_loss <= 0:
+                    return
                 equity = await self._get_equity_snapshot()
                 if equity is None:
                     return
                 max_loss = equity * (self.risk_pct / Decimal(100))
-                redundancy_u = max_loss - potential_loss
-                if redundancy_u < 0:
-                    redundancy_u = Decimal(0)
-                redundancy_base = redundancy_u / per_base_loss if per_base_loss > 0 else Decimal(0)
-                # 若冗余为 0 且持仓超额且超额 >= 最小下单量，则主动削减超额
-                excess = position_amt - redundancy_base
-                if redundancy_base <= 0 and excess >= self.min_order_size and position_amt > 0:
+                allowed_position = max_loss / per_base_loss
+                if allowed_position < 0:
+                    allowed_position = Decimal(0)
+                allowed_position = self._round_quantity(allowed_position)
+                excess = max(Decimal(0), position_amt - allowed_position)
+                tolerance = self.min_order_size or Decimal("0")
+                if excess >= tolerance and position_amt > 0:
                     try:
                         close_qty = excess
                         close_side = 'sell' if pos_signed > 0 else 'buy'
                         await self.exchange_client.reduce_only_close_with_retry(close_qty, close_side)
                         self.logger.log(f"[RISK] Reduced excess position {close_qty} to keep stop-loss exposure within limit", "WARNING")
+                        self._invalidate_position_cache()
                     except Exception as e:
                         self.logger.log(f"[RISK] Failed to trim excess position: {e}", "ERROR")
-                if redundancy_base < self.config.quantity:
+                headroom = allowed_position - position_amt
+                needed_headroom = self.config.quantity or Decimal(0)
+                if headroom < needed_headroom:
                     if not self.stop_new_orders and self.enable_notifications:
-                        await self.send_notification(f"[RISK] Stop new orders after SL update: redundancy {redundancy_base} < qty {self.config.quantity}")
+                        await self.send_notification(f"[RISK] Stop new orders after SL update: headroom {headroom} < qty {self.config.quantity}")
                     self._set_stop_new_orders(True)
                     if self.redundancy_insufficient_since is None:
                         self.redundancy_insufficient_since = time.time()
@@ -2341,13 +2376,11 @@ class TradingBot:
                 if self.enable_advanced_risk and self.stop_loss_enabled and equity is not None:
                     # Redundancy calculation for stop-new-orders gating
                     avg_price = mid_price
-                    if hasattr(self.exchange_client, "get_position_detail"):
-                        try:
-                            pos_signed_detail, avg_price_detail = await self.exchange_client.get_position_detail()
-                            if pos_signed_detail != 0:
-                                avg_price = avg_price_detail
-                        except Exception as e:
-                            self.logger.log(f"[RISK] get_position_detail failed: {e}", "WARNING")
+                    pos_detail = await self._get_position_detail_prefer_ws()
+                    if pos_detail:
+                        pos_signed_detail, avg_price_detail = pos_detail
+                        if pos_signed_detail != 0:
+                            avg_price = avg_price_detail
 
                 stop_price = self.dynamic_stop_price if (self.enable_dynamic_sl and self.dynamic_stop_price) else None
                 if self.enable_advanced_risk and self.stop_loss_enabled and stop_price and position_amt > 0:
