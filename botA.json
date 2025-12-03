@@ -19,15 +19,15 @@
 
   "risk": {
     "advanced": {
-      "enable": false,                      # 进阶风险：冗余/SL/ZigZag/自动反手
-      "enable_stop_loss": false,            # 止损总开关（关闭则仅记录 ZigZag，不止损/冗余/自动反手）
+      "enable": true,                      # 进阶风险：冗余/SL/ZigZag/自动反手
+      "enable_stop_loss": true,            # 止损总开关（关闭则仅记录 ZigZag，不止损/冗余/自动反手）
       "risk_pct": 2.0,                     # 风险敞口百分比
       "release_timeout_minutes": 10,       # 冗余不足持续 N 分钟后释放
       "stop_new_orders_equity_threshold": 30, # 低于该 equity 停新并缓步平仓退出
       "zigzag": {
-        "enable_zigzag": false,             # 是否启用 ZigZag 判向
-        "enable_auto_reverse": false,       # 是否自动反手
-        "auto_reverse_fast": false,         # true=破位立即反手；false=等待下一确认点
+        "enable_zigzag": true,             # 是否启用 ZigZag 判向
+        "enable_auto_reverse": true,       # 是否自动反手
+        "auto_reverse_fast": true,         # true=破位立即反手；false=等待下一确认点
         "zigzag_depth": 15,
         "zigzag_deviation": 5,             # ZigZag 偏离（%）
         "zigzag_backstep": 2,              # ZigZag backstep
@@ -38,12 +38,12 @@
       }
     },
     "basic": {
-      "enable": true,                       # 基础风险：最大持仓/基础释放（与进阶风险建议二选一）
+      "enable": false,                       # 基础风险：最大持仓/基础释放（与进阶风险建议二选一）
       "max_position_count": 50,             # 最大持仓 = quantity * max_position_count
       "basic_release_timeout_minutes": 10,   # 满仓持续 N 分钟后释放
-      "webhook_sl": true,                  # TradingView buy/sell 基础风控是否触发止损
-      "webhook_sl_fast": true,              # true=立即全平并撤单；false=停新+撤单，按节奏慢慢平
-      "webhook_reverse": true              # 止损完成后是否自动反向开仓
+      "webhook_sl": false,                  # TradingView buy/sell 基础风控是否触发止损
+      "webhook_sl_fast": false,              # true=立即全平并撤单；false=停新+撤单，按节奏慢慢平
+      "webhook_reverse": false              # 止损完成后是否自动反向开仓
     }
   },
 
