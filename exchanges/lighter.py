@@ -964,15 +964,40 @@ class LighterClient(BaseExchangeClient):
                 await self._handle_rate_limit_backoff()
             raise
 
+    def _signed_position_from_record(self, position) -> Decimal:
+        """Derive signed position using side/is_long hints when position.position is absolute."""
+        raw_pos = getattr(position, "position", 0)
+        try:
+            pos_val = Decimal(raw_pos)
+        except Exception:
+            try:
+                pos_val = Decimal(str(raw_pos))
+            except Exception:
+                pos_val = Decimal(0)
+        sign_hint = None
+        side_attr = getattr(position, "side", None) or getattr(position, "position_side", None)
+        if isinstance(side_attr, str):
+            side_l = side_attr.lower()
+            if side_l in ("ask", "sell", "short"):
+                sign_hint = -1
+            elif side_l in ("bid", "buy", "long"):
+                sign_hint = 1
+        if sign_hint is None:
+            is_long = getattr(position, "is_long", None)
+            if is_long is not None:
+                sign_hint = 1 if is_long else -1
+        if sign_hint is None:
+            return pos_val
+        return abs(pos_val) * (1 if sign_hint > 0 else -1)
+
     async def get_account_positions(self) -> Decimal:
         """Get account positions using official SDK."""
-        # Get account info which includes positions
         positions = await self._fetch_positions_with_retry()
 
         # Find position for current market
         for position in positions:
             if position.market_id == self.config.contract_id:
-                return Decimal(position.position)
+                return self._signed_position_from_record(position)
 
         return Decimal(0)
 
@@ -981,7 +1006,7 @@ class LighterClient(BaseExchangeClient):
         positions = await self._fetch_positions_with_retry()
         for position in positions:
             if position.market_id == self.config.contract_id:
-                size = Decimal(position.position)
+                size = self._signed_position_from_record(position)
                 avg_raw = getattr(position, "avg_entry_price", None)
                 if avg_raw is None and hasattr(position, "avg_price"):
                     avg_raw = position.avg_price
