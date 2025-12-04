@@ -975,8 +975,22 @@ class LighterClient(BaseExchangeClient):
             except Exception:
                 pos_val = Decimal(0)
         sign_hint = None
+        # Prefer explicit sign if provided (account_data.accounts[].positions[].sign)
+        sign_attr = getattr(position, "sign", None)
+        if sign_attr is None and hasattr(position, "to_dict"):
+            try:
+                sign_attr = position.to_dict().get("sign")
+            except Exception:
+                sign_attr = None
+        if sign_attr is not None:
+            try:
+                sign_val = int(sign_attr)
+                if sign_val != 0:
+                    sign_hint = 1 if sign_val > 0 else -1
+            except Exception:
+                pass
         side_attr = getattr(position, "side", None) or getattr(position, "position_side", None)
-        if isinstance(side_attr, str):
+        if isinstance(side_attr, str) and sign_hint is None:
             side_l = side_attr.lower()
             if side_l in ("ask", "sell", "short"):
                 sign_hint = -1
