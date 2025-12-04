@@ -93,6 +93,7 @@ class TradingConfig:
     zigzag_pivot_file: Optional[str] = None
     webhook_basic_direction_file: Optional[str] = None
     max_fast_close_qty: Optional[Decimal] = None
+    break_buffer_ticks: Decimal = Decimal("10")
 
     @property
     def close_order_side(self) -> str:
@@ -194,7 +195,7 @@ class TradingBot:
         self.stop_loss_triggered = False
         self.dynamic_stop_price: Optional[Decimal] = None
         self.dynamic_stop_direction: Optional[str] = None
-        self.current_direction: Optional[str] = self.config.direction.lower()
+        self.current_direction: Optional[str] = self.config.direction.lower() if self.config.direction else None
         self.reversing = False
         self.last_confirmed_low: Optional[Decimal] = None
         self.last_confirmed_high: Optional[Decimal] = None
@@ -217,6 +218,11 @@ class TradingBot:
         self._position_cache: Optional[Decimal] = None
         self._position_cache_ts: float = 0.0
         self._position_cache_ttl: float = 100.0  # seconds
+        # Residual position handling (tiny < min_order_size)
+        self._residual_last_dir: Optional[str] = None
+        self._residual_last_qty: Optional[Decimal] = None
+        self._residual_last_ts: float = 0.0
+        self._residual_last_fail: bool = False
         # 动态 SL 无单独开关：开启止损即开启动态 SL
         self.enable_dynamic_sl = self.stop_loss_enabled
         self.enable_zigzag = str(os.getenv('ENABLE_ZIGZAG', 'true')).lower() == 'true'
@@ -231,7 +237,7 @@ class TradingBot:
         self.enable_notifications = str(os.getenv('ENABLE_NOTIFICATIONS', 'false')).lower() == 'true'
         self.daily_pnl_report = str(os.getenv('DAILY_PNL_REPORT', 'false')).lower() == 'true'
         self.current_sl_order_id: Optional[Decimal] = None
-        self.break_buffer_ticks = Decimal(os.getenv('ZIGZAG_BREAK_BUFFER_TICKS', '10'))
+        self.break_buffer_ticks = Decimal(self.config.break_buffer_ticks)
         self.zigzag_timeframe = os.getenv('ZIGZAG_TIMEFRAME', '1m')
         self.zigzag_timeframe_sec = self._parse_timeframe_to_seconds(self.zigzag_timeframe)
         self.zigzag_timeframe_key = self._normalize_timeframe_key(self.zigzag_timeframe)
@@ -354,6 +360,24 @@ class TradingBot:
             keys = [k for k in self.cache.keys() if k.startswith("order_info:")]
             if keys:
                 self.cache.invalidate(*keys)
+
+    def _set_direction_all(self, direction: Optional[str], lock: bool = True) -> bool:
+        """
+        Set config/current/lock consistently.
+        Returns True if any value changed.
+        """
+        dir_val = direction.lower() if isinstance(direction, str) else None
+        changed = False
+        if self.config.direction != dir_val:
+            self.config.direction = dir_val
+            changed = True
+        if self.current_direction != dir_val:
+            self.current_direction = dir_val
+            changed = True
+        if lock and self.direction_lock != dir_val:
+            self.direction_lock = dir_val
+            changed = True
+        return changed
 
     def _price_breaches_stop(self, stop_price: Optional[Decimal], direction: str, price: Decimal) -> bool:
         """Return True if an order price is beyond the allowed stop boundary."""
@@ -1029,12 +1053,11 @@ class TradingBot:
         if pos_abs > 0:
             await self._post_only_exit_batch(close_side, pos_abs, best_bid, best_ask, wait_sec=5.0)
             await self._notify_zigzag_trade("exit", close_side, pos_abs, ref_price, note="stop-hit")
-        self.direction_lock = None
+        self._set_direction_all(None)
         self.pending_entry = None
         self.zigzag_stop_price = None
         self.zigzag_entry_price = None
         self.dynamic_stop_price = None
-        self.current_direction = None
 
     async def _process_pending_zigzag_entry(self, best_bid: Decimal, best_ask: Decimal):
         """Process pending zigzag entry: flatten opposite, compute qty, place batch post-only."""
@@ -1071,13 +1094,11 @@ class TradingBot:
             if filled > 0:
                 self._invalidate_position_cache()
         if current_dir_qty >= (target_qty - (self.min_order_size or Decimal("0"))):
-            self.direction_lock = direction
+            self._set_direction_all(direction)
             self.pending_entry = None
             self.zigzag_stop_price = stop_price
             self.zigzag_entry_price = anchor_price
             self.dynamic_stop_price = stop_price
-            self.current_direction = direction
-            self.config.direction = direction
             await self._place_zigzag_tp(direction, current_dir_qty, anchor_price, stop_price)
             await self._notify_zigzag_trade("entry", direction, current_dir_qty, anchor_price)
         else:
@@ -1086,7 +1107,7 @@ class TradingBot:
                 "INFO",
             )
 
-    async def _sync_direction_lock(self):
+    async def _sync_direction_lock(self) -> Decimal:
         """Keep direction_lock in sync with actual position."""
         pos_signed = await self._get_position_signed_cached(force=True)
         if pos_signed > 0:
@@ -1098,7 +1119,102 @@ class TradingBot:
                 self.direction_lock = None
                 self.zigzag_stop_price = None
                 self.dynamic_stop_price = None
+                self.dynamic_stop_direction = None
                 await self._cancel_zigzag_tp()
+        return pos_signed
+
+    async def _realign_direction_state(self, trade_price: Optional[Decimal], pos_signed: Optional[Decimal] = None, reason: Optional[str] = None):
+        """
+        Align direction/config with actual position and breakout context.
+        - When holding a position, trust the signed position to set direction.
+        - When flat, follow breakout of confirmed pivots to reset direction.
+        """
+        if pos_signed is None:
+            pos_signed = await self._get_position_signed_cached(force=True)
+        pos_abs = abs(pos_signed)
+        tolerance = self.min_order_size or Decimal("0")
+        buffer = self.break_buffer_ticks * self.config.tick_size
+
+        # Tiny residual position: try to flatten via reduce-only market, without locking direction
+        if tolerance > 0 and pos_abs > 0 and pos_abs < tolerance:
+            dir_hint = "buy" if pos_signed > 0 else "sell"
+            now = time.time()
+            same_residual = (
+                self._residual_last_dir == dir_hint
+                and self._residual_last_qty is not None
+                and abs(self._residual_last_qty - pos_abs) < (tolerance / Decimal(1000))
+                and (now - self._residual_last_ts) < 30
+                and self._residual_last_fail
+            )
+            if same_residual:
+                self.logger.log(
+                    f"[ZIGZAG-TIMING] Residual pos {pos_abs} {dir_hint} < min {tolerance}; skip repeat close attempt (cooldown)",
+                    "DEBUG",
+                )
+                return
+            self.logger.log(
+                f"[ZIGZAG-TIMING] Residual pos {pos_abs} {dir_hint} < min {tolerance}; sending reduce-only market close",
+                "INFO",
+            )
+            try:
+                success = await self._close_residual_position_market(pos_signed)
+            except Exception as exc:
+                self._residual_last_fail = True
+                self.logger.log(f"[ZIGZAG-TIMING] Residual close failed: {exc}", "WARNING")
+            else:
+                self._residual_last_fail = not success
+            self._residual_last_dir = dir_hint
+            self._residual_last_qty = pos_abs
+            self._residual_last_ts = now
+            return
+
+        if pos_abs > tolerance:
+            actual_dir = "buy" if pos_signed > 0 else "sell"
+            changed = self._set_direction_all(actual_dir)
+            if self.pending_entry and self.pending_entry == actual_dir:
+                self.pending_entry = None
+                changed = True
+            if changed:
+                self.logger.log(f"[ZIGZAG-TIMING] Direction realigned to {actual_dir.upper()} based on position {pos_signed}", "INFO")
+            needs_stop_refresh = changed or (self.dynamic_stop_price is None)
+            if self.dynamic_stop_direction and self.dynamic_stop_direction != actual_dir:
+                self.dynamic_stop_price = None
+                self.dynamic_stop_direction = None
+                needs_stop_refresh = True
+            # Ensure stop tracking matches the real direction
+            if self.enable_dynamic_sl and needs_stop_refresh:
+                await self._refresh_stop_loss(force=True)
+            return
+
+        # Flat: allow breakout to reset intended direction (without entering yet)
+        self._set_direction_all(None)
+        self.dynamic_stop_price = None
+        self.dynamic_stop_direction = None
+        if (not self.pending_entry) and trade_price is not None:
+            new_dir = None
+            if self.last_confirmed_high is not None and trade_price >= (self.last_confirmed_high + buffer):
+                new_dir = "buy"
+            elif self.last_confirmed_low is not None and trade_price <= (self.last_confirmed_low - buffer):
+                new_dir = "sell"
+            if new_dir and new_dir != self.config.direction:
+                self._set_direction_all(new_dir, lock=False)
+                self.logger.log(f"[ZIGZAG-TIMING] Flat breakout sets direction to {new_dir.upper()}", "INFO")
+
+    async def _close_residual_position_market(self, pos_signed: Decimal) -> bool:
+        """Close tiny residual position with reduce-only market path."""
+        pos_abs = abs(pos_signed)
+        if pos_abs <= 0:
+            return True
+        close_side = "sell" if pos_signed > 0 else "buy"
+        try:
+            await self.exchange_client.reduce_only_close_with_retry(pos_abs, close_side)
+            return True
+        except Exception:
+            # Fallback to market close if reduce-only helper fails
+            if hasattr(self.exchange_client, "place_market_order"):
+                await self.exchange_client.place_market_order(self.config.contract_id, pos_abs, close_side)
+                return True
+            raise
 
     async def _handle_zigzag_timing_cycle(self):
         """Main loop for zigzag_timing mode."""
@@ -1108,7 +1224,8 @@ class TradingBot:
         if best_bid <= 0 or best_ask <= 0 or best_bid >= best_ask:
             raise ValueError("No bid/ask data available")
         trade_price = await self._get_last_trade_price_cached(best_bid, best_ask, force=False)
-        await self._sync_direction_lock()
+        pos_signed = await self._sync_direction_lock()
+        await self._realign_direction_state(trade_price, pos_signed, reason="loop")
 
         # Stop check (use best bid/ask)
         active_stop = self.dynamic_stop_price if (self.enable_dynamic_sl and self.dynamic_stop_price is not None) else self.zigzag_stop_price
@@ -1765,9 +1882,9 @@ class TradingBot:
         self.recent_pivots.append(pivot)
 
     def _compute_dynamic_stop(self, direction: str) -> Optional[Decimal]:
-        """Compute dynamic stop based on confirmed pivots and tick buffer (10 ticks)."""
+        """Compute dynamic stop based on confirmed pivots and configurable tick buffer."""
         tick = self.config.tick_size
-        buffer_ticks = Decimal("10") * tick
+        buffer_ticks = self.break_buffer_ticks * tick
         if direction == "buy" and self.last_confirmed_low is not None:
             return self.last_confirmed_low - buffer_ticks
         if direction == "sell" and self.last_confirmed_high is not None:
@@ -2005,8 +2122,7 @@ class TradingBot:
         latest = max(candidates, key=lambda p: p.close_time)
         desired_dir = "buy" if latest.label == "HH" else "sell"
         if desired_dir != self.config.direction:
-            self.config.direction = desired_dir
-            self.current_direction = desired_dir
+            self._set_direction_all(desired_dir, lock=False)
             self.logger.log(f"[INIT] Direction set to {desired_dir.upper()} via pivot {latest.label} at {latest.close_time}", "INFO")
 
     async def _initialize_pivots_from_store(self):
@@ -2027,8 +2143,7 @@ class TradingBot:
         direction, stop_entry = self._determine_initial_direction_and_stop(entries)
         if direction and self.enable_advanced_risk and self.stop_loss_enabled and self.enable_zigzag:
             if direction != self.config.direction:
-                self.config.direction = direction
-                self.current_direction = direction
+                self._set_direction_all(direction, lock=False)
                 self.logger.log(f"[INIT] Direction set to {direction.upper()} via recent pivots (fast init)", "INFO")
             if stop_entry:
                 key = (stop_entry["close_time"].isoformat(), stop_entry["label"])
@@ -2292,8 +2407,7 @@ class TradingBot:
                 pass
 
         # Update direction and reset timers
-        self.config.direction = new_direction
-        self.current_direction = new_direction
+        self._set_direction_all(new_direction)
         self.dynamic_stop_price = None
         self.dynamic_stop_direction = None
         self.last_open_order_time = 0
@@ -2381,7 +2495,8 @@ class TradingBot:
         pos_abs = abs(pos_signed)
         if pos_abs == 0:
             if self.pending_reverse_direction:
-                self.config.direction = self.pending_reverse_direction
+                self._set_direction_all(self.pending_reverse_direction, lock=False)
+                self.direction_lock = None
                 self.pending_reverse_direction = None
                 self.pending_reverse_state = None
                 self.pending_original_direction = None
@@ -2476,7 +2591,8 @@ class TradingBot:
         """Handle the result of an order placement."""
         order_id = order_result.order_id
         filled_price = order_result.price
-        self.config.direction = self.config.direction.lower()
+        if self.config.direction:
+            self._set_direction_all(self.config.direction, lock=False)
 
         if self.order_filled_event.is_set() or order_result.status == 'FILLED':
             if self.config.boost_mode:
@@ -2961,8 +3077,7 @@ class TradingBot:
         # Position flat: finalize stop/reverse
         await self._cancel_all_orders_safely()
         if self.webhook_reverse_pending and self.webhook_target_direction:
-            self.config.direction = self.webhook_target_direction
-            self.current_direction = self.config.direction
+            self._set_direction_all(self.webhook_target_direction)
             self.webhook_reverse_pending = False
             self.webhook_block_trading = False
             self.webhook_stop_mode = None
@@ -3171,7 +3286,8 @@ class TradingBot:
         """Notify current direction once (used at startup)."""
         if not self.enable_notifications:
             return
-        await self.send_notification(f"{prefix} Current direction {self.config.direction.upper()}")
+        dir_val = self.config.direction.upper() if self.config.direction else "NONE"
+        await self.send_notification(f"{prefix} Current direction {dir_val}")
 
     async def run(self):
         """Main trading loop."""
@@ -3190,7 +3306,8 @@ class TradingBot:
                 await self._initialize_pivots_from_store()
                 await self._backfill_recent_pivot_prices()
             if self.zigzag_timing_enabled:
-                await self._sync_direction_lock()
+                pos_signed = await self._sync_direction_lock()
+                await self._realign_direction_state(trade_price=None, pos_signed=pos_signed, reason="startup_sync")
 
             # Log current TradingConfig
             self.logger.log("=== Trading Configuration ===", "INFO")
