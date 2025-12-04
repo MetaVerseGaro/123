@@ -1294,6 +1294,9 @@ class TradingBot:
         self._set_direction_all(None)
         self.dynamic_stop_price = None
         self.dynamic_stop_direction = None
+        if self.zigzag_timing_enabled and not self.webhook_stop_mode:
+            self._set_stop_new_orders(False)
+            self.redundancy_insufficient_since = None
         if (not self.pending_entry) and trade_price is not None:
             new_dir = None
             if self.last_confirmed_high is not None and trade_price >= (self.last_confirmed_high + buffer):
