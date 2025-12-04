@@ -230,6 +230,9 @@ class TradingBot:
         # ZigZag timing mode state
         self.direction_lock: Optional[str] = None
         self.pending_entry: Optional[str] = None
+        self.pending_break_price: Optional[Decimal] = None
+        self.pending_entry_static_mode: bool = False
+        self._pending_entry_order_ids: List[str] = []
         self.zigzag_stop_price: Optional[Decimal] = None
         self.zigzag_entry_price: Optional[Decimal] = None
         self.zigzag_tp_order_id: Optional[str] = None
@@ -754,10 +757,22 @@ class TradingBot:
             )
             if not needs_fast:
                 ttl = max(self.ttl_active_orders_idle, self.ttl_active_orders)
+        async def _fetch_active_orders():
+            try:
+                val = await self.exchange_client.get_active_orders(self.config.contract_id)
+            except Exception as exc:
+                self.logger.log(f"[ORDERS] get_active_orders failed: {exc}", "WARNING")
+                return []
+            if val is None:
+                return []
+            try:
+                return list(val)
+            except Exception:
+                return []
         return await self.cache.get(
             key,
             ttl,
-            lambda: self.exchange_client.get_active_orders(self.config.contract_id)
+            _fetch_active_orders
         )
 
     async def _get_directional_position(self, direction: str, force: bool = False) -> Decimal:
@@ -771,6 +786,8 @@ class TradingBot:
         """Cancel all active orders of a given side."""
         try:
             active_orders = await self._get_active_orders_cached()
+            if not active_orders:
+                return
             targets = [o for o in active_orders if getattr(o, "side", "").lower() == side.lower()]
             for order in targets:
                 try:
@@ -1061,9 +1078,68 @@ class TradingBot:
             await self._notify_zigzag_trade("exit", close_side, pos_abs, ref_price, note="stop-hit")
         self._set_direction_all(None)
         self.pending_entry = None
+        self.pending_break_price = None
+        self.pending_entry_static_mode = False
+        await self._cancel_pending_entry_orders()
         self.zigzag_stop_price = None
         self.zigzag_entry_price = None
         self.dynamic_stop_price = None
+
+    async def _cancel_pending_entry_orders(self):
+        """Cancel tracked pending entry orders."""
+        if not self._pending_entry_order_ids:
+            return
+        await self._cancel_order_ids(self._pending_entry_order_ids)
+        self._pending_entry_order_ids = []
+
+    async def _clear_pending_entry_state(self, clear_direction: bool = False):
+        """Clear pending entry flags and optionally reset direction/stop state."""
+        await self._cancel_pending_entry_orders()
+        if clear_direction:
+            self._set_direction_all(None, lock=True)
+            self.zigzag_stop_price = None
+            self.zigzag_entry_price = None
+            self.dynamic_stop_price = None
+        self.pending_entry = None
+        self.pending_break_price = None
+        self.pending_entry_static_mode = False
+        self._set_stop_new_orders(False)
+
+    async def _place_static_entry_orders(self, direction: str, break_price: Decimal, quantity: Decimal) -> List[str]:
+        """Place static post-only entry orders anchored at break_price without chasing."""
+        await self._cancel_pending_entry_orders()
+        if quantity <= 0:
+            return []
+        max_per = self.max_fast_close_qty if self.max_fast_close_qty > 0 else quantity
+        num_orders = int((quantity / max_per).to_integral_value(rounding=ROUND_HALF_UP))
+        if num_orders * max_per < quantity:
+            num_orders += 1
+        prices = self._build_price_ladder(direction, break_price, max(num_orders, 1))
+        remaining = quantity
+        placed: List[str] = []
+        for px in prices:
+            if remaining <= 0:
+                break
+            qty = min(max_per, remaining)
+            res = await self._place_post_only_limit(direction, qty, px, reduce_only=False)
+            if res and res.success:
+                placed.append(res.order_id)
+                remaining -= qty
+        self._pending_entry_order_ids = placed
+        return placed
+
+    async def _finalize_pending_entry(self, direction: str, filled_qty: Decimal, entry_price: Decimal, stop_price: Decimal):
+        """Finalize pending entry: set direction, stop, TP, clear state."""
+        await self._cancel_pending_entry_orders()
+        self._set_direction_all(direction)
+        self.pending_entry = None
+        self.pending_break_price = None
+        self.pending_entry_static_mode = False
+        self.zigzag_stop_price = stop_price
+        self.zigzag_entry_price = entry_price
+        self.dynamic_stop_price = stop_price
+        await self._place_zigzag_tp(direction, filled_qty, entry_price, stop_price)
+        await self._notify_zigzag_trade("entry", direction, filled_qty, entry_price)
 
     async def _process_pending_zigzag_entry(self, best_bid: Decimal, best_ask: Decimal):
         """Process pending zigzag entry: flatten opposite, compute qty, place batch post-only."""
@@ -1073,49 +1149,71 @@ class TradingBot:
             return
         direction = self.pending_entry
         buffer = self.break_buffer_ticks * self.config.tick_size
+        min_qty = self.min_order_size or Decimal("0")
         if direction == "buy":
-            if self.last_confirmed_low is None:
+            if self.last_confirmed_low is None or self.last_confirmed_high is None:
                 return
             stop_price = self.last_confirmed_low - buffer
+            break_price = self.pending_break_price or (self.last_confirmed_high + buffer)
             anchor_price = best_ask
+            threshold_price = break_price * Decimal("1.001")
         else:
-            if self.last_confirmed_high is None:
+            if self.last_confirmed_high is None or self.last_confirmed_low is None:
                 return
             stop_price = self.last_confirmed_high + buffer
+            break_price = self.pending_break_price or (self.last_confirmed_low - buffer)
             anchor_price = best_bid
+            threshold_price = break_price * Decimal("0.999")
         if anchor_price is None or anchor_price <= 0:
             return
         if self.zigzag_tp_order_id:
             await self._cancel_zigzag_tp()
+        overshoot = (direction == "buy" and anchor_price > threshold_price) or (direction == "sell" and anchor_price < threshold_price)
+
         ok = await self._flatten_opposite(direction, best_bid, best_ask)
         if not ok:
             return
-        target_qty = await self._calc_qty_by_risk_zigzag(anchor_price, stop_price)
+
+        current_dir_qty = await self._get_directional_position(direction, force=True)
+        target_entry_price = break_price if overshoot else anchor_price
+        target_qty = await self._calc_qty_by_risk_zigzag(target_entry_price, stop_price)
         if target_qty is None or target_qty <= 0:
             return
-        current_dir_qty = await self._get_directional_position(direction, force=True)
         remaining = max(Decimal(0), target_qty - current_dir_qty)
-        if remaining >= (self.min_order_size or Decimal("0")):
-            filled, current_dir_qty = await self._post_only_entry_batch(direction, remaining, best_bid, best_ask, wait_sec=20.0)
-            if filled > 0:
-                self._invalidate_position_cache()
-        if current_dir_qty >= (target_qty - (self.min_order_size or Decimal("0"))):
-            self._set_direction_all(direction)
-            self.pending_entry = None
-            self.zigzag_stop_price = stop_price
-            self.zigzag_entry_price = anchor_price
-            self.dynamic_stop_price = stop_price
-            await self._place_zigzag_tp(direction, current_dir_qty, anchor_price, stop_price)
-            await self._notify_zigzag_trade("entry", direction, current_dir_qty, anchor_price)
-        else:
-            self.logger.log(
-                f"[ZIGZAG-TIMING] Entry pending ({direction}) filled {current_dir_qty}/{target_qty}",
-                "INFO",
-            )
 
-    async def _sync_direction_lock(self) -> Decimal:
+        if not overshoot:
+            self.pending_entry_static_mode = False
+            if remaining >= min_qty:
+                filled, current_dir_qty = await self._post_only_entry_batch(direction, remaining, best_bid, best_ask, wait_sec=20.0)
+                if filled > 0:
+                    self._invalidate_position_cache()
+            if current_dir_qty >= max(min_qty, target_qty - min_qty):
+                await self._finalize_pending_entry(direction, current_dir_qty, anchor_price, stop_price)
+            else:
+                self.logger.log(
+                    f"[ZIGZAG-TIMING] Entry pending ({direction}) filled {current_dir_qty}/{target_qty}",
+                    "INFO",
+                )
+            return
+
+        # Overshoot后采用原破位价静态挂单，不追价
+        self.pending_entry_static_mode = True
+        if current_dir_qty >= min_qty and remaining <= min_qty:
+            await self._finalize_pending_entry(direction, current_dir_qty, break_price, stop_price)
+            return
+        if remaining < min_qty:
+            return
+        if not self._pending_entry_order_ids:
+            placed = await self._place_static_entry_orders(direction, break_price, remaining)
+            if placed:
+                self.logger.log(
+                    f"[ZIGZAG-TIMING] Static entry at break price {break_price} ({len(placed)} orders) remaining {remaining}",
+                    "INFO",
+                )
+
+    async def _sync_direction_lock(self, force: bool = False) -> Decimal:
         """Keep direction_lock in sync with actual position."""
-        pos_signed = await self._get_position_signed_cached(force=True)
+        pos_signed = await self._get_position_signed_cached(force=force)
         if pos_signed > 0:
             self.direction_lock = "buy"
         elif pos_signed < 0:
@@ -1256,6 +1354,15 @@ class TradingBot:
                 signal = None
             else:
                 self.pending_entry = signal
+                self.pending_entry_static_mode = False
+                await self._cancel_pending_entry_orders()
+                try:
+                    if signal == "buy" and self.last_confirmed_high is not None:
+                        self.pending_break_price = self.last_confirmed_high + buffer
+                    elif signal == "sell" and self.last_confirmed_low is not None:
+                        self.pending_break_price = self.last_confirmed_low - buffer
+                except Exception:
+                    self.pending_break_price = None
 
         if self.pending_entry:
             await self._process_pending_zigzag_entry(best_bid, best_ask)
@@ -1749,10 +1856,12 @@ class TradingBot:
                         self.logger.log(f"[PNL] get_account_pnl failed: {e}", "WARNING")
             if equity is None or self.daily_pnl_baseline is None:
                 with TelegramBot(telegram_token, telegram_chat_id) as tg_bot:
-                    tg_bot.send_text("[PNL] Daily PnL unavailable (missing equity data)")
+                    prefix = f"[{self.account_name}] " if self.account_name else ""
+                    tg_bot.send_text(f"{prefix}[PNL] Daily PnL unavailable (missing equity data)")
             else:
                 pnl = equity - self.daily_pnl_baseline
-                msg = f"[PNL] {current_date} Equity: {equity} | PnL: {pnl}"
+                prefix = f"[{self.account_name}] " if self.account_name else ""
+                msg = f"{prefix}[PNL] {current_date} Equity: {equity} | PnL: {pnl}"
                 with TelegramBot(telegram_token, telegram_chat_id) as tg_bot:
                     tg_bot.send_text(msg)
             self.last_daily_sent_date = current_date
@@ -1968,6 +2077,8 @@ class TradingBot:
                 await self._throttle_rest("candle", min_interval=1.0)
                 try:
                     candles = await self.exchange_client.fetch_history_candles(limit=300, timeframe=tf)
+                    if not candles:
+                        return None
                     for c in candles:
                         ts_val = self._get_candle_close_ts(c)
                         if ts_val is None:
@@ -2314,9 +2425,32 @@ class TradingBot:
         except Exception as e:
             self.logger.log(f"[RISK] redundancy check after SL update failed: {e}", "WARNING")
 
+    async def _handle_pending_entry_pivot(self, pivot: PivotPoint):
+        """Handle new HL/LH during pending entry: cancel or finalize partial fills."""
+        if not self.pending_entry:
+            return
+        need_cancel = (
+            (self.pending_entry == "buy" and pivot.label == "HL")
+            or (self.pending_entry == "sell" and pivot.label == "LH")
+        )
+        if not need_cancel:
+            return
+        min_qty = self.min_order_size or Decimal("0")
+        current_dir_qty = await self._get_directional_position(self.pending_entry, force=True)
+        await self._cancel_pending_entry_orders()
+        if current_dir_qty <= min_qty:
+            await self._clear_pending_entry_state(clear_direction=True)
+            return
+        stop_price = self._compute_dynamic_stop(self.pending_entry) or self.dynamic_stop_price or pivot.price
+        entry_price = self.pending_break_price or pivot.price
+        await self._finalize_pending_entry(self.pending_entry, current_dir_qty, entry_price, stop_price)
+        if self.enable_dynamic_sl:
+            await self._refresh_stop_loss(force=True)
+
     async def _handle_pivot_event(self, pivot: PivotPoint, notify: bool = True):
         """Handle external ZigZag pivot: update pivots, dynamic SL, and slow reverse follow-up."""
         self._update_confirmed_pivots(pivot)
+        await self._handle_pending_entry_pivot(pivot)
 
         if self.pending_reverse_state:
             handled = await self._process_slow_reverse_followup(pivot)
@@ -2980,6 +3114,8 @@ class TradingBot:
                 self.logger.log(f"[WEBHOOK] cancel_all_orders failed: {exc}", "WARNING")
         try:
             active_orders = await self._get_active_orders_cached()
+            if not active_orders:
+                return
             for order in active_orders:
                 try:
                     await self.exchange_client.cancel_order(order.order_id)
@@ -3312,7 +3448,7 @@ class TradingBot:
                 await self._initialize_pivots_from_store()
                 await self._backfill_recent_pivot_prices()
             if self.zigzag_timing_enabled:
-                pos_signed = await self._sync_direction_lock()
+                pos_signed = await self._sync_direction_lock(force=True)
                 await self._realign_direction_state(trade_price=None, pos_signed=pos_signed, reason="startup_sync")
 
             # Log current TradingConfig
