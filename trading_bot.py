@@ -929,9 +929,14 @@ class TradingBot:
         await self._cancel_zigzag_tp()
         tp_price = self._calc_tp_price_rr2(entry_price, stop_price, direction)
         if tp_price is None:
+            self.logger.log(f"[ZIGZAG-TIMING] Skip TP: tp_price None (entry={entry_price}, stop={stop_price}, dir={direction})", "INFO")
             return
         qty = self._round_quantity(filled_qty / Decimal(2))
         if self.min_order_size and qty < self.min_order_size:
+            self.logger.log(
+                f"[ZIGZAG-TIMING] Skip TP: qty {qty} < min_order_size {self.min_order_size} (filled={filled_qty})",
+                "INFO",
+            )
             return
         side = "sell" if direction == "buy" else "buy"
         res = await self._place_post_only_limit(side, qty, tp_price, reduce_only=True)
@@ -939,6 +944,7 @@ class TradingBot:
             self.zigzag_tp_order_id = res.order_id
             self.zigzag_tp_qty = qty
             self._invalidate_order_cache()
+            self.logger.log(f"[ZIGZAG-TIMING] TP placed {side.upper()} qty={qty} @ {tp_price} reduce-only", "INFO")
         else:
             self.logger.log(f"[ZIGZAG-TIMING] Place TP failed: {getattr(res, 'error_message', '')}", "WARNING")
 
