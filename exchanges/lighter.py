@@ -965,7 +965,7 @@ class LighterClient(BaseExchangeClient):
             raise
 
     def _signed_position_from_record(self, position) -> Decimal:
-        """Derive signed position using side/is_long hints when position.position is absolute."""
+        """Derive signed position using side/is_long hints when position.position may be absolute."""
         raw_pos = getattr(position, "position", 0)
         try:
             pos_val = Decimal(raw_pos)
@@ -984,8 +984,15 @@ class LighterClient(BaseExchangeClient):
                 sign_hint = 1
         if sign_hint is None:
             is_long = getattr(position, "is_long", None)
-            if is_long is not None:
-                sign_hint = 1 if is_long else -1
+            if isinstance(is_long, str):
+                is_long_val = is_long.strip().lower() in ("true", "1", "long", "buy")
+                sign_hint = 1 if is_long_val else -1
+            elif is_long is not None:
+                sign_hint = 1 if bool(is_long) else -1
+        if sign_hint is None:
+            is_short = getattr(position, "is_short", None)
+            if is_short is not None:
+                sign_hint = -1 if bool(is_short) else 1
         if sign_hint is None:
             return pos_val
         return abs(pos_val) * (1 if sign_hint > 0 else -1)
@@ -996,7 +1003,7 @@ class LighterClient(BaseExchangeClient):
 
         # Find position for current market
         for position in positions:
-            if position.market_id == self.config.contract_id:
+            if position.market_id == self.config.contract_id or position.symbol == self.config.ticker:
                 return self._signed_position_from_record(position)
 
         return Decimal(0)
@@ -1005,7 +1012,7 @@ class LighterClient(BaseExchangeClient):
         """Get signed position size and avg entry price for current market."""
         positions = await self._fetch_positions_with_retry()
         for position in positions:
-            if position.market_id == self.config.contract_id:
+            if position.market_id == self.config.contract_id or position.symbol == self.config.ticker:
                 size = self._signed_position_from_record(position)
                 avg_raw = getattr(position, "avg_entry_price", None)
                 if avg_raw is None and hasattr(position, "avg_price"):
