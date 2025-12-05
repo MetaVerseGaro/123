@@ -94,6 +94,7 @@ class TradingConfig:
     webhook_basic_direction_file: Optional[str] = None
     max_fast_close_qty: Optional[Decimal] = None
     break_buffer_ticks: Decimal = Decimal("10")
+    breakout_static_pct: Decimal = Decimal("0.1")
 
     @property
     def close_order_side(self) -> str:
@@ -278,6 +279,13 @@ class TradingBot:
             self.max_fast_close_qty = Decimal(str(val)) if val not in (None, "") else Decimal("0.5")
         except Exception:
             self.max_fast_close_qty = Decimal("0.5")
+        try:
+            cfg_break_pct = getattr(config, "breakout_static_pct", None)
+            env_break_pct = os.getenv("BREAKOUT_STATIC_PCT", None)
+            val = cfg_break_pct if cfg_break_pct not in (None, "") else env_break_pct
+            self.breakout_static_pct = Decimal(str(val)) if val not in (None, "") else Decimal("0.1")
+        except Exception:
+            self.breakout_static_pct = Decimal("0.1")
         # Risk control
 # Risk control
         self.risk_pct = Decimal(os.getenv("RISK_PCT", "0.5"))
@@ -1156,14 +1164,22 @@ class TradingBot:
             stop_price = self.last_confirmed_low - buffer
             break_price = self.pending_break_price or (self.last_confirmed_high + buffer)
             anchor_price = best_ask
-            threshold_price = break_price * Decimal("1.001")
+            try:
+                pct = (self.breakout_static_pct or Decimal("0")) / Decimal("100")
+            except Exception:
+                pct = Decimal("0.001")
+            threshold_price = break_price * (Decimal("1") + pct)
         else:
             if self.last_confirmed_high is None or self.last_confirmed_low is None:
                 return
             stop_price = self.last_confirmed_high + buffer
             break_price = self.pending_break_price or (self.last_confirmed_low - buffer)
             anchor_price = best_bid
-            threshold_price = break_price * Decimal("0.999")
+            try:
+                pct = (self.breakout_static_pct or Decimal("0")) / Decimal("100")
+            except Exception:
+                pct = Decimal("0.001")
+            threshold_price = break_price * (Decimal("1") - pct)
         if anchor_price is None or anchor_price <= 0:
             return
         if self.zigzag_tp_order_id:
@@ -1356,16 +1372,17 @@ class TradingBot:
             if self.direction_lock and self.direction_lock == signal:
                 signal = None
             else:
-                self.pending_entry = signal
-                self.pending_entry_static_mode = False
-                await self._cancel_pending_entry_orders()
-                try:
-                    if signal == "buy" and self.last_confirmed_high is not None:
-                        self.pending_break_price = self.last_confirmed_high + buffer
-                    elif signal == "sell" and self.last_confirmed_low is not None:
-                        self.pending_break_price = self.last_confirmed_low - buffer
-                except Exception:
-                    self.pending_break_price = None
+                if self.pending_entry != signal:
+                    self.pending_entry = signal
+                    self.pending_entry_static_mode = False
+                    await self._cancel_pending_entry_orders()
+                    try:
+                        if signal == "buy" and self.last_confirmed_high is not None:
+                            self.pending_break_price = self.last_confirmed_high + buffer
+                        elif signal == "sell" and self.last_confirmed_low is not None:
+                            self.pending_break_price = self.last_confirmed_low - buffer
+                    except Exception:
+                        self.pending_break_price = None
 
         if self.pending_entry:
             await self._process_pending_zigzag_entry(best_bid, best_ask)
