@@ -2455,10 +2455,10 @@ class TradingBot:
         )
         if not need_cancel:
             return
-        min_qty = self.min_order_size or Decimal("0")
         current_dir_qty = await self._get_directional_position(self.pending_entry, force=True)
         await self._cancel_pending_entry_orders()
-        if current_dir_qty <= min_qty:
+        # 如果已持有该方向仓位（无论是否打满），视为入场；否则放弃本次信号
+        if current_dir_qty <= Decimal("0"):
             await self._clear_pending_entry_state(clear_direction=True)
             return
         stop_price = self._compute_dynamic_stop(self.pending_entry) or self.dynamic_stop_price or pivot.price
