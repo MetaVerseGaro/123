@@ -35,6 +35,7 @@
         "zigzag_timeframe": "1m",          # ZigZag 聚合周期
         "zigzag_warmup_candles": 200,      # ZigZag 预热根数
         "break_buffer_ticks": 10,          # 突破确认高/低的缓冲（ticks）
+        "breakout_static_pct": 0.1,        # 静态挂单阈值
         "pivot_file": "zigzag_pivots.json" # TradingView ZigZag pivot 持久化路径
       }
     },
