@@ -1,0 +1,135 @@
+<!-- Padding: this line is intentionally long to work around utf8 slicing in tooling; it has no semantic meaning; remove once editing tools fully support unicode; padding padding padding padding padding padding padding padding -->
+# 多模式多账户并行 + 热切换重构方案
+
+## 1. 现状分析
+
+- 核心单体：`trading_bot.py` 承担所有职责。主要区域：
+  - 配置/初始化：`TradingConfig`/`TradingBot.__init__` 负责读取 CLI/ENV、实例化 `ExchangeFactory` 客户端、构建 `_AsyncCache`、BBO/价格/仓位/订单缓存 TTL、共享 BBO 文件读写、ZigZag pivot 文件路径解析、通知开关、风险参数、Webhook 相关状态。
+  - 行情获取与缓存：`_fetch_ws_bbo`、`_get_bbo_cached`、`_get_last_trade_price_cached`、`_get_position_signed_cached`、`_get_active_orders_cached` 等统一从交易所 REST/WS 拉取并做 TTL 缓存；支持 `_read_shared_bbo`/`_write_shared_bbo` 复用 `bbo_sidecar.py` 写入的共享文件。
+  - 下单执行/网格策略：主循环 `run()` 中默认 `grid` 路径调用 `_calculate_wait_time`、`_meet_grid_step_condition`、`_place_and_monitor_open_order` → `_handle_order_result` → `_place_take_profit_order`，并在 `_check_price_condition` 判定 stop/pause/SL；`boost_mode`、reduce-only 复用同一套下单入口。
+  - ZigZag Timing 模式：`trading_mode=zigzag_timing` 走 `_handle_zigzag_timing_cycle`，包含 pivot 同步 `_sync_external_pivots`/`_build_pivot_points`、方向锁 `direction_lock`/`pending_entry`、突破检测、post-only 逐笔进场、动态 SL/TP、慢速反手（pending reverse）等。ZigZag pivot 和基础方向依赖 `zigzag_webhook_server.py` 持久化的 JSON 文件。
+  - 风控：
+    - 进阶风险：`risk_pct`、`stop_new_orders_equity_threshold`、`release_timeout_minutes`、动态止损（`_refresh_stop_loss`）、冗余度计算（`_log_status_periodically` 内）、自动反手 `_handle_reverse_signal`/`_reverse_position`、`_perform_slow_unwind`。
+    - 基础风险：`max_position_limit`（quantity*max_position_count）、`basic_release_timeout_minutes`、Webhook 风控（`_poll_webhook_direction`/`_handle_webhook_stop_tasks`）。
+  - 通知与日志：`send_notification`（Lark/Telegram）、`TradingLogger` 贯穿、`_notify_error_once` 去重告警、`_maybe_send_daily_pnl`。
+  - 仓位自愈与一致性：`_log_status_periodically` 中处理持仓 vs 挂单缺口的自动 reduce-only 调整，残余小仓位 `_close_residual_position_market`，缓存失效 `_invalidate_*`，优雅退出 `graceful_shutdown`。
+- 运行形态：`runbot.py` 是单实例入口，解析 CLI/JSON（如 `botA.json`），写入 ENV 后构建 `TradingConfig`，`asyncio.run(TradingBot.run)`。多账户当前需要用户手动多进程/多窗口运行各自的 `runbot.py --env-file xxx`。
+- 配套进程：
+  - `bbo_sidecar.py` 独立进程持续产出共享 BBO（依赖与 `trading_bot.py` 兼容的 `TradingConfig`），通过 `SHARED_BBO_FILE` 供多个实例复用。
+  - `zigzag_webhook_server.py` 提供 HTTP Webhook，将 ZigZag pivot 和 basic direction 写入文件，`trading_bot.py` 通过轮询文件热读取，但无统一调度。
+- 交易所适配：`exchanges/` 下每个交易所文件实现 `base.py` 定义的接口（REST/WS、下单、撤单、账户、行情）；`ExchangeFactory` 负责按名称实例化。
+
+## 2. 目标架构草图（Core + Strategy + Orchestrator）
+
+- Core 层（可放 `core/`）：
+  - Exchange 网关：基于现有 `ExchangeFactory`/`base.py` 抽象出统一的异步接口，封装 BBO/行情/仓位/订单信息的缓存策略、REST 节流（沿用 `_AsyncCache`/TTL/REST throttle 逻辑）。
+  - Order & Position 管理：复用 `_place_and_monitor_open_order`、reduce-only 关闭、止盈/止损执行、方向状态 `_set_direction_all` 等，形成策略无关的下单/风控操作接口。
+  - Risk 模块：拆成基础/进阶两个组件（保持现有公式和阈值），提供 `evaluate()`/`should_stop_new_orders()`/`maybe_release_liquidity()` 等纯逻辑输出，避免策略重写。
+  - Data & State 服务：共享 BBO、pivot/direction 文件读写、Webhook 轮询、日志/通知、PnL 报告、缓存失效工具。
+- Strategy 层（`strategies/`）：定义统一协议（如 `on_tick(ctx)`、`on_price_update(ctx)`、`on_signal()`）。
+  - GridStrategy：仅搬运现有默认循环的决策部分（计算 wait_time、grid_step 条件、开仓/TP），调用 Core 的下单/风控接口。
+  - ZigZagTimingStrategy：搬运 `_handle_zigzag_timing_cycle` 系列（pivot 构建、pending_entry、突破判定、post-only 阶梯、动态 SL/TP、慢速反手）并复用 Core 行情/风险/通知。
+  - 策略内保持自己的运行时状态（direction_lock、pending_entry 等），通过上下文对象访问 Core 服务。
+- Orchestrator 层（`orchestrator/`）：
+  - 负责读取多账户配置、初始化每个账户的 Core + Strategy、启动各自 `asyncio.Task` 并监控生命周期。
+  - 支持绑定账户/符号 → Strategy + 风控组合（如 A: Grid+Advanced，B: Grid+Basic，C: ZigZagTiming）。
+  - 管理辅助进程/共享资源：统一拉起或连接 `bbo_sidecar`、监听 `zigzag_webhook` 文件路径，确保实例间互不污染。
+- 文件划分初步建议（不删除 `trading_bot.py`）：
+  - `core/config.py`（新配置模型/解析，兼容旧 JSON/ENV）
+  - `core/engine.py`（行情/下单/风险/通知的组合体）
+  - `core/risk_basic.py`、`core/risk_advanced.py`
+  - `core/data_feeds.py`（BBO、pivot、webhook 轮询，包含共享文件读写）
+  - `strategies/grid.py`、`strategies/zigzag_timing.py`
+  - `orchestrator/manager.py`（多账户调度）、`orchestrator/config_watcher.py`
+  - `legacy/trading_bot.py`（原文件拷贝或别名，保持旧入口可用）；`runbot.py` 保持兼容，同时可新增 `run_orchestrator.py`。
+
+## 3. 多账户并行与热切换方案
+
+- 并行运行：
+  - 每个账户/符号实例化 `BotInstance`（Core + Strategy 状态 + 风控组合），运行在同一事件循环的独立 `asyncio.Task`，通过隔离的 Exchange 客户端和缓存保证互不干扰；必要时支持一账户一进程的可选模式（如需要完全隔离 API 限速）。
+  - 共享资源：
+    - 行情：可选复用 `SHARED_BBO_FILE`（由 sidecar 写），Core 自动回退到本地 WS/REST。
+    - Pivot/基础方向：统一由 Orchestrator 配置的路径传递给每个实例，读取仍为文件轮询，避免跨实例内存耦合。
+- 配置组织：
+  - 建议新总配置 `configs/*.json|yaml` 形如：`accounts: [{id, env_file, exchange, trading: {...}, strategy: {name: grid|zigzag_timing, params...}, risk: {basic|advanced}, notifications: {...}, sidecar: {...}}]`；同时兼容旧单实例 JSON（如 `botA.json`）由 Orchestrator 转换为单元素账户列表。
+  - 每账户允许指定 `env_file`、共享文件路径、日志前缀、策略参数，运行时可动态更新。
+- 热读取 & 应用：
+  - Orchestrator 持续监听配置文件 mtime/hash；发现变更后执行两阶段：
+    1) 解析+校验（参数范围、所需 ENV、策略合法性、路径存在性）；失败时不影响现有实例。
+    2) 针对变更的账户应用差异：
+       - 纯参数更新（如风险阈值、take_profit）：在持有锁的情况下更新 Core/策略的配置视图，并刷缓存/重新计算止损。
+       - 策略/风控切换：设置实例级 “drain” 标记 → 停止新单/撤挂 → 根据策略需求选择是否强制平仓或保持现有仓位（配置可选）→ 重建 Strategy 对象并继承必要状态（如方向锁/动态止损/最近 pivot 快照）→ 重新订阅行情并解锁。
+  - 安全检查：
+    - 切换前确保 `_cancel_all_orders_safely`、同步最新持仓；若策略切换要求空仓，调用 reduce-only 关闭并确认仓位为 0。
+    - 对共享文件（BBO/pivot）重新校验可读性；对新的风险参数立即执行一次 `evaluate`，若不通过则继续保持 stop_new_orders。
+    - 切换失败时回滚到旧实例（旧 Task 不停，直到新实例 Ready 才切换路由）。
+
+## 4. 兼容性与安全性策略
+
+- 保留旧路径：`trading_bot.py` 原地不动；引入 `legacy/` 别名或包装以供新架构引用；`runbot.py` 继续工作，新增入口不影响老用户。
+- 行为不变原则：
+  - 前期仅做“拆文件/搬家”式重构，所有判断/公式/阈值/下单参数保持原样；策略实现尽量直接调用已抽取的 Core 方法，避免重写算法。
+  - ZigZag/动态 SL/慢速反手/Webhook/风险释放等分支保持日志与原逻辑一致（可在 Core 里保留原日志文案）。
+- 验证手段：
+  - 并行回放：为 Strategy 增加 “dry-run/diagnostic” 模式，利用 mock exchange（tests/ 内已有基础设施可扩展）复现相同行情序列，对比旧 `trading_bot.py` 的决策日志。
+  - 真实对拍：在同一账户只读模式下运行新架构（stop_new_orders=true）记录信号，与生产实例日志比对，确认方向/触发条件一致后再放开。
+  - 日志对齐：新增结构化日志字段（strategy, account, decision, price, qty, reason）便于 diff；出现偏差可快速切换回 `trading_bot.py`。
+
+## 5. 防黑天鹅/极端故障与恢复策略
+
+- 故障分类与检测信号：
+  - 交易所侧：REST 返回空/异常（连续 N 次失败）、WS 心跳超时或静默窗口超阈值（如 >3×订阅间隔）、BBO/成交时间戳滞后、价格/仓位/订单状态不一致（同一订单 ID 多版本、仓位数与挂单合计不匹配）。
+  - 网络/本地侧：请求超时、频繁重连（单位时间重连次数超阈值）、代理异常；`bbo_sidecar` 无新写入（文件 mtime 过期）、pivot/direction 文件不可读或时间戳异常、系统时间跳变。
+  - 系统/云侧：实例重启、进程崩溃、磁盘满（写文件失败）、时钟漂移（NTP 偏差超阈值）。
+  - 多账户并行风险：同 symbol 不同模式出现状态污染（共享缓存键冲突、共享文件 key 冲突）、热加载导致部分实例已切换部分未切换。
+- 全局安全原则（宁可不交易，也不要错误交易）：
+  - 数据不可用/不可信/过期时进入 safe mode/只读模式：停止新开仓，允许 reduce-only 的风险收敛（可配置），记录告警与原因。
+  - safe mode 触发条件示例：BBO/仓位/订单任一来源连续失败 >N 次；共享文件滞后超阈值；心跳静默；检测到状态不一致无法对账。
+- 重连/恢复的对账顺序：
+  1) 以“真实持仓 + 真实挂单”为唯一事实来源重新对齐（REST/WS 双路径取可信度更高者）。
+  2) 清理过期/孤儿订单（无挂单但本地记录有、或挂单已不在目标方向/价格带）。
+  3) 重新加载最新 config、pivot、direction 文件，刷新风险参数。
+  4) 恢复策略 tick 前，再次校验数据新鲜度；若仍不可信继续停单。
+- “错过信号”处理（不改变原策略方向逻辑）：
+  - 恢复时检查自上次心跳后的 pivot 进展/价格轨迹；仅当数据完整且满足原触发条件才补偿执行（如 ZigZag 破位后应该反手且当前仍满足条件）。
+  - 若缺失关键数据或价格已脱离原触发区间，则保持安全状态等待下一次明确触发，不做补仓/反手。
+- 状态持久化与幂等性：
+  - 按账户/模式隔离落盘：最近确认的方向锁、pending_entry、动态止损价、已处理 pivot key 集合、stop_new_orders 状态、上次风险评估时间戳。
+  - 幂等策略：下单动作附带幂等键（如 account+symbol+intent+timestamp）；恢复时先查询订单/仓位再决定是否需要重新下单，避免重复开仓/反手。
+- 验证与回滚：
+  - 故障回放：注入 REST/WS 失败、共享文件过期、时间漂移等场景，对比新旧日志，确认 safe mode 触发与原逻辑一致或更保守。
+  - 任意阶段可切回 legacy 路径：保留旧入口，可靠性模块有全局开关（ENV/CLI）便于关闭。
+
+## 6. 实施步骤拆解（保持可随时回滚）
+
+1) 搭建骨架（不改行为）：
+   - 新增 `core/config.py`、`orchestrator/manager.py`（仅解析配置、打印待启动清单），`strategies/__init__.py`。
+   - 无业务逻辑更改；`trading_bot.py`/`runbot.py` 原路径继续工作。
+   - 自检：加载现有 `botA.json`，确认解析后的模型与原参数一致（打印 diff 日志）。
+2) 抽取通用服务：
+   - 将 `_AsyncCache`、BBO 读写、缓存失效、日志/通知封装到 `core/data_feeds.py`/`core/notifications.py`，创建 `CoreServices` 容器，内部仍可调用原实现。
+   - 行为预期不变；新增单元测试覆盖缓存 TTL/共享 BBO 读写。
+   - 自检：运行旧 `runbot.py` + 新封装的无侵入导入，确保日志/下单路径无差异。
+3) 抽风险模块：
+   - 新建 `core/risk_basic.py`、`core/risk_advanced.py`，把 `_log_status_periodically` 中的计算拆成纯函数（保持公式/阈值/日志文案）；`trading_bot.py` 改为通过封装类返回决策结果。
+   - 行为不变；在 tests/ 里用固定输入对比旧输出。
+   - 自检：开启 basic/advanced 风控的账户跑一次模拟行情，对比 stop_new_orders/释放逻辑。
+4) 策略接口与 Grid 迁移：
+   - 定义 `Strategy` 抽象（生命周期钩子 + 状态容器）；实现 `GridStrategy` 直接调用 Core 下单/风险接口，逻辑照搬 `_meet_grid_step_condition`/`_place_and_monitor_open_order` 路径。
+   - `runbot.py` 增加可选入口 `--engine new`（默认 legacy）。
+   - 自检：使用相同 BBO 序列对比 grid 开单/止盈触发时点。
+5) ZigZag Timing 迁移：
+   - 将 `_handle_zigzag_timing_cycle` 及依赖迁到 `strategies/zigzag_timing.py`，保持状态字段、日志文案、默认参数一致，复用 Core 服务。
+   - 自检：重放 `docs/zigzag-timing-mode.md` 示例 pivot 序列，比较方向锁/挂单行为。
+6) Orchestrator 并行与热切换：
+   - 完成 `orchestrator/manager.py`：启动/停止实例、监控 Task、合并 sidecar/pivot 配置、注册 config watcher（mtime/hash），实现差异化更新与切换步骤（停单→撤单→切换→恢复）。
+   - 新增 `run_orchestrator.py` 入口，支持加载 `configs/*.json`。
+   - 自检：同时运行 A/B/C 三账户模拟（可用 mock exchange），验证互不干扰、热修改配置后实例重建或参数更新符合预期。
+7) 引入防黑天鹅/可靠性模块（可开关、可灰度）：
+   - 在 Core 增加健康度探针（数据新鲜度、心跳、文件 mtime、重连计数），提供 safe mode 控制开关；在 Strategy 层增加恢复对账/补偿判断框架；Orchestrator 负责灰度开关与分账户切换。
+   - 行为默认保持与 legacy 等价（开关关闭时），开启后只增加更保守的停单/只读，不改变方向逻辑。
+   - 自检：模拟 REST/WS 失败、共享文件过期、实例重启，验证进入/退出 safe mode、幂等下单、状态对账正确。
+8) 渐进切流与回滚保障：
+   - 提供全局/分账户开关控制是否使用新架构和可靠性模块；默认旧路径，便于快速回滚。
+   - 增加健康度探针/状态页（可选），监控各实例的 stop_new 状态、最近错误、pivot/共享文件时间戳。
+   - 自检：线上灰度一账户，观察日志一致性；出现偏差即可关闭新入口继续用 `trading_bot.py` 原逻辑。
