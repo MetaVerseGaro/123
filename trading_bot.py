@@ -382,7 +382,8 @@ class TradingBot:
             self.cache.invalidate(self._order_info_key(order_id))
         else:
             # Broad invalidation (used after bulk cancel)
-            keys = [k for k in self.cache.keys() if k.startswith("order_info:")]
+            suffix = f":{self.mode_tag}"
+            keys = [k for k in self.cache.keys() if k.startswith("order_info:") and k.endswith(suffix)]
             if keys:
                 self.cache.invalidate(*keys)
 
@@ -2307,7 +2308,7 @@ class TradingBot:
         latest = max(candidates, key=lambda p: p.close_time)
         desired_dir = "buy" if latest.label == "HH" else "sell"
         if desired_dir != self.config.direction:
-            self._set_direction_all(desired_dir, lock=False)
+            self._set_direction_all(desired_dir, lock=False, mode=self.mode_tag)
             self.logger.log(f"[INIT] Direction set to {desired_dir.upper()} via pivot {latest.label} at {latest.close_time}", "INFO")
 
     async def _initialize_pivots_from_store(self):
@@ -2328,7 +2329,7 @@ class TradingBot:
         direction, stop_entry = self._determine_initial_direction_and_stop(entries)
         if direction and self.enable_advanced_risk and self.stop_loss_enabled and self.enable_zigzag:
             if direction != self.config.direction:
-                self._set_direction_all(direction, lock=False)
+                self._set_direction_all(direction, lock=False, mode=self.mode_tag)
                 self.logger.log(f"[INIT] Direction set to {direction.upper()} via recent pivots (fast init)", "INFO")
             if stop_entry:
                 key = (stop_entry["close_time"].isoformat(), stop_entry["label"])
@@ -2713,7 +2714,7 @@ class TradingBot:
         pos_abs = abs(pos_signed)
         if pos_abs == 0:
             if self.pending_reverse_direction:
-                self._set_direction_all(self.pending_reverse_direction, lock=False)
+                self._set_direction_all(self.pending_reverse_direction, lock=False, mode=self.mode_tag)
                 self.direction_lock = None
                 self.pending_reverse_direction = None
                 self.pending_reverse_state = None
@@ -2810,7 +2811,7 @@ class TradingBot:
         order_id = order_result.order_id
         filled_price = order_result.price
         if self.config.direction:
-            self._set_direction_all(self.config.direction, lock=False)
+            self._set_direction_all(self.config.direction, lock=False, mode=self.mode_tag)
 
         if self.order_filled_event.is_set() or order_result.status == 'FILLED':
             if self.config.boost_mode:
