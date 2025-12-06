@@ -271,6 +271,9 @@ class TradingBot:
         self.webhook_reverse_pending: bool = False
         self.webhook_block_trading: bool = False
         self.webhook_unwind_last_ts: float = 0.0
+        # Break/flatten retry throttles
+        self._last_flatten_attempt_ts: float = 0.0
+        self._last_entry_attempt_ts: float = 0.0
         # fast close chunk size for fast reverse/fast webhook stop
         try:
             cfg_fast_close = getattr(config, "max_fast_close_qty", None)
@@ -1065,16 +1068,25 @@ class TradingBot:
 
         pos_signed = await self._get_position_signed_cached(force=True)
         if (pos_signed > 0 and new_direction == "buy") or (pos_signed < 0 and new_direction == "sell"):
+            self._last_flatten_attempt_ts = 0.0
             return True  # already aligned
 
         pos_abs = abs(pos_signed)
         if pos_abs <= (self.min_order_size or Decimal("0")):
+            self._last_flatten_attempt_ts = 0.0
             return True
 
         # Use the correct close side based on current position sign to avoid opening on the wrong side
         close_side = "sell" if pos_signed > 0 else "buy"
+        now_ts = time.time()
+        if (now_ts - self._last_flatten_attempt_ts) < 5:
+            return False
+        self._last_flatten_attempt_ts = now_ts
         _, remaining = await self._post_only_exit_batch(close_side, pos_abs, best_bid, best_ask, wait_sec=5.0)
-        return remaining <= (self.min_order_size or Decimal("0"))
+        if remaining <= (self.min_order_size or Decimal("0")):
+            self._last_flatten_attempt_ts = 0.0
+            return True
+        return False
 
     async def _execute_zigzag_stop(self, close_side: str, best_bid: Decimal, best_ask: Decimal):
         """Handle stop trigger: cancel TP, close position, reset state."""
@@ -1112,6 +1124,7 @@ class TradingBot:
         self.pending_break_price = None
         self.pending_entry_static_mode = False
         self._set_stop_new_orders(False)
+        self._last_entry_attempt_ts = 0.0
 
     async def _place_static_entry_orders(self, direction: str, break_price: Decimal, quantity: Decimal) -> List[str]:
         """Place static post-only entry orders anchored at break_price without chasing."""
@@ -1148,6 +1161,7 @@ class TradingBot:
         self.dynamic_stop_price = stop_price
         await self._place_zigzag_tp(direction, filled_qty, entry_price, stop_price)
         await self._notify_zigzag_trade("entry", direction, filled_qty, entry_price)
+        self._last_entry_attempt_ts = 0.0
 
     async def _process_pending_zigzag_entry(self, best_bid: Decimal, best_ask: Decimal):
         """Process pending zigzag entry: flatten opposite, compute qty, place batch post-only."""
@@ -1200,6 +1214,10 @@ class TradingBot:
         if not overshoot:
             self.pending_entry_static_mode = False
             if remaining >= min_qty:
+                now_ts = time.time()
+                if (now_ts - self._last_entry_attempt_ts) < 20:
+                    return
+                self._last_entry_attempt_ts = now_ts
                 filled, current_dir_qty = await self._post_only_entry_batch(direction, remaining, best_bid, best_ask, wait_sec=20.0)
                 if filled > 0:
                     self._invalidate_position_cache()
@@ -1374,6 +1392,8 @@ class TradingBot:
             else:
                 if self.pending_entry != signal:
                     self.pending_entry = signal
+                    self._last_entry_attempt_ts = 0.0
+                    self._last_flatten_attempt_ts = 0.0
                     self.pending_entry_static_mode = False
                     await self._cancel_pending_entry_orders()
                     try:
