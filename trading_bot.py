@@ -374,9 +374,12 @@ class TradingBot:
     def _invalidate_position_cache(self):
         self.cache.invalidate(self._cache_key("position"))
 
+    def _order_info_key(self, order_id: str) -> str:
+        return f"order_info:{order_id}:{self.mode_tag}"
+
     def _invalidate_order_info_cache(self, order_id: Optional[str] = None):
         if order_id:
-            self.cache.invalidate(f"order_info:{order_id}")
+            self.cache.invalidate(self._order_info_key(order_id))
         else:
             # Broad invalidation (used after bulk cancel)
             keys = [k for k in self.cache.keys() if k.startswith("order_info:")]
@@ -405,6 +408,9 @@ class TradingBot:
             self.direction_lock = dir_val
             changed = True
         return changed
+
+    def _rest_lane(self, lane: str) -> str:
+        return f"{self.mode_tag}:{lane}"
 
     def _price_breaches_stop(self, stop_price: Optional[Decimal], direction: str, price: Decimal) -> bool:
         """Return True if an order price is beyond the allowed stop boundary."""
@@ -921,11 +927,12 @@ class TradingBot:
         Keeps LF endpoints (e.g., historical candles) below ~60 req/min default cap.
         """
         now_ts = time.time()
-        last_ts = self._rest_last_call.get(lane, 0.0)
+        lane_key = self._rest_lane(lane)
+        last_ts = self._rest_last_call.get(lane_key, 0.0)
         wait = min_interval - (now_ts - last_ts)
         if wait > 0:
             await asyncio.sleep(wait)
-        self._rest_last_call[lane] = time.time()
+        self._rest_last_call[lane_key] = time.time()
 
     async def _notify_zigzag_trade(self, action: str, direction: str, qty: Decimal, price: Decimal, note: str = ""):
         """Notify entry/exit in zigzag_timing with size and notional exposure."""
@@ -1475,7 +1482,7 @@ class TradingBot:
         return bool(getattr(self.exchange_client, "ws_manager", None)) or bool(getattr(self.exchange_client, "order_ws_enabled", False))
 
     async def _get_order_info_cached(self, order_id: str, force: bool = False):
-        key = f"order_info:{order_id}"
+        key = self._order_info_key(order_id)
         return await self.cache.get(
             key,
             self.ttl_order_info,
@@ -1836,6 +1843,7 @@ class TradingBot:
     async def _get_equity_snapshot(self) -> Optional[Decimal]:
         """Fetch equity with fallbacks."""
         now_ts = time.time()
+        equity_key = f"equity:{self.mode_tag}"
         if self._equity_cache is not None and (now_ts - self._equity_cache_ts) < self.ttl_equity:
             return self._equity_cache
 
@@ -1856,9 +1864,9 @@ class TradingBot:
                 return self._equity_last_nonzero
             return equity_val
 
-        equity = await self.cache.get("equity", self.ttl_equity, _fetch_equity, force=False)
+        equity = await self.cache.get(equity_key, self.ttl_equity, _fetch_equity, force=False)
         if equity is None or equity <= 0:
-            self.cache.invalidate("equity")
+            self.cache.invalidate(equity_key)
             return self._equity_last_nonzero
         self._equity_cache = equity
         self._equity_cache_ts = now_ts
@@ -1867,7 +1875,7 @@ class TradingBot:
 
     async def _get_balance_snapshot(self) -> Optional[Decimal]:
         """Fetch balance with short TTL; reuse equity failure semantics."""
-        key = "balance"
+        key = f"balance:{self.mode_tag}"
 
         async def _fetch_balance():
             bal = None
@@ -1914,11 +1922,13 @@ class TradingBot:
                         self.logger.log(f"[PNL] get_account_pnl failed: {e}", "WARNING")
             if equity is None or self.daily_pnl_baseline is None:
                 with TelegramBot(telegram_token, telegram_chat_id) as tg_bot:
-                    prefix = f"[{self.account_name}] " if self.account_name else ""
+                    labels = [lbl for lbl in (self.account_name, self.mode_tag) if lbl]
+                    prefix = f"[{'|'.join(labels)}] " if labels else ""
                     tg_bot.send_text(f"{prefix}[PNL] Daily PnL unavailable (missing equity data)")
             else:
                 pnl = equity - self.daily_pnl_baseline
-                prefix = f"[{self.account_name}] " if self.account_name else ""
+                labels = [lbl for lbl in (self.account_name, self.mode_tag) if lbl]
+                prefix = f"[{'|'.join(labels)}] " if labels else ""
                 msg = f"{prefix}[PNL] {current_date} Equity: {equity} | PnL: {pnl}"
                 with TelegramBot(telegram_token, telegram_chat_id) as tg_bot:
                     tg_bot.send_text(msg)
@@ -2473,7 +2483,7 @@ class TradingBot:
                 if headroom < needed_headroom:
                     if not self.stop_new_orders and self.enable_notifications:
                         await self.send_notification(f"[RISK] Stop new orders after SL update: headroom {headroom} < qty {self.config.quantity}")
-                    self._set_stop_new_orders(True)
+                    self._set_stop_new_orders(True, mode=self.mode_tag)
                     if self.redundancy_insufficient_since is None:
                         self.redundancy_insufficient_since = time.time()
                     self.last_stop_new_notify = True
@@ -2488,7 +2498,7 @@ class TradingBot:
                 else:
                     if self.stop_new_orders and self.enable_notifications:
                         await self.send_notification("[RISK] Resume new orders after SL update: redundancy restored")
-                    self._set_stop_new_orders(False)
+                    self._set_stop_new_orders(False, mode=self.mode_tag)
                     self.redundancy_insufficient_since = None
         except Exception as e:
             self.logger.log(f"[RISK] redundancy check after SL update failed: {e}", "WARNING")
@@ -2708,7 +2718,7 @@ class TradingBot:
                 self.pending_reverse_direction = None
                 self.pending_reverse_state = None
                 self.pending_original_direction = None
-                self._set_stop_new_orders(False)
+                self._set_stop_new_orders(False, mode=self.mode_tag)
                 self.last_open_order_time = 0
                 self._invalidate_position_cache()
                 self._invalidate_order_cache()
@@ -2961,7 +2971,7 @@ class TradingBot:
                 mismatch_detected = False
                 # 基础风险：最大持仓限制（启用时）
                 if self.enable_basic_risk and self.max_position_limit is not None and position_amt >= self.max_position_limit:
-                    self._set_stop_new_orders(True)
+                    self._set_stop_new_orders(True, mode=self.mode_tag)
                     if self.basic_full_since is None:
                         self.basic_full_since = time.time()
                     if position_amt > self.max_position_limit:
@@ -3242,7 +3252,7 @@ class TradingBot:
             "INFO",
         )
         self.webhook_block_trading = True
-        self._set_stop_new_orders(True)
+        self._set_stop_new_orders(True, mode=self.mode_tag)
         self.webhook_target_direction = webhook_dir
         self.webhook_reverse_pending = self.webhook_reverse
         self.webhook_unwind_last_ts = 0.0
@@ -3294,7 +3304,7 @@ class TradingBot:
             self.webhook_target_direction = None
             self.dynamic_stop_price = None
             self.dynamic_stop_direction = None
-            self._set_stop_new_orders(False)
+            self._set_stop_new_orders(False, mode=self.mode_tag)
             if self.enable_notifications:
                 await self.send_notification(f"[WEBHOOK] Reversed to {self.config.direction.upper()} after webhook stop")
             await self._place_and_monitor_open_order()
@@ -3470,8 +3480,13 @@ class TradingBot:
     async def send_notification(self, message: str):
         if not self.enable_notifications:
             return
+        prefix_parts = []
         if self.account_name:
-            message = f"[{self.account_name}] {message}"
+            prefix_parts.append(self.account_name)
+        if self.mode_tag:
+            prefix_parts.append(self.mode_tag)
+        if prefix_parts:
+            message = f"[{'|'.join(prefix_parts)}] {message}"
         lark_token = os.getenv("LARK_TOKEN")
         if lark_token:
             async with LarkBot(lark_token) as lark_bot:
