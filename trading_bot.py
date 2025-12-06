@@ -148,6 +148,10 @@ class TradingBot:
         self.trading_mode = str(getattr(config, "trading_mode", None) or os.getenv("TRADING_MODE", "grid")).lower()
         self.zigzag_timing_enabled = self.trading_mode == "zigzag_timing"
 
+        # Mode tags
+        self.mode_tag = self.trading_mode or "grid"
+        self.mode_prefix = f"[MODE:{self.mode_tag.upper()}]"
+
         # Cache helper
         debug_flag = ("--debug" in sys.argv) or (str(os.getenv("DEBUG_CACHE", "false")).lower() == "true")
         self.cache = _AsyncCache(self.logger, debug=debug_flag)
@@ -360,11 +364,15 @@ class TradingBot:
         # Register order callback
         self._setup_websocket_handlers()
 
+    def _cache_key(self, name: str) -> str:
+        cid = self.config.contract_id or self.config.ticker
+        return f"{name}:{cid}:{self.mode_tag}"
+
     def _invalidate_order_cache(self):
-        self.cache.invalidate(f"orders:{self.config.contract_id}")
+        self.cache.invalidate(self._cache_key("orders"))
 
     def _invalidate_position_cache(self):
-        self.cache.invalidate(f"position:{self.config.contract_id}")
+        self.cache.invalidate(self._cache_key("position"))
 
     def _invalidate_order_info_cache(self, order_id: Optional[str] = None):
         if order_id:
@@ -375,11 +383,16 @@ class TradingBot:
             if keys:
                 self.cache.invalidate(*keys)
 
-    def _set_direction_all(self, direction: Optional[str], lock: bool = True) -> bool:
+    def _set_direction_all(self, direction: Optional[str], lock: bool = True, mode: Optional[str] = None) -> bool:
         """
         Set config/current/lock consistently.
         Returns True if any value changed.
         """
+        mode = mode or self.mode_tag
+        if mode != self.mode_tag:
+            if self.cache.debug:
+                self.logger.log(f"{self.mode_prefix} skip set_direction_all for mode {mode}", "DEBUG")
+            return False
         dir_val = direction.lower() if isinstance(direction, str) else None
         changed = False
         if self.config.direction != dir_val:
@@ -618,7 +631,7 @@ class TradingBot:
         return None
 
     async def _get_bbo_cached(self, force: bool = False) -> Tuple[Decimal, Decimal]:
-        key = f"bbo:{self.config.contract_id}"
+        key = self._cache_key("bbo")
         async def fetch_bbo():
             return await self.exchange_client.fetch_bbo_prices(self.config.contract_id)
 
@@ -663,7 +676,7 @@ class TradingBot:
         Throttled BBO for zigzag mode: honor a min interval when idle; force refresh when in/pending position.
         """
         now = time.time()
-        key = f"bbo:{self.config.contract_id}"
+        key = self._cache_key("bbo")
         if (not force) and (now - self._zigzag_last_bbo_ts < self.zigzag_bbo_min_interval):
             cached = self.cache.peek(key, self.ttl_bbo_cache)
             if cached:
@@ -732,7 +745,7 @@ class TradingBot:
         return None
 
     async def _get_last_trade_price_cached(self, best_bid: Optional[Decimal] = None, best_ask: Optional[Decimal] = None, force: bool = False) -> Optional[Decimal]:
-        key = f"last_price:{self.config.contract_id}"
+        key = self._cache_key("last_price")
 
         async def _fetch():
             ws_last = await self._get_ws_last_price()
@@ -754,7 +767,7 @@ class TradingBot:
         return await self.cache.get(key, self.ttl_last_price, _fetch, force=force)
 
     async def _get_active_orders_cached(self) -> list:
-        key = f"orders:{self.config.contract_id}"
+        key = self._cache_key("orders")
         ttl = self.ttl_active_orders
         if self.zigzag_timing_enabled:
             needs_fast = bool(
@@ -1096,7 +1109,7 @@ class TradingBot:
         if pos_abs > 0:
             await self._post_only_exit_batch(close_side, pos_abs, best_bid, best_ask, wait_sec=5.0)
             await self._notify_zigzag_trade("exit", close_side, pos_abs, ref_price, note="stop-hit")
-        self._set_direction_all(None)
+        self._set_direction_all(None, mode="zigzag_timing")
         self.pending_entry = None
         self.pending_break_price = None
         self.pending_entry_static_mode = False
@@ -1116,14 +1129,14 @@ class TradingBot:
         """Clear pending entry flags and optionally reset direction/stop state."""
         await self._cancel_pending_entry_orders()
         if clear_direction:
-            self._set_direction_all(None, lock=True)
+            self._set_direction_all(None, lock=True, mode="zigzag_timing")
             self.zigzag_stop_price = None
             self.zigzag_entry_price = None
             self.dynamic_stop_price = None
         self.pending_entry = None
         self.pending_break_price = None
         self.pending_entry_static_mode = False
-        self._set_stop_new_orders(False)
+        self._set_stop_new_orders(False, mode="zigzag_timing")
         self._last_entry_attempt_ts = 0.0
 
     async def _place_static_entry_orders(self, direction: str, break_price: Decimal, quantity: Decimal) -> List[str]:
@@ -1152,7 +1165,7 @@ class TradingBot:
     async def _finalize_pending_entry(self, direction: str, filled_qty: Decimal, entry_price: Decimal, stop_price: Decimal):
         """Finalize pending entry: set direction, stop, TP, clear state."""
         await self._cancel_pending_entry_orders()
-        self._set_direction_all(direction)
+        self._set_direction_all(direction, mode="zigzag_timing")
         self.pending_entry = None
         self.pending_break_price = None
         self.pending_entry_static_mode = False
@@ -1308,7 +1321,7 @@ class TradingBot:
 
         if pos_abs > tolerance:
             actual_dir = "buy" if pos_signed > 0 else "sell"
-            changed = self._set_direction_all(actual_dir)
+            changed = self._set_direction_all(actual_dir, mode="zigzag_timing")
             if self.pending_entry and self.pending_entry == actual_dir:
                 self.pending_entry = None
                 changed = True
@@ -1325,11 +1338,11 @@ class TradingBot:
             return
 
         # Flat: allow breakout to reset intended direction (without entering yet)
-        self._set_direction_all(None)
+        self._set_direction_all(None, mode="zigzag_timing")
         self.dynamic_stop_price = None
         self.dynamic_stop_direction = None
         if self.zigzag_timing_enabled and not self.webhook_stop_mode:
-            self._set_stop_new_orders(False)
+            self._set_stop_new_orders(False, mode="zigzag_timing")
             self.redundancy_insufficient_since = None
         if (not self.pending_entry) and trade_price is not None:
             new_dir = None
@@ -1338,7 +1351,7 @@ class TradingBot:
             elif self.last_confirmed_low is not None and trade_price <= (self.last_confirmed_low - buffer):
                 new_dir = "sell"
             if new_dir and new_dir != self.config.direction:
-                self._set_direction_all(new_dir, lock=False)
+                self._set_direction_all(new_dir, lock=False, mode="zigzag_timing")
                 self.logger.log(f"[ZIGZAG-TIMING] Flat breakout sets direction to {new_dir.upper()}", "INFO")
 
     async def _close_residual_position_market(self, pos_signed: Decimal) -> bool:
@@ -1408,7 +1421,7 @@ class TradingBot:
             await self._process_pending_zigzag_entry(best_bid, best_ask)
 
     async def _get_position_signed_cached(self, force: bool = False) -> Decimal:
-        key = f"position:{self.config.contract_id}"
+        key = self._cache_key("position")
         ttl = self.ttl_position
         if self.zigzag_timing_enabled:
             needs_fast = bool(
@@ -1471,8 +1484,13 @@ class TradingBot:
         )
 
 
-    def _set_stop_new_orders(self, enable: bool):
+    def _set_stop_new_orders(self, enable: bool, mode: Optional[str] = None):
         """Set stop_new_orders flag and track duration."""
+        mode = mode or self.mode_tag
+        if mode != self.mode_tag:
+            if self.cache.debug:
+                self.logger.log(f"{self.mode_prefix} skip stop_new_orders update from mode {mode}", "DEBUG")
+            return
         if enable:
             if not self.stop_new_orders:
                 self.stop_new_since = time.time()
@@ -2330,8 +2348,13 @@ class TradingBot:
             )
         await self.send_notification("\n".join(lines))
 
-    async def _refresh_stop_loss(self, force: bool = False):
+    async def _refresh_stop_loss(self, force: bool = False, mode: Optional[str] = None):
         """Refresh stop-loss tracking without placing native SL orders."""
+        mode = mode or self.mode_tag
+        if mode != self.mode_tag:
+            if self.cache.debug:
+                self.logger.log(f"{self.mode_prefix} skip refresh_stop_loss from mode {mode}", "DEBUG")
+            return
         if not self.enable_dynamic_sl:
             return
 
@@ -2391,16 +2414,21 @@ class TradingBot:
             except Exception:
                 pass
         # After SL update, re-evaluate redundancy and optionally stop new orders
-        await self._run_redundancy_check(direction, pos_signed)
+        await self._run_redundancy_check(direction, pos_signed, mode=mode)
 
-    async def _run_redundancy_check(self, direction: str, pos_signed: Decimal):
+    async def _run_redundancy_check(self, direction: str, pos_signed: Decimal, mode: Optional[str] = None):
         """Re-evaluate redundancy and update stop_new_orders state."""
+        mode = mode or self.mode_tag
+        if mode != self.mode_tag:
+            if self.cache.debug:
+                self.logger.log(f"{self.mode_prefix} skip redundancy_check from mode {mode}", "DEBUG")
+            return
         if not (self.stop_loss_enabled and self.enable_advanced_risk):
             return
         try:
             position_amt = abs(pos_signed)
             if position_amt == 0:
-                self._set_stop_new_orders(False)
+                self._set_stop_new_orders(False, mode=self.mode_tag)
                 self.redundancy_insufficient_since = None
                 return
             best_bid, best_ask = await self._get_bbo_cached()
@@ -2587,14 +2615,14 @@ class TradingBot:
                 pass
 
         # Update direction and reset timers
-        self._set_direction_all(new_direction)
+        self._set_direction_all(new_direction, mode=self.mode_tag)
         self.dynamic_stop_price = None
         self.dynamic_stop_direction = None
         self.last_open_order_time = 0
         self._invalidate_position_cache()
         self._invalidate_order_cache()
         # Ensure new direction can place orders
-        self._set_stop_new_orders(False)
+        self._set_stop_new_orders(False, mode=self.mode_tag)
 
         # Refresh stop loss for new direction
         if self.enable_dynamic_sl:
@@ -2617,7 +2645,7 @@ class TradingBot:
         self.pending_reverse_direction = new_direction
         self.pending_reverse_state = "waiting_next_pivot"
         self.pending_original_direction = self.config.direction
-        self._set_stop_new_orders(True)  # 暂停新开仓，保留现有 TP
+        self._set_stop_new_orders(True, mode=self.mode_tag)  # 暂停新开仓，保留现有 TP
 
     async def _cancel_close_orders(self):
         """Cancel existing close/TP orders."""
@@ -2637,7 +2665,7 @@ class TradingBot:
         self.pending_reverse_direction = None
         self.pending_reverse_state = None
         self.pending_original_direction = None
-        self._set_stop_new_orders(False)
+        self._set_stop_new_orders(False, mode=self.mode_tag)
 
     async def _process_slow_reverse_followup(self, pivot: PivotPoint) -> bool:
         """Process next confirmed pivot for slow reverse logic. Returns True if handled."""
@@ -3027,15 +3055,15 @@ class TradingBot:
                             self.logger.log(msg, "WARNING")
                             if self.enable_notifications:
                                 await self.send_notification(msg)
-                        self._set_stop_new_orders(True)
-                        if self.redundancy_insufficient_since is None:
-                            self.redundancy_insufficient_since = time.time()
-                        self.last_stop_new_notify = True
-                    else:
-                        if self.stop_new_orders and self.enable_notifications and self.last_stop_new_notify:
-                            await self.send_notification("[RISK] Resume new orders: redundancy restored")
-                        self._set_stop_new_orders(False)
-                        self.redundancy_insufficient_since = None
+                        self._set_stop_new_orders(True, mode=self.mode_tag)
+                    if self.redundancy_insufficient_since is None:
+                        self.redundancy_insufficient_since = time.time()
+                    self.last_stop_new_notify = True
+                else:
+                    if self.stop_new_orders and self.enable_notifications and self.last_stop_new_notify:
+                        await self.send_notification("[RISK] Resume new orders: redundancy restored")
+                    self._set_stop_new_orders(False, mode=self.mode_tag)
+                    self.redundancy_insufficient_since = None
 
                 # Release liquidity: advanced uses release_timeout_minutes；基础风险也可用 basic_release_timeout_minutes
                 should_release_advanced = (
@@ -3201,7 +3229,7 @@ class TradingBot:
         if webhook_dir == self.config.direction and not self.webhook_stop_mode:
             if self.webhook_block_trading:
                 self.webhook_block_trading = False
-                self._set_stop_new_orders(False)
+                self._set_stop_new_orders(False, mode=self.mode_tag)
             return
         await self._handle_webhook_signal(webhook_dir)
 
@@ -3259,7 +3287,7 @@ class TradingBot:
         # Position flat: finalize stop/reverse
         await self._cancel_all_orders_safely()
         if self.webhook_reverse_pending and self.webhook_target_direction:
-            self._set_direction_all(self.webhook_target_direction)
+            self._set_direction_all(self.webhook_target_direction, mode=self.mode_tag)
             self.webhook_reverse_pending = False
             self.webhook_block_trading = False
             self.webhook_stop_mode = None
