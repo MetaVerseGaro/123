@@ -1220,6 +1220,9 @@ class TradingBot:
         if self.zigzag_tp_order_id:
             await self._cancel_zigzag_tp()
         overshoot = (direction == "buy" and anchor_price > threshold_price) or (direction == "sell" and anchor_price < threshold_price)
+        # 如果已经进入静态破位挂单模式且仍有挂单，保持 overshoot 状态，避免改为追价再挂一组入场单
+        if self.pending_entry_static_mode and self._pending_entry_order_ids:
+            overshoot = True
 
         ok = await self._flatten_opposite(direction, best_bid, best_ask)
         if not ok:
