@@ -1,10 +1,15 @@
 import asyncio
 import json
 import time
+import sys
 from decimal import Decimal
 from pathlib import Path
 
 import pytest
+
+ROOT = Path(__file__).parent.parent
+if str(ROOT) not in sys.path:
+    sys.path.append(str(ROOT))
 
 from core.data_feeds import AsyncCache, SharedBBOStore, PivotFileWatcher
 from core.notifications import NotificationManager
@@ -132,3 +137,4 @@ def test_notification_error_dedup(monkeypatch):
         assert third_ts >= second_ts
 
     asyncio.run(_run())
+
