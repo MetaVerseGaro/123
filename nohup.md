@@ -29,4 +29,13 @@
   sudo kill 12345
   # 或强制：sudo kill -9 12345
   ```
-2025-12-01 08:15:40 | WARNING | [LIGHTER][ETH] [POST_ONLY] Attempt 15353 failed (Order creation error: HTTP response body: code=21706 message='invalid order base or quote amount' additional_properties={}). Retrying with adjusted price.
+____________________________________ ERROR collecting test_core_services.py ____________________________________
+ImportError while importing test module '/home/lighter/123/tests/test_core_services.py'.
+Hint: make sure your test modules/packages have valid Python names.
+Traceback:
+/usr/lib/python3.12/importlib/__init__.py:90: in import_module
+    return _bootstrap._gcd_import(name[level:], package, level)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+test_core_services.py:9: in <module>
+    from core.data_feeds import AsyncCache, SharedBBOStore, PivotFileWatcher
+E   ModuleNotFoundError: No module named 'core'
