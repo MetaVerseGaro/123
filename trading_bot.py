@@ -951,14 +951,14 @@ class TradingBot:
             "[ZIGZAG-TIMING]",
             action.upper(),
             direction.upper(),
-            f"qty={qty_val}",
-            f"px={price_val}",
+            f"qty={qty_val:.8f}",
+            f"px={price_val:.4f}",
         ]
         if exposure is not None:
-            msg_parts.append(f"notional={exposure}")
+            msg_parts.append(f"notional={exposure:.4f}")
         if note:
             msg_parts.append(note)
-        await self.send_notification(" ".join(str(x) for x in msg_parts))
+        await self.send_notification(" ".join(msg_parts))
 
     async def _cancel_zigzag_tp(self):
         """Cancel existing fixed TP order if tracked."""
@@ -993,7 +993,7 @@ class TradingBot:
             self.zigzag_tp_order_id = res.order_id
             self.zigzag_tp_qty = qty
             self._invalidate_order_cache()
-            self.logger.log(f"[ZIGZAG-TIMING] TP placed {side.upper()} qty={qty} @ {tp_price} reduce-only", "INFO")
+            self.logger.log(f"[ZIGZAG-TIMING] TP placed {side.upper()} qty={qty:.8f} @ {tp_price:.4f} reduce-only", "INFO")
         else:
             self.logger.log(f"[ZIGZAG-TIMING] Place TP failed: {getattr(res, 'error_message', '')}", "WARNING")
 
@@ -2024,7 +2024,7 @@ class TradingBot:
             sl_result = await self.exchange_client.place_stop_loss_order(quantity, trigger_price, side)
             if sl_result.success:
                 self.current_sl_order_id = sl_result.order_id
-                self.logger.log(f"[SL] Placed native stop-loss {side} qty={quantity} trig={trigger_price}", "INFO")
+                self.logger.log(f"[SL] Placed native stop-loss {side} qty={quantity:.8f} trig={trigger_price:.4f}", "INFO")
             else:
                 self.logger.log(f"[SL] Failed to place native stop-loss: {sl_result.error_message}", "ERROR")
         else:
@@ -2424,7 +2424,7 @@ class TradingBot:
         self._last_stop_eval_price = dyn_stop
         if self.enable_notifications and prev_stop != self.dynamic_stop_price:
             try:
-                await self.send_notification(f"[SL] Dynamic stop updated from {prev_stop} to {self.dynamic_stop_price} for {direction.upper()}")
+                await self.send_notification(f"[SL] Dynamic stop updated from {prev_stop:.4f} to {self.dynamic_stop_price:.4f} for {direction.upper()}")
             except Exception:
                 pass
         # After SL update, re-evaluate redundancy and optionally stop new orders
@@ -2478,7 +2478,7 @@ class TradingBot:
                         close_qty = excess
                         close_side = 'sell' if pos_signed > 0 else 'buy'
                         await self.exchange_client.reduce_only_close_with_retry(close_qty, close_side)
-                        self.logger.log(f"[RISK] Reduced excess position {close_qty} to keep stop-loss exposure within limit", "WARNING")
+                        self.logger.log(f"[RISK] Reduced excess position {close_qty:.8f} to keep stop-loss exposure within limit", "WARNING")
                         self._invalidate_position_cache()
                     except Exception as e:
                         self.logger.log(f"[RISK] Failed to trim excess position: {e}", "ERROR")
@@ -2968,7 +2968,7 @@ class TradingBot:
                     if isinstance(order, dict)
                 )
 
-                self.logger.log(f"Current Position: {position_amt} | Active closing amount: {active_close_amount} | "
+                self.logger.log(f"Current Position: {position_amt:.8f} | Active closing amount: {active_close_amount:.8f} | "
                                 f"Order quantity: {len(self.active_close_orders)}")
                 self.last_log_time = time.time()
                 # Check for position mismatch
@@ -2983,7 +2983,7 @@ class TradingBot:
                         close_side = self.config.close_order_side
                         try:
                             await self.exchange_client.reduce_only_close_with_retry(excess_pos, close_side)
-                            self.logger.log(f"[RISK-BASIC] Trimmed excess position {excess_pos} over limit {self.max_position_limit}", "WARNING")
+                            self.logger.log(f"[RISK-BASIC] Trimmed excess position {excess_pos:.8f} over limit {self.max_position_limit:.8f}", "WARNING")
                         except Exception as e:
                             self.logger.log(f"[RISK-BASIC] Failed to trim excess position: {e}", "ERROR")
 
@@ -2997,7 +2997,7 @@ class TradingBot:
                         if close_qty < self.min_order_size:
                             close_qty = close_qty + self.config.quantity
                         close_side = self.config.close_order_side
-                        self.logger.log(f"Auto-closing excess position {close_qty} via reduce-only post-only", "WARNING")
+                        self.logger.log(f"Auto-closing excess position {close_qty:.8f} via reduce-only post-only", "WARNING")
                         fix_result = await self.exchange_client.reduce_only_close_with_retry(
                             close_qty, close_side, timeout_sec=5.0, max_attempts=5
                         )
@@ -3017,7 +3017,7 @@ class TradingBot:
                                     break
                                 await self.exchange_client.cancel_order(order['id'])
                                 cancelled += Decimal(order.get('size', 0))
-                                self.logger.log(f"Canceled excess close order {order['id']} size {order.get('size')}", "WARNING")
+                                self.logger.log(f"Canceled excess close order {order['id']} size {Decimal(order.get('size', 0)):.8f}", "WARNING")
                     elif mismatch < 0:
                         # Active close orders exceed position: cancel farthest-from-mid until aligned
                         excess = abs(mismatch)
@@ -3065,7 +3065,7 @@ class TradingBot:
                     redundancy_base = redundancy_u / per_base_loss if per_base_loss > 0 else Decimal(0)
                     if redundancy_base < self.config.quantity:
                         if not self.stop_new_orders:
-                            msg = f"[RISK] Stop new orders: redundancy {redundancy_base} < quantity {self.config.quantity}"
+                            msg = f"[RISK] Stop new orders: redundancy {redundancy_base:.8f} < quantity {self.config.quantity:.8f}"
                             self.logger.log(msg, "WARNING")
                             if self.enable_notifications:
                                 await self.send_notification(msg)
@@ -3129,7 +3129,7 @@ class TradingBot:
                                             self.logger.log(f"[RISK] Release cancel TP failed: {e_cancel}", "WARNING")
                                         if self.enable_notifications:
                                             await self.send_notification(
-                                                f"[RISK] Released {release_qty} after sustained stop-new (advanced)"
+                                                f"[RISK] Released {release_qty:.8f} after sustained stop-new (advanced)"
                                             )
                             except Exception as e:
                                 self.logger.log(f"[RISK] Release attempt failed: {e}", "WARNING")
@@ -3166,7 +3166,7 @@ class TradingBot:
                                             self.logger.log(f"[RISK] Release cancel TP failed: {e_cancel}", "WARNING")
                                         if self.enable_notifications:
                                             await self.send_notification(
-                                                f"[RISK-BASIC] Released {release_qty} after sustained full position"
+                                                f"[RISK-BASIC] Released {release_qty:.8f} after sustained full position"
                                             )
                             except Exception as e:
                                 self.logger.log(f"[RISK] Release attempt failed: {e}", "WARNING")
@@ -3542,18 +3542,18 @@ class TradingBot:
             self.logger.log("=== Trading Configuration ===", "INFO")
             self.logger.log(f"Ticker: {self.config.ticker}", "INFO")
             self.logger.log(f"Contract ID: {self.config.contract_id}", "INFO")
-            self.logger.log(f"Quantity: {self.config.quantity}", "INFO")
-            self.logger.log(f"Take Profit: {self.config.take_profit}%", "INFO")
+            self.logger.log(f"Quantity: {self.config.quantity:.8f}", "INFO")
+            self.logger.log(f"Take Profit: {self.config.take_profit:.4f}%", "INFO")
             self.logger.log(f"Direction: {self.config.direction}", "INFO")
             self.logger.log(f"Max Orders: {self.config.max_orders}", "INFO")
             self.logger.log(f"Wait Time: {self.config.wait_time}s", "INFO")
             self.logger.log(f"Exchange: {self.config.exchange}", "INFO")
             self.logger.log(f"Trading Mode: {self.trading_mode}", "INFO")
-            self.logger.log(f"Grid Step: {self.config.grid_step}%", "INFO")
-            self.logger.log(f"Stop Price: {self.config.stop_price}", "INFO")
+            self.logger.log(f"Grid Step: {self.config.grid_step:.4f}%", "INFO")
+            self.logger.log(f"Stop Price: {self.config.stop_price:.4f}", "INFO")
             if self.enable_dynamic_sl:
                 self.logger.log(f"Dynamic SL enabled", "INFO")
-            self.logger.log(f"Pause Price: {self.config.pause_price}", "INFO")
+            self.logger.log(f"Pause Price: {self.config.pause_price:.4f}", "INFO")
             self.logger.log(f"Boost Mode: {self.config.boost_mode}", "INFO")
             self.logger.log("=============================", "INFO")
 
