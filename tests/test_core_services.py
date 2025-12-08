@@ -137,4 +137,3 @@ def test_notification_error_dedup(monkeypatch):
         assert third_ts >= second_ts
 
     asyncio.run(_run())
-
