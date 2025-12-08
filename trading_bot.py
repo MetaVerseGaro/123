@@ -300,6 +300,8 @@ class TradingBot:
         self.basic_release_timeout_minutes = getattr(config, "basic_release_timeout_minutes", 0) or 0
         self.stop_new_orders_equity_threshold = Decimal(os.getenv("STOP_NEW_ORDERS_EQUITY_THRESHOLD", "50"))
         self.stop_new_orders = False
+        self.stop_new_orders_reason: Optional[str] = None
+        self.stop_new_orders_since: Optional[float] = None
         self.stop_new_since: Optional[float] = None
         self.basic_full_since: Optional[float] = None
         self.redundancy_insufficient_since: Optional[float] = None
@@ -951,14 +953,14 @@ class TradingBot:
             "[ZIGZAG-TIMING]",
             action.upper(),
             direction.upper(),
-            f"qty={qty_val:.8f}",
-            f"px={price_val:.4f}",
+            f"qty={qty_val}",
+            f"px={price_val}",
         ]
         if exposure is not None:
-            msg_parts.append(f"notional={exposure:.4f}")
+            msg_parts.append(f"notional={exposure}")
         if note:
             msg_parts.append(note)
-        await self.send_notification(" ".join(msg_parts))
+        await self.send_notification(" ".join(str(x) for x in msg_parts))
 
     async def _cancel_zigzag_tp(self):
         """Cancel existing fixed TP order if tracked."""
@@ -993,7 +995,7 @@ class TradingBot:
             self.zigzag_tp_order_id = res.order_id
             self.zigzag_tp_qty = qty
             self._invalidate_order_cache()
-            self.logger.log(f"[ZIGZAG-TIMING] TP placed {side.upper()} qty={qty:.8f} @ {tp_price:.4f} reduce-only", "INFO")
+            self.logger.log(f"[ZIGZAG-TIMING] TP placed {side.upper()} qty={qty} @ {tp_price} reduce-only", "INFO")
         else:
             self.logger.log(f"[ZIGZAG-TIMING] Place TP failed: {getattr(res, 'error_message', '')}", "WARNING")
 
@@ -1101,12 +1103,21 @@ class TradingBot:
         close_side = "sell" if pos_signed > 0 else "buy"
         now_ts = time.time()
         if (now_ts - self._last_flatten_attempt_ts) < 5:
+            wait_left = 5 - (now_ts - self._last_flatten_attempt_ts)
+            self.logger.log(
+                f"[ZIGZAG-TIMING] Flatten blocked: cooldown {wait_left:.2f}s remaining (pos={pos_signed}, side={close_side})",
+                "INFO",
+            )
             return False
         self._last_flatten_attempt_ts = now_ts
         _, remaining = await self._post_only_exit_batch(close_side, pos_abs, best_bid, best_ask, wait_sec=5.0)
         if remaining <= (self.min_order_size or Decimal("0")):
             self._last_flatten_attempt_ts = 0.0
             return True
+        self.logger.log(
+            f"[ZIGZAG-TIMING] Flatten incomplete: remaining {remaining} {close_side} after post-only exit batch",
+            "INFO",
+        )
         return False
 
     async def _execute_zigzag_stop(self, close_side: str, best_bid: Decimal, best_ask: Decimal):
@@ -1188,13 +1199,30 @@ class TradingBot:
         """Process pending zigzag entry: flatten opposite, compute qty, place batch post-only."""
         if not self.pending_entry:
             return
-        if self.stop_new_orders:
-            return
         direction = self.pending_entry
         buffer = self.break_buffer_ticks * self.config.tick_size
         min_qty = self.min_order_size or Decimal("0")
+        if self.stop_new_orders:
+            # 允许平掉反向仓位，但不新开仓
+            ok = await self._flatten_opposite(direction, best_bid, best_ask)
+            if not ok:
+                try:
+                    pos_signed = await self._get_position_signed_cached(force=True)
+                except Exception:
+                    pos_signed = None
+                self.logger.log(
+                    f"[ZIGZAG-TIMING] Pending entry blocked: stop_new_orders active (reason={self.stop_new_orders_reason}) flatten failed pos={pos_signed}",
+                    "INFO",
+                )
+            else:
+                self.logger.log(
+                    f"[ZIGZAG-TIMING] Pending entry blocked: stop_new_orders active (reason={self.stop_new_orders_reason}) but opposite flattened",
+                    "INFO",
+                )
+            return
         if direction == "buy":
             if self.last_confirmed_low is None or self.last_confirmed_high is None:
+                self.logger.log("[ZIGZAG-TIMING] Pending entry buy blocked: missing pivots", "INFO")
                 return
             stop_price = self.last_confirmed_low - buffer
             break_price = self.pending_break_price or (self.last_confirmed_high + buffer)
@@ -1216,6 +1244,7 @@ class TradingBot:
                 pct = Decimal("0.001")
             threshold_price = break_price * (Decimal("1") - pct)
         if anchor_price is None or anchor_price <= 0:
+            self.logger.log("[ZIGZAG-TIMING] Pending entry blocked: invalid anchor price", "INFO")
             return
         if self.zigzag_tp_order_id:
             await self._cancel_zigzag_tp()
@@ -1226,12 +1255,21 @@ class TradingBot:
 
         ok = await self._flatten_opposite(direction, best_bid, best_ask)
         if not ok:
+            try:
+                pos_signed = await self._get_position_signed_cached(force=True)
+            except Exception:
+                pos_signed = None
+            self.logger.log(f"[ZIGZAG-TIMING] Pending entry blocked: flatten failed pos={pos_signed}", "INFO")
             return
 
         current_dir_qty = await self._get_directional_position(direction, force=True)
         target_entry_price = break_price if overshoot else anchor_price
         target_qty = await self._calc_qty_by_risk_zigzag(target_entry_price, stop_price)
         if target_qty is None or target_qty <= 0:
+            self.logger.log(
+                f"[ZIGZAG-TIMING] Pending entry blocked: target_qty invalid (target_qty={target_qty}, entry={target_entry_price}, stop={stop_price})",
+                "INFO",
+            )
             return
         remaining = max(Decimal(0), target_qty - current_dir_qty)
 
@@ -1240,6 +1278,11 @@ class TradingBot:
             if remaining >= min_qty:
                 now_ts = time.time()
                 if (now_ts - self._last_entry_attempt_ts) < 20:
+                    wait_left = 20 - (now_ts - self._last_entry_attempt_ts)
+                    self.logger.log(
+                        f"[ZIGZAG-TIMING] Pending entry blocked: cooldown {wait_left:.2f}s remaining (remaining={remaining}, target={target_qty})",
+                        "INFO",
+                    )
                     return
                 self._last_entry_attempt_ts = now_ts
                 filled, current_dir_qty = await self._post_only_entry_batch(direction, remaining, best_bid, best_ask, wait_sec=20.0)
@@ -1260,6 +1303,10 @@ class TradingBot:
             await self._finalize_pending_entry(direction, current_dir_qty, break_price, stop_price)
             return
         if remaining < min_qty:
+            self.logger.log(
+                f"[ZIGZAG-TIMING] Pending entry blocked: remaining {remaining} < min_qty {min_qty} (overshoot/static)",
+                "INFO",
+            )
             return
         if not self._pending_entry_order_ids:
             placed = await self._place_static_entry_orders(direction, break_price, remaining)
@@ -1402,8 +1449,19 @@ class TradingBot:
                 await self._execute_zigzag_stop("buy", best_bid, best_ask)
                 return
 
-        # Detect breakout signals
+        # Structural close on confirmed pivot breaks (not gated by stop_new_orders/pending_entry)
         buffer = self.break_buffer_ticks * self.config.tick_size
+        if self.direction_lock:
+            if self.direction_lock == "buy" and self.last_confirmed_low is not None and best_bid <= (self.last_confirmed_low - buffer):
+                self.logger.log("[ZIGZAG-TIMING] Structural close: long breaks last confirmed low", "INFO")
+                await self._execute_zigzag_stop("sell", best_bid, best_ask)
+                return
+            if self.direction_lock == "sell" and self.last_confirmed_high is not None and best_ask >= (self.last_confirmed_high + buffer):
+                self.logger.log("[ZIGZAG-TIMING] Structural close: short breaks last confirmed high", "INFO")
+                await self._execute_zigzag_stop("buy", best_bid, best_ask)
+                return
+
+        # Detect breakout signals
         signal = None
         if trade_price is not None:
             if self.last_confirmed_high is not None and trade_price >= (self.last_confirmed_high + buffer):
@@ -1495,8 +1553,8 @@ class TradingBot:
         )
 
 
-    def _set_stop_new_orders(self, enable: bool, mode: Optional[str] = None):
-        """Set stop_new_orders flag and track duration."""
+    def _set_stop_new_orders(self, enable: bool, mode: Optional[str] = None, reason: Optional[str] = None):
+        """Set stop_new_orders flag and track duration with reason logging."""
         mode = mode or self.mode_tag
         if mode != self.mode_tag:
             if self.cache.debug:
@@ -1505,10 +1563,22 @@ class TradingBot:
         if enable:
             if not self.stop_new_orders:
                 self.stop_new_since = time.time()
+                self.stop_new_orders_since = self.stop_new_since
+                self.stop_new_orders_reason = reason or "unspecified"
+                self.logger.log(
+                    f"{self.mode_prefix} stop_new_orders enabled: reason={self.stop_new_orders_reason}",
+                    "INFO",
+                )
             self.stop_new_orders = True
+            if reason:
+                self.stop_new_orders_reason = reason
         else:
+            if self.stop_new_orders:
+                self.logger.log(f"{self.mode_prefix} stop_new_orders disabled", "INFO")
             self.stop_new_orders = False
             self.stop_new_since = None
+            self.stop_new_orders_since = None
+            self.stop_new_orders_reason = None
             self.last_stop_new_notify = False
             self.redundancy_insufficient_since = None
 
@@ -2024,7 +2094,7 @@ class TradingBot:
             sl_result = await self.exchange_client.place_stop_loss_order(quantity, trigger_price, side)
             if sl_result.success:
                 self.current_sl_order_id = sl_result.order_id
-                self.logger.log(f"[SL] Placed native stop-loss {side} qty={quantity:.8f} trig={trigger_price:.4f}", "INFO")
+                self.logger.log(f"[SL] Placed native stop-loss {side} qty={quantity} trig={trigger_price}", "INFO")
             else:
                 self.logger.log(f"[SL] Failed to place native stop-loss: {sl_result.error_message}", "ERROR")
         else:
@@ -2386,6 +2456,10 @@ class TradingBot:
             self.logger.log(f"[SL] Failed to fetch position for refresh: {e}", "WARNING")
             return
 
+        if pos_signed is None:
+            self.logger.log(f"[SL] Position is None, skipping refresh", "WARNING")
+            return
+
         pos_abs = abs(pos_signed)
         if pos_abs == 0:
             self.dynamic_stop_price = None
@@ -2424,7 +2498,7 @@ class TradingBot:
         self._last_stop_eval_price = dyn_stop
         if self.enable_notifications and prev_stop != self.dynamic_stop_price:
             try:
-                await self.send_notification(f"[SL] Dynamic stop updated from {prev_stop:.4f} to {self.dynamic_stop_price:.4f} for {direction.upper()}")
+                await self.send_notification(f"[SL] Dynamic stop updated from {prev_stop} to {self.dynamic_stop_price} for {direction.upper()}")
             except Exception:
                 pass
         # After SL update, re-evaluate redundancy and optionally stop new orders
@@ -2478,7 +2552,7 @@ class TradingBot:
                         close_qty = excess
                         close_side = 'sell' if pos_signed > 0 else 'buy'
                         await self.exchange_client.reduce_only_close_with_retry(close_qty, close_side)
-                        self.logger.log(f"[RISK] Reduced excess position {close_qty:.8f} to keep stop-loss exposure within limit", "WARNING")
+                        self.logger.log(f"[RISK] Reduced excess position {close_qty} to keep stop-loss exposure within limit", "WARNING")
                         self._invalidate_position_cache()
                     except Exception as e:
                         self.logger.log(f"[RISK] Failed to trim excess position: {e}", "ERROR")
@@ -2487,7 +2561,7 @@ class TradingBot:
                 if headroom < needed_headroom:
                     if not self.stop_new_orders and self.enable_notifications:
                         await self.send_notification(f"[RISK] Stop new orders after SL update: headroom {headroom} < qty {self.config.quantity}")
-                    self._set_stop_new_orders(True, mode=self.mode_tag)
+                    self._set_stop_new_orders(True, mode=self.mode_tag, reason="redundancy_insufficient")
                     if self.redundancy_insufficient_since is None:
                         self.redundancy_insufficient_since = time.time()
                     self.last_stop_new_notify = True
@@ -2968,14 +3042,14 @@ class TradingBot:
                     if isinstance(order, dict)
                 )
 
-                self.logger.log(f"Current Position: {position_amt:.8f} | Active closing amount: {active_close_amount:.8f} | "
+                self.logger.log(f"Current Position: {self._round_quantity(position_amt)} | Active closing amount: {self._round_quantity(active_close_amount)} | "
                                 f"Order quantity: {len(self.active_close_orders)}")
                 self.last_log_time = time.time()
                 # Check for position mismatch
                 mismatch_detected = False
                 # 基础风险：最大持仓限制（启用时）
                 if self.enable_basic_risk and self.max_position_limit is not None and position_amt >= self.max_position_limit:
-                    self._set_stop_new_orders(True, mode=self.mode_tag)
+                    self._set_stop_new_orders(True, mode=self.mode_tag, reason="max_position_limit")
                     if self.basic_full_since is None:
                         self.basic_full_since = time.time()
                     if position_amt > self.max_position_limit:
@@ -2983,7 +3057,7 @@ class TradingBot:
                         close_side = self.config.close_order_side
                         try:
                             await self.exchange_client.reduce_only_close_with_retry(excess_pos, close_side)
-                            self.logger.log(f"[RISK-BASIC] Trimmed excess position {excess_pos:.8f} over limit {self.max_position_limit:.8f}", "WARNING")
+                            self.logger.log(f"[RISK-BASIC] Trimmed excess position {excess_pos} over limit {self.max_position_limit}", "WARNING")
                         except Exception as e:
                             self.logger.log(f"[RISK-BASIC] Failed to trim excess position: {e}", "ERROR")
 
@@ -2997,7 +3071,7 @@ class TradingBot:
                         if close_qty < self.min_order_size:
                             close_qty = close_qty + self.config.quantity
                         close_side = self.config.close_order_side
-                        self.logger.log(f"Auto-closing excess position {close_qty:.8f} via reduce-only post-only", "WARNING")
+                        self.logger.log(f"Auto-closing excess position {close_qty} via reduce-only post-only", "WARNING")
                         fix_result = await self.exchange_client.reduce_only_close_with_retry(
                             close_qty, close_side, timeout_sec=5.0, max_attempts=5
                         )
@@ -3017,7 +3091,7 @@ class TradingBot:
                                     break
                                 await self.exchange_client.cancel_order(order['id'])
                                 cancelled += Decimal(order.get('size', 0))
-                                self.logger.log(f"Canceled excess close order {order['id']} size {Decimal(order.get('size', 0)):.8f}", "WARNING")
+                                self.logger.log(f"Canceled excess close order {order['id']} size {order.get('size')}", "WARNING")
                     elif mismatch < 0:
                         # Active close orders exceed position: cancel farthest-from-mid until aligned
                         excess = abs(mismatch)
@@ -3065,11 +3139,11 @@ class TradingBot:
                     redundancy_base = redundancy_u / per_base_loss if per_base_loss > 0 else Decimal(0)
                     if redundancy_base < self.config.quantity:
                         if not self.stop_new_orders:
-                            msg = f"[RISK] Stop new orders: redundancy {redundancy_base:.8f} < quantity {self.config.quantity:.8f}"
+                            msg = f"[RISK] Stop new orders: redundancy {redundancy_base} < quantity {self.config.quantity}"
                             self.logger.log(msg, "WARNING")
                             if self.enable_notifications:
                                 await self.send_notification(msg)
-                        self._set_stop_new_orders(True, mode=self.mode_tag)
+                        self._set_stop_new_orders(True, mode=self.mode_tag, reason="redundancy_insufficient")
                     if self.redundancy_insufficient_since is None:
                         self.redundancy_insufficient_since = time.time()
                     self.last_stop_new_notify = True
@@ -3129,7 +3203,7 @@ class TradingBot:
                                             self.logger.log(f"[RISK] Release cancel TP failed: {e_cancel}", "WARNING")
                                         if self.enable_notifications:
                                             await self.send_notification(
-                                                f"[RISK] Released {release_qty:.8f} after sustained stop-new (advanced)"
+                                                f"[RISK] Released {release_qty} after sustained stop-new (advanced)"
                                             )
                             except Exception as e:
                                 self.logger.log(f"[RISK] Release attempt failed: {e}", "WARNING")
@@ -3166,7 +3240,7 @@ class TradingBot:
                                             self.logger.log(f"[RISK] Release cancel TP failed: {e_cancel}", "WARNING")
                                         if self.enable_notifications:
                                             await self.send_notification(
-                                                f"[RISK-BASIC] Released {release_qty:.8f} after sustained full position"
+                                                f"[RISK-BASIC] Released {release_qty} after sustained full position"
                                             )
                             except Exception as e:
                                 self.logger.log(f"[RISK] Release attempt failed: {e}", "WARNING")
@@ -3256,7 +3330,7 @@ class TradingBot:
             "INFO",
         )
         self.webhook_block_trading = True
-        self._set_stop_new_orders(True, mode=self.mode_tag)
+        self._set_stop_new_orders(True, mode=self.mode_tag, reason="webhook_stop")
         self.webhook_target_direction = webhook_dir
         self.webhook_reverse_pending = self.webhook_reverse
         self.webhook_unwind_last_ts = 0.0
@@ -3542,18 +3616,18 @@ class TradingBot:
             self.logger.log("=== Trading Configuration ===", "INFO")
             self.logger.log(f"Ticker: {self.config.ticker}", "INFO")
             self.logger.log(f"Contract ID: {self.config.contract_id}", "INFO")
-            self.logger.log(f"Quantity: {self.config.quantity:.8f}", "INFO")
-            self.logger.log(f"Take Profit: {self.config.take_profit:.4f}%", "INFO")
+            self.logger.log(f"Quantity: {self._round_quantity(self.config.quantity)}", "INFO")
+            self.logger.log(f"Take Profit: {self.config.take_profit}%", "INFO")
             self.logger.log(f"Direction: {self.config.direction}", "INFO")
             self.logger.log(f"Max Orders: {self.config.max_orders}", "INFO")
             self.logger.log(f"Wait Time: {self.config.wait_time}s", "INFO")
             self.logger.log(f"Exchange: {self.config.exchange}", "INFO")
             self.logger.log(f"Trading Mode: {self.trading_mode}", "INFO")
-            self.logger.log(f"Grid Step: {self.config.grid_step:.4f}%", "INFO")
-            self.logger.log(f"Stop Price: {self.config.stop_price:.4f}", "INFO")
+            self.logger.log(f"Grid Step: {self.config.grid_step}%", "INFO")
+            self.logger.log(f"Stop Price: {self.config.stop_price if self.config.stop_price == -1 else self.exchange_client.round_to_tick(self.config.stop_price)}", "INFO")
             if self.enable_dynamic_sl:
                 self.logger.log(f"Dynamic SL enabled", "INFO")
-            self.logger.log(f"Pause Price: {self.config.pause_price:.4f}", "INFO")
+            self.logger.log(f"Pause Price: {self.config.pause_price if self.config.pause_price == -1 else self.exchange_client.round_to_tick(self.config.pause_price)}", "INFO")
             self.logger.log(f"Boost Mode: {self.config.boost_mode}", "INFO")
             self.logger.log("=============================", "INFO")
 
@@ -3566,7 +3640,7 @@ class TradingBot:
                     await self._maybe_send_daily_pnl()
                     if self.zigzag_timing_enabled:
                         await self._handle_zigzag_timing_cycle()
-                        await asyncio.sleep(0.5)
+                        await asyncio.sleep(2)
                         continue
                     if self.webhook_sl:
                         await self._poll_webhook_direction()
