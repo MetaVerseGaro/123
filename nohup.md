@@ -29,4 +29,18 @@
   sudo kill 12345
   # 或强制：sudo kill -9 12345
   ```
-2025-12-01 08:15:40 | WARNING | [LIGHTER][ETH] [POST_ONLY] Attempt 15353 failed (Order creation error: HTTP response body: code=21706 message='invalid order base or quote amount' additional_properties={}). Retrying with adjusted price.
+_________________________________ ERROR collecting tests/test_risk_modules.py __________________________________
+ImportError while importing test module '/home/lighter/123/tests/test_risk_modules.py'.
+Hint: make sure your test modules/packages have valid Python names.
+Traceback:
+/usr/lib/python3.12/importlib/__init__.py:90: in import_module
+    return _bootstrap._gcd_import(name[level:], package, level)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+tests/test_risk_modules.py:4: in <module>
+    from core.risk_basic import BasicRiskInput, evaluate_basic_risk
+E   ModuleNotFoundError: No module named 'core'
+=========================================== short test summary info ============================================
+ERROR tests/test_risk_modules.py
+!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!! Interrupted: 1 error during collection !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+=============================================== 1 error in 0.08s ===============================================
+(env) lighter@LAPTOP-300BN8JQ:~/123$
