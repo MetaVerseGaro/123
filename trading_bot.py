@@ -9,7 +9,6 @@ import asyncio
 import traceback
 import sys
 import random
-import math
 from pathlib import Path
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -237,8 +236,8 @@ class TradingBot:
         self.direction_lock: Optional[str] = None
         self.pending_entry: Optional[str] = None
         self.pending_break_price: Optional[Decimal] = None
-        self.pending_entry_static_mode: bool = False
         self.pending_break_trigger_ts: Optional[float] = None
+        self.pending_entry_static_mode: bool = False
         self._pending_entry_order_ids: List[str] = []
         self.zigzag_stop_price: Optional[Decimal] = None
         self.zigzag_entry_price: Optional[Decimal] = None
@@ -251,13 +250,6 @@ class TradingBot:
         self.zigzag_timeframe = os.getenv('ZIGZAG_TIMEFRAME', '1m')
         self.zigzag_timeframe_sec = self._parse_timeframe_to_seconds(self.zigzag_timeframe)
         self.zigzag_timeframe_key = self._normalize_timeframe_key(self.zigzag_timeframe)
-        try:
-            cfg_offset = getattr(config, "zigzag_sync_offset_sec", None)
-            env_offset = os.getenv("ZIGZAG_SYNC_OFFSET_SEC")
-            offset_val = cfg_offset if cfg_offset not in (None, "") else env_offset
-            self.zigzag_sync_offset_sec = int(offset_val) if offset_val not in (None, "") else 0
-        except Exception:
-            self.zigzag_sync_offset_sec = 0
         self.symbol_base = self._extract_symbol_base(self.config.ticker)
         self.base_dir = Path(__file__).resolve().parent
         pivot_path_cfg = getattr(config, "zigzag_pivot_file", None)
@@ -273,7 +265,6 @@ class TradingBot:
         self._pivot_poll_interval: float = float(os.getenv("PIVOT_POLL_INTERVAL_SEC", str(int(default_interval))))
         self._webhook_poll_interval: float = float(os.getenv("WEBHOOK_POLL_INTERVAL_SEC", "5"))
         self._last_webhook_poll: float = 0.0
-        self._last_pivot_sync_aligned_ts = 0.0
         # REST throttle lanes to comply with lighter_rate_limits_official.md
         self._rest_last_call: Dict[str, float] = {}
         self.webhook_sl = bool(getattr(config, "webhook_sl", False) or str(os.getenv("WEBHOOK_SL", "false")).lower() == "true")
@@ -785,74 +776,6 @@ class TradingBot:
 
         return await self.cache.get(key, self.ttl_last_price, _fetch, force=force)
 
-    async def _fetch_extreme_price_since(self, start_ts: float, direction: str) -> Optional[Decimal]:
-        tf = self.zigzag_timeframe
-        if not tf:
-            return None
-        try:
-            candles = await self.exchange_client.fetch_history_candles(limit=300, timeframe=tf)
-        except Exception as exc:
-            self.logger.log(f"[ZIGZAG] fetch_history_candles for extreme price failed: {exc}", "WARNING")
-            return None
-        extreme: Optional[Decimal] = None
-        for candle in candles or []:
-            close_ts = self._get_candle_close_ts(candle)
-            if close_ts is None:
-                continue
-            # normalize ms to seconds if needed
-            if close_ts > 1_000_000_000_000:
-                close_ts = close_ts / 1000
-            if close_ts < start_ts:
-                continue
-            if direction == "buy":
-                val = getattr(candle, "low", None) if not isinstance(candle, dict) else candle.get("low")
-            else:
-                val = getattr(candle, "high", None) if not isinstance(candle, dict) else candle.get("high")
-            if val is None:
-                continue
-            price_val = Decimal(str(val))
-            if extreme is None:
-                extreme = price_val
-                continue
-            if direction == "buy" and price_val < extreme:
-                extreme = price_val
-            if direction == "sell" and price_val > extreme:
-                extreme = price_val
-        return extreme
-
-    async def _derive_break_stop_from_latest_pivot(self, direction: str, buffer: Decimal) -> Optional[Decimal]:
-        latest = self._peek_latest_pivot_entry()
-        if not latest:
-            return None
-        close_time = latest.get("close_time")
-        if not isinstance(close_time, datetime):
-            return None
-        label = str(latest.get("label", "")).upper()
-        start_ts = close_time.timestamp()
-        if direction == "buy" and label in ("HH", "LH"):
-            extreme = await self._fetch_extreme_price_since(start_ts, "buy")
-            if extreme is None:
-                return None
-            stop_candidate = extreme - buffer
-            if stop_candidate <= 0:
-                return None
-            self.logger.log(
-                f"[ZIGZAG-TIMING] Long breakout stop derived from min since {close_time.isoformat()}: {stop_candidate}",
-                "INFO",
-            )
-            return stop_candidate
-        if direction == "sell" and label in ("LL", "HL"):
-            extreme = await self._fetch_extreme_price_since(start_ts, "sell")
-            if extreme is None:
-                return None
-            stop_candidate = extreme + buffer
-            self.logger.log(
-                f"[ZIGZAG-TIMING] Short breakout stop derived from max since {close_time.isoformat()}: {stop_candidate}",
-                "INFO",
-            )
-            return stop_candidate
-        return None
-
     async def _get_active_orders_cached(self) -> list:
         key = self._cache_key("orders")
         ttl = self.ttl_active_orders
@@ -1209,9 +1132,8 @@ class TradingBot:
         self._set_direction_all(None, mode="zigzag_timing")
         self.pending_entry = None
         self.pending_break_price = None
+        self.pending_break_trigger_ts = None
         self.pending_entry_static_mode = False
-        self.pending_break_trigger_ts = None
-        self.pending_break_trigger_ts = None
         await self._cancel_pending_entry_orders()
         self.zigzag_stop_price = None
         self.zigzag_entry_price = None
@@ -1234,8 +1156,8 @@ class TradingBot:
             self.dynamic_stop_price = None
         self.pending_entry = None
         self.pending_break_price = None
-        self.pending_entry_static_mode = False
         self.pending_break_trigger_ts = None
+        self.pending_entry_static_mode = False
         self._set_stop_new_orders(False, mode="zigzag_timing")
         self._last_entry_attempt_ts = 0.0
 
@@ -1268,6 +1190,7 @@ class TradingBot:
         self._set_direction_all(direction, mode="zigzag_timing")
         self.pending_entry = None
         self.pending_break_price = None
+        self.pending_break_trigger_ts = None
         self.pending_entry_static_mode = False
         self.zigzag_stop_price = stop_price
         self.zigzag_entry_price = entry_price
@@ -1281,6 +1204,7 @@ class TradingBot:
         if not self.pending_entry:
             return
         direction = self.pending_entry
+        last_pivot = self.recent_pivots[-1] if getattr(self, "recent_pivots", None) else None
         buffer = self.break_buffer_ticks * self.config.tick_size
         min_qty = self.min_order_size or Decimal("0")
         if self.stop_new_orders:
@@ -1306,6 +1230,10 @@ class TradingBot:
                 self.logger.log("[ZIGZAG-TIMING] Pending entry buy blocked: missing pivots", "INFO")
                 return
             stop_price = self.last_confirmed_low - buffer
+            if last_pivot and last_pivot.label in ("HH", "LH") and last_pivot.close_time:
+                extremum = await self._get_extremum_since(last_pivot.close_time, "min", best_bid, best_ask)
+                if extremum is not None:
+                    stop_price = extremum - buffer
             break_price = self.pending_break_price or (self.last_confirmed_high + buffer)
             anchor_price = best_ask
             try:
@@ -1317,6 +1245,10 @@ class TradingBot:
             if self.last_confirmed_high is None or self.last_confirmed_low is None:
                 return
             stop_price = self.last_confirmed_high + buffer
+            if last_pivot and last_pivot.label in ("LL", "HL") and last_pivot.close_time:
+                extremum = await self._get_extremum_since(last_pivot.close_time, "max", best_bid, best_ask)
+                if extremum is not None:
+                    stop_price = extremum + buffer
             break_price = self.pending_break_price or (self.last_confirmed_low - buffer)
             anchor_price = best_bid
             try:
@@ -1324,9 +1256,6 @@ class TradingBot:
             except Exception:
                 pct = Decimal("0.001")
             threshold_price = break_price * (Decimal("1") - pct)
-        override_stop = await self._derive_break_stop_from_latest_pivot(direction, buffer)
-        if override_stop is not None:
-            stop_price = override_stop
         if anchor_price is None or anchor_price <= 0:
             self.logger.log("[ZIGZAG-TIMING] Pending entry blocked: invalid anchor price", "INFO")
             return
@@ -1466,6 +1395,7 @@ class TradingBot:
             changed = self._set_direction_all(actual_dir, mode="zigzag_timing")
             if self.pending_entry and self.pending_entry == actual_dir:
                 self.pending_entry = None
+                self.pending_break_trigger_ts = None
                 changed = True
             if changed:
                 self.logger.log(f"[ZIGZAG-TIMING] Direction realigned to {actual_dir.upper()} based on position {pos_signed}", "INFO")
@@ -1558,10 +1488,10 @@ class TradingBot:
             else:
                 if self.pending_entry != signal:
                     self.pending_entry = signal
+                    self.pending_break_trigger_ts = time.time()
                     self._last_entry_attempt_ts = 0.0
                     self._last_flatten_attempt_ts = 0.0
                     self.pending_entry_static_mode = False
-                    self.pending_break_trigger_ts = time.time()
                     await self._cancel_pending_entry_orders()
                     try:
                         if signal == "buy" and self.last_confirmed_high is not None:
@@ -1679,14 +1609,6 @@ class TradingBot:
             return int(tf)
         except Exception:
             return 60
-
-    def _next_zigzag_sync_timestamp(self, now: float) -> float:
-        interval = float(self.zigzag_timeframe_sec or 60)
-        if interval <= 0:
-            interval = 60
-        offset = float(self.zigzag_sync_offset_sec or 0)
-        base = math.floor((now - offset) / interval) * interval
-        return base + interval + offset
 
     def _resolve_path(self, path_str: str) -> Path:
         """Resolve a file path relative to the project root."""
@@ -2392,14 +2314,66 @@ class TradingBot:
         pivots.sort(key=lambda x: x["close_time"])
         return pivots
 
-    def _peek_latest_pivot_entry(self) -> Optional[Dict[str, Any]]:
-        entries = self._load_pivots_for_config()
-        if not entries:
+    async def _get_extremum_since(self, since: datetime, mode: str, best_bid: Optional[Decimal] = None, best_ask: Optional[Decimal] = None) -> Optional[Decimal]:
+        """Get min/max price from pivot close_time to now using recent candles plus live BBO."""
+        if since is None:
             return None
-        valid = [entry for entry in entries if isinstance(entry.get("close_time"), datetime)]
-        if not valid:
+        try:
+            since_ms = int(since.replace(tzinfo=timezone.utc).timestamp() * 1000)
+        except Exception:
             return None
-        return max(valid, key=lambda entry: entry["close_time"])
+        extremum: Optional[Decimal] = None
+        tf = self.zigzag_timeframe
+        candles = None
+        if hasattr(self.exchange_client, "fetch_history_candles"):
+            try:
+                candles = await self.exchange_client.fetch_history_candles(limit=300, timeframe=tf)
+            except Exception as exc:
+                self.logger.log(f"[ZIGZAG] fetch_history_candles for extremum failed: {exc}", "WARNING")
+        if candles:
+            for c in candles:
+                ts_val = self._get_candle_close_ts(c)
+                if ts_val is None:
+                    continue
+                try:
+                    ts_ms = int(ts_val)
+                except Exception:
+                    continue
+                if ts_ms < 1_000_000_000_000:
+                    ts_ms *= 1000
+                if ts_ms < since_ms:
+                    continue
+                high_val = getattr(c, "high", None) if not isinstance(c, dict) else c.get("high")
+                low_val = getattr(c, "low", None) if not isinstance(c, dict) else c.get("low")
+                if high_val is None or low_val is None:
+                    continue
+                try:
+                    high_d = Decimal(str(high_val))
+                    low_d = Decimal(str(low_val))
+                except Exception:
+                    continue
+                val = low_d if mode == "min" else high_d
+                if extremum is None:
+                    extremum = val
+                else:
+                    if mode == "min" and val < extremum:
+                        extremum = val
+                    if mode == "max" and val > extremum:
+                        extremum = val
+        live_candidates: List[Decimal] = []
+        if best_bid is not None:
+            live_candidates.append(best_bid)
+        if best_ask is not None:
+            live_candidates.append(best_ask)
+        for val in live_candidates:
+            if extremum is None:
+                extremum = val
+            else:
+                if mode == "min" and val < extremum:
+                    extremum = val
+                if mode == "max" and val > extremum:
+                    extremum = val
+        return extremum
 
     async def _build_pivot_point(self, entry: Dict[str, Any]) -> Optional[PivotPoint]:
         """Build PivotPoint with price derived from exchange OHLC data."""
@@ -2447,16 +2421,6 @@ class TradingBot:
         if not self.enable_zigzag:
             return
         now = time.time()
-        aligned_ts = self._next_zigzag_sync_timestamp(now)
-        if not force:
-            if now < aligned_ts:
-                return
-            if aligned_ts <= self._last_pivot_sync_aligned_ts:
-                return
-            self.logger.log(
-                f"[ZIGZAG] Pivot sync aligned at {datetime.fromtimestamp(aligned_ts, timezone.utc).isoformat()}",
-                "DEBUG",
-            )
         current_mtime = 0.0
         try:
             if self.zigzag_pivot_file.exists():
@@ -2464,12 +2428,10 @@ class TradingBot:
         except Exception:
             current_mtime = 0.0
         if (not force) and (now - self._last_pivot_poll < self._pivot_poll_interval) and (current_mtime == self._pivot_file_mtime):
-            self._last_pivot_sync_aligned_ts = aligned_ts
             return
         self._last_pivot_poll = now
         entries = self._load_pivots_for_config()
         if not entries:
-            self._last_pivot_sync_aligned_ts = aligned_ts
             return
         # Debounce rapid successive file writes
         if current_mtime and current_mtime != self._pivot_file_mtime:
@@ -2484,7 +2446,6 @@ class TradingBot:
                 continue
             self._processed_pivot_keys.add(key)
             await self._handle_pivot_event(pivot, notify=notify)
-        self._last_pivot_sync_aligned_ts = aligned_ts
 
     async def _set_initial_direction_from_pivots(self, pivots: List[PivotPoint]):
         """Set initial direction based on latest HH/LL pivot when advanced risk is on."""
@@ -2700,25 +2661,17 @@ class TradingBot:
         """Handle new HL/LH during pending entry: cancel or finalize partial fills."""
         if not self.pending_entry:
             return
-        trigger_ts = self.pending_break_trigger_ts or 0.0
-        pivot_ts = pivot.close_time.timestamp()
-        need_cancel = False
-        if self.pending_entry == "buy" and pivot.label == "HL":
-            if pivot_ts > trigger_ts:
-                need_cancel = True
-            else:
-                self.logger.log(
-                    f"[ZIGZAG-TIMING] HL ignored for pending buy because close_time {pivot.close_time} <= break trigger",
-                    "DEBUG",
-                )
-        if self.pending_entry == "sell" and pivot.label == "LH":
-            if pivot_ts > trigger_ts:
-                need_cancel = True
-            else:
-                self.logger.log(
-                    f"[ZIGZAG-TIMING] LH ignored for pending sell because close_time {pivot.close_time} <= break trigger",
-                    "DEBUG",
-                )
+        need_cancel = (
+            (self.pending_entry == "buy" and pivot.label == "HL")
+            or (self.pending_entry == "sell" and pivot.label == "LH")
+        )
+        if need_cancel and pivot.close_time and self.pending_break_trigger_ts:
+            try:
+                pivot_ts = pivot.close_time.replace(tzinfo=timezone.utc).timestamp()
+            except Exception:
+                pivot_ts = None
+            if pivot_ts is not None and pivot_ts <= self.pending_break_trigger_ts:
+                need_cancel = False
         if not need_cancel:
             return
         current_dir_qty = await self._get_directional_position(self.pending_entry, force=True)
