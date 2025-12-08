@@ -1,5 +1,11 @@
+import sys
 import time
 from decimal import Decimal
+from pathlib import Path
+
+ROOT = Path(__file__).parent.parent
+if str(ROOT) not in sys.path:
+    sys.path.append(str(ROOT))
 
 from core.risk_basic import BasicRiskInput, evaluate_basic_risk
 from core.risk_advanced import AdvancedRiskInput, evaluate_advanced_risk
@@ -116,3 +122,4 @@ def test_advanced_risk_no_stop_when_headroom_ok():
     assert decision.redundancy_insufficient_since is None
     assert decision.trim_excess_qty == Decimal("0")
     assert decision.release_qty == Decimal("0")
+
