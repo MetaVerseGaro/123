@@ -181,11 +181,55 @@ class PivotStore:
             await self._persist()
 
     async def _persist(self) -> None:
+        """Persist pivots while preserving existing price_* fields for retained entries."""
         self.path.parent.mkdir(parents=True, exist_ok=True)
+
+        # Merge existing price fields for entries we still keep
+        try:
+            existing: Dict[str, Dict[str, list]] = {}
+            if self.path.exists():
+                with open(self.path, "r", encoding="utf-8") as f:
+                    existing = json.load(f)
+        except Exception:
+            existing = {}
+
+        merged: Dict[str, Dict[str, list]] = {}
+        for base, tf_map in self.data.items():
+            merged[base] = {}
+            for tf, bucket in tf_map.items():
+                prev_bucket = []
+                try:
+                    prev_bucket = existing.get(base, {}).get(tf, []) or []
+                except Exception:
+                    prev_bucket = []
+                # Build lookup from previous entries for price fields
+                prev_lookup = {}
+                for item in prev_bucket:
+                    key = (item.get("label"), item.get("close_time_utc"))
+                    prev_lookup[key] = {k: v for k, v in item.items() if str(k).startswith("price")}
+
+                new_bucket = []
+                for item in bucket:
+                    key = (item.get("label"), item.get("close_time_utc"))
+                    price_fields = prev_lookup.get(key, {})
+                    # only add price fields that are absent to avoid overwriting upstream values
+                    merged_item = dict(item)
+                    for pk, pv in price_fields.items():
+                        if pk not in merged_item:
+                            merged_item[pk] = pv
+                    new_bucket.append(merged_item)
+
+                # enforce max 10 (oldest trimmed), trimming also discards their prices implicitly
+                if len(new_bucket) > 10:
+                    new_bucket = new_bucket[-10:]
+
+                merged[base][tf] = new_bucket
+
         tmp = self.path.with_suffix(".tmp")
         with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(self.data, f, ensure_ascii=False, indent=2)
+            json.dump(merged, f, ensure_ascii=False, indent=2)
         tmp.replace(self.path)
+        self.data = merged
 
 
 class DirectionStore:
