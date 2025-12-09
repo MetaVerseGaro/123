@@ -1232,6 +1232,8 @@ class TradingBot:
             stop_price = self.last_confirmed_low - buffer
             if last_pivot and last_pivot.label in ("HH", "LH") and last_pivot.close_time:
                 extremum = await self._get_extremum_since(last_pivot.close_time, "min", best_bid, best_ask)
+                fetch_ts_after = time.time()
+                self._log_pivot_price_delay(last_pivot, "low", fetch_ts_after)
                 if extremum is not None:
                     stop_price = extremum - buffer
             break_price = self.pending_break_price or (self.last_confirmed_high + buffer)
@@ -1247,6 +1249,8 @@ class TradingBot:
             stop_price = self.last_confirmed_high + buffer
             if last_pivot and last_pivot.label in ("LL", "HL") and last_pivot.close_time:
                 extremum = await self._get_extremum_since(last_pivot.close_time, "max", best_bid, best_ask)
+                fetch_ts_after = time.time()
+                self._log_pivot_price_delay(last_pivot, "high", fetch_ts_after)
                 if extremum is not None:
                     stop_price = extremum + buffer
             break_price = self.pending_break_price or (self.last_confirmed_low - buffer)
@@ -2375,6 +2379,21 @@ class TradingBot:
                     extremum = val
         return extremum
 
+    def _log_pivot_price_delay(self, pivot: PivotPoint, price_type: str, fetch_ts: float):
+        if not pivot or not pivot.close_time:
+            return
+        try:
+            pivot_ts = pivot.close_time.replace(tzinfo=timezone.utc).timestamp()
+        except Exception:
+            return
+        delay_sec = int(fetch_ts - pivot_ts)
+        pivot_dt = pivot.close_time.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+        fetch_dt = datetime.fromtimestamp(fetch_ts, timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+        self.logger.log(
+            f"[ZIGZAG] Received {pivot.label} at {pivot_dt}, {price_type} price fetched at {fetch_dt}, Δ+{delay_sec}s",
+            "INFO",
+        )
+
     async def _build_pivot_point(self, entry: Dict[str, Any]) -> Optional[PivotPoint]:
         """Build PivotPoint with price derived from exchange OHLC data."""
         price = entry.get("price")
@@ -2467,13 +2486,17 @@ class TradingBot:
         entries = self._load_pivots_for_config()
         if not entries:
             return
-        # 标记已有 pivot，避免启动后重复通知
+        # 先补全缺失价格，再标记 processed，避免覆盖已有价格
         for entry in entries:
             try:
-                key = (entry["close_time"].isoformat(), entry["label"])
+                pivot_point = await self._build_pivot_point(entry)
+            except Exception as exc:
+                self.logger.log(f"[INIT] Build pivot failed: {exc}", "WARNING")
+                pivot_point = None
+            if pivot_point:
+                key = (pivot_point.close_time.isoformat(), pivot_point.label)
+                self._pivot_point_cache[key] = pivot_point
                 self._processed_pivot_keys.add(key)
-            except Exception:
-                continue
         # 仅根据最近 pivot 判向并获取匹配方向的最近止损位，减少 OHLC 查询
         direction, stop_entry = self._determine_initial_direction_and_stop(entries)
         if direction and self.enable_advanced_risk and self.stop_loss_enabled and self.enable_zigzag:
