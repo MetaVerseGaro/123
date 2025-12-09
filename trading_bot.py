@@ -900,6 +900,8 @@ class TradingBot:
             return None
         qty = allowed_risk / unit_risk
         if self.min_order_size:
+            if self.zigzag_timing_enabled and qty < self.min_order_size:
+                return None  # timing 模式下不足最小单直接放弃本次入场
             qty = max(qty, self.min_order_size)
         return self._round_quantity(qty)
 
@@ -1335,7 +1337,14 @@ class TradingBot:
 
     async def _sync_direction_lock(self, force: bool = False) -> Decimal:
         """Keep direction_lock in sync with actual position."""
-        pos_signed = await self._get_position_signed_cached(force=force)
+        # Slow down REST hits when idle/stable; still allow callers to force refresh
+        need_fast = force or bool(
+            self.pending_entry
+            or self.pending_reverse_state
+            or self.pending_reverse_direction
+            or self.webhook_stop_mode
+        )
+        pos_signed = await self._get_position_signed_cached(force=need_fast)
         if pos_signed > 0:
             self.direction_lock = "buy"
         elif pos_signed < 0:
@@ -1514,7 +1523,6 @@ class TradingBot:
         if self.zigzag_timing_enabled:
             needs_fast = bool(
                 self.pending_entry
-                or self.direction_lock
                 or self.redundancy_insufficient_since
                 or self.pending_reverse_state
                 or self.pending_reverse_direction
@@ -2610,6 +2618,9 @@ class TradingBot:
             if self.cache.debug:
                 self.logger.log(f"{self.mode_prefix} skip redundancy_check from mode {mode}", "DEBUG")
             return
+        # Timing 模式不依赖冗余检查来阻止新单，改由方向锁 + min_order_size 控制
+        if self.zigzag_timing_enabled:
+            return
         if not (self.stop_loss_enabled and self.enable_advanced_risk):
             return
         try:
@@ -3219,7 +3230,7 @@ class TradingBot:
                     await self.send_notification(error_message.lstrip())
                     mismatch_detected = True
 
-                if self.enable_advanced_risk and self.stop_loss_enabled and equity is not None:
+                if (not self.zigzag_timing_enabled) and self.enable_advanced_risk and self.stop_loss_enabled and equity is not None:
                     # Redundancy calculation for stop-new-orders gating
                     avg_price = mid_price
                     pos_detail = await self._get_position_detail_prefer_ws()
@@ -3229,7 +3240,7 @@ class TradingBot:
                             avg_price = avg_price_detail
 
                 stop_price = self.dynamic_stop_price if (self.enable_dynamic_sl and self.dynamic_stop_price) else None
-                if self.enable_advanced_risk and self.stop_loss_enabled and stop_price and position_amt > 0:
+                if (not self.zigzag_timing_enabled) and self.enable_advanced_risk and self.stop_loss_enabled and stop_price and position_amt > 0:
                     if position_signed > 0:
                         potential_loss = (avg_price - stop_price) * position_amt
                         per_base_loss = (avg_price - stop_price)
@@ -3261,7 +3272,8 @@ class TradingBot:
 
                 # Release liquidity: advanced uses release_timeout_minutes；基础风险也可用 basic_release_timeout_minutes
                 should_release_advanced = (
-                    self.enable_advanced_risk
+                    (not self.zigzag_timing_enabled)
+                    and self.enable_advanced_risk
                     and self.stop_loss_enabled
                     and self.redundancy_insufficient_since is not None
                     and (time.time() - self.redundancy_insufficient_since > self.release_timeout_minutes * 60)
