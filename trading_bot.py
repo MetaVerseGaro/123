@@ -2580,6 +2580,8 @@ class TradingBot:
                 key = (pivot_point.close_time.isoformat(), pivot_point.label)
                 self._pivot_point_cache[key] = pivot_point
                 self._processed_pivot_keys.add(key)
+                # Seed confirmed high/low so timing mode has break reference on startup
+                self._update_confirmed_pivots(pivot_point)
         # 仅根据最近 pivot 判向并获取匹配方向的最近止损位，减少 OHLC 查询
         direction, stop_entry = self._determine_initial_direction_and_stop(entries)
         if direction and self.enable_advanced_risk and self.stop_loss_enabled and self.enable_zigzag:
