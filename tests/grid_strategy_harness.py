@@ -8,10 +8,16 @@ so no network/API calls are made. Logs are printed to stdout for quick inspectio
 import asyncio
 import itertools
 import os
+import sys
 from decimal import Decimal
 from pathlib import Path
 
 import dotenv
+
+# Ensure repository root is on sys.path for local imports
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 
 from exchanges import ExchangeFactory
 from trading_bot import TradingBot, TradingConfig
