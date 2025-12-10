@@ -27,28 +27,13 @@ python tests/grid_strategy_harness.py
 - 如果需要记录日志到文件，可在 `TradingLogger` 配置中添加文件输出，或在脚本里简单重定向 `bot.logger.log`。 
 
 (env) lighter@LAPTOP-300BN8JQ:~/123$ python tests/grid_strategy_harness.py
-2025-12-10 22:10:35 | INFO | [LIGHTER][ETH] [INIT] Shared BBO file not set; using local WS/REST only
-Traceback (most recent call last):
-  File "/home/lighter/123/tests/grid_strategy_harness.py", line 194, in <module>
-    asyncio.run(main())
-  File "/usr/lib/python3.12/asyncio/runners.py", line 194, in run
-    return runner.run(main)
-           ^^^^^^^^^^^^^^^^
-  File "/usr/lib/python3.12/asyncio/runners.py", line 118, in run
-    return self._loop.run_until_complete(task)
-           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "/usr/lib/python3.12/asyncio/base_events.py", line 687, in run_until_complete
-    return future.result()
-           ^^^^^^^^^^^^^^^
-  File "/home/lighter/123/tests/grid_strategy_harness.py", line 175, in main
-    bot = build_bot_from_config("botA.json")
-          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "/home/lighter/123/tests/grid_strategy_harness.py", line 105, in build_bot_from_config
-    return TradingBot(tc)
-           ^^^^^^^^^^^^^^
-  File "/home/lighter/123/trading_bot.py", line 368, in __init__
-    self._setup_websocket_handlers()
-  File "/home/lighter/123/trading_bot.py", line 1912, in _setup_websocket_handlers
-    self.exchange_client.setup_order_update_handler(order_update_handler)
-    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-AttributeError: 'DummyExchange' object has no attribute 'setup_order_update_handler'
+2025-12-10 22:15:10 | INFO | [LIGHTER][ETH] [INIT] Shared BBO file not set; using local WS/REST only
+2025-12-10 22:15:10 | INFO | [LIGHTER][ETH] [GRID] Starting offline grid strategy harness (3 ticks)
+2025-12-10 22:15:10 | INFO | [LIGHTER][ETH] [GRID] Tick 1
+2025-12-10 22:15:10 | ERROR | [LIGHTER][ETH] Critical error in main loop: 'DummyExchange' object has no attribute 'get_account_positions'
+2025-12-10 22:15:10 | INFO | [LIGHTER][ETH] [NOTIFY] 出现报错：'DummyExchange' object has no attribute 'get_account_positions'
+2025-12-10 22:15:15 | INFO | [LIGHTER][ETH] [GRID] Tick 2
+2025-12-10 22:15:15 | ERROR | [LIGHTER][ETH] Critical error in main loop: 'DummyExchange' object has no attribute 'get_account_positions'
+2025-12-10 22:15:20 | INFO | [LIGHTER][ETH] [GRID] Tick 3
+2025-12-10 22:15:20 | ERROR | [LIGHTER][ETH] Critical error in main loop: 'DummyExchange' object has no attribute 'get_account_positions'
+2025-12-10 22:15:25 | INFO | [LIGHTER][ETH] [GRID] Harness completed
