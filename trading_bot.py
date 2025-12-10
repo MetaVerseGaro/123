@@ -277,6 +277,8 @@ class TradingBot:
         self._log_throttle: Dict[str, Tuple[str, float]] = {}
         self._pending_log_cache: Dict[str, str] = {}
         self._blocked_direction: Optional[str] = None
+        self._hft_block_dir: Optional[str] = None
+        self._hft_block_until: float = 0.0
         # Throttled log tracker to avoid repeated identical logs
         self._log_throttle: Dict[str, Tuple[str, float]] = {}
         default_interval = float(self.zigzag_timeframe_sec or 60)
@@ -1198,6 +1200,7 @@ class TradingBot:
         if pos_abs > 0:
             await self._post_only_exit_batch(close_side, pos_abs, best_bid, best_ask, wait_sec=5.0)
             await self._notify_zigzag_trade("exit", close_side, pos_abs, ref_price, note="stop-hit")
+        prev_dir = self.direction_lock
         self._set_direction_all(None, mode="zigzag_timing")
         self.pending_entry = None
         self.pending_entry_state = None
@@ -1209,6 +1212,10 @@ class TradingBot:
         self.zigzag_entry_price = None
         self.dynamic_stop_price = None
         self.dynamic_stop_can_widen = False
+        # HFT: block same direction reopen for 2 minutes after full close
+        if self.hft_mode and prev_dir:
+            self._hft_block_dir = prev_dir
+            self._hft_block_until = time.time() + 120
 
     async def _cancel_pending_entry_orders(self):
         """Cancel tracked pending entry orders."""
@@ -1439,6 +1446,12 @@ class TradingBot:
                     return
                 if favourable:
                     # 价格更有利：按 3s 节奏追价，取消静态挂单
+                    self._log_once(
+                        f"close_mode:{direction}",
+                        f"{self.timing_prefix} Close favourable: book={book_price} break={break_price} -> chase 3s",
+                        "INFO",
+                        interval=5.0,
+                    )
                     if state.get("static_close_order_ids"):
                         await self._cancel_order_ids(state["static_close_order_ids"])
                         state["static_close_order_ids"] = []
@@ -1450,8 +1463,12 @@ class TradingBot:
                             self._invalidate_position_cache()
                     return
                 # 不利时挂破位价静态单，取消追价
-                if state.get("static_close_order_ids") is None:
-                    state["static_close_order_ids"] = []
+                self._log_once(
+                    f"close_mode_static:{direction}",
+                    f"{self.timing_prefix} Close static at break {break_price} (book={book_price})",
+                    "INFO",
+                    interval=5.0,
+                )
                 if book_price is not None and book_price > 0:
                     if state.get("static_close_order_ids"):
                         pass
@@ -1493,7 +1510,26 @@ class TradingBot:
             await self._cancel_order_ids(state.get("static_open_order_ids", []))
             self._blocked_direction = direction
             self.logger.log(f"{self.timing_prefix} Abandon open: adverse pivot arrived before entry filled; block {direction} until opposite breakout", "INFO")
-            await self._clear_pending_entry_state(clear_direction=True)
+            # 如果仍有反向持仓，重新转为 close-only 追价
+            try:
+                pos_abs = abs(await self._get_position_signed_cached(force=True))
+            except Exception:
+                pos_abs = Decimal(0)
+            if pos_abs > min_qty:
+                state["stage"] = "close"
+                state["force_close_only"] = True
+                state["skip_open"] = True
+                state["static_open_order_ids"] = []
+                state["static_close_order_ids"] = []
+                state["last_close_attempt"] = 0.0
+                self._log_once(
+                    f"re_close:{direction}",
+                    f"{self.timing_prefix} Adverse pivot -> re-enter close-only chasing for remaining pos={pos_abs}",
+                    "INFO",
+                    interval=5.0,
+                )
+            else:
+                await self._clear_pending_entry_state(clear_direction=True)
             return
 
         book_price = best_ask if direction == "buy" else best_bid
@@ -1710,6 +1746,10 @@ class TradingBot:
                 # unblock if opposite breakout
                 if self._blocked_direction and signal != self._blocked_direction:
                     self._blocked_direction = None
+                # HFT 同向冷却 2 分钟
+                if self.hft_mode and self._hft_block_dir == signal and time.time() < self._hft_block_until:
+                    self._log_once("hft_block_dir", f"{self.timing_prefix} Block {signal} until {int(self._hft_block_until - time.time())}s later (cooldown)", "INFO", interval=5.0)
+                    signal = None
                 # block same-direction signal when flagged
                 if self._blocked_direction and signal == self._blocked_direction:
                     self._log_once("blocked_direction", f"{self.timing_prefix} Pending entry blocked for {signal} until opposite breakout", "INFO", interval=10.0)
