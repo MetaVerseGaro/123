@@ -1,0 +1,24 @@
+{
+  "config": {
+    "contract_id": "MOCK",
+    "ticker": "TEST",
+    "exchange": "mock",
+    "tick_size": "0.1",
+    "min_order_size": "1",
+    "break_buffer_ticks": "1",
+    "breakout_static_pct": "0.0",
+    "risk_pct": "1",
+    "enable_dynamic_sl": true,
+    "mode_tag": "zigzag_timing"
+  },
+  "pivots": [
+    {"label": "LL", "price": "99", "close_time": "2024-01-01T00:00:00Z"},
+    {"label": "HH", "price": "101", "close_time": "2024-01-01T00:01:00Z"}
+  ],
+  "bbo": [
+    ["101.2", "101.3"]
+  ],
+  "expected": {
+    "direction_lock": "buy"
+  }
+}
