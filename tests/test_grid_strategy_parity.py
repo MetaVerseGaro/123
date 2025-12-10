@@ -121,6 +121,7 @@ class DummyConfig:
     min_order_size: Decimal = Decimal("0")
     max_position_limit: Decimal = Decimal("0")
     basic_release_timeout_minutes: int = 0
+    ticker: str = "TEST"
 
 
 class DummyServices:
