@@ -95,6 +95,10 @@ class TradingConfig:
     max_fast_close_qty: Optional[Decimal] = None
     break_buffer_ticks: Decimal = Decimal("10")
     breakout_static_pct: Decimal = Decimal("0.1")
+    use_risk_exposure: bool = True
+    leverage: Decimal = Decimal("1")
+    risk_reward: Decimal = Decimal("2")
+    hft_pivot_file: Optional[str] = None
 
     @property
     def close_order_side(self) -> str:
@@ -146,7 +150,8 @@ class TradingBot:
 
         # Mode: grid (default) | zigzag_timing
         self.trading_mode = str(getattr(config, "trading_mode", None) or os.getenv("TRADING_MODE", "grid")).lower()
-        self.zigzag_timing_enabled = self.trading_mode == "zigzag_timing"
+        self.hft_mode = self.trading_mode == "hft"
+        self.zigzag_timing_enabled = self.trading_mode in ("zigzag_timing", "hft")
 
         # Mode tags
         self.mode_tag = self.trading_mode or "grid"
@@ -253,8 +258,12 @@ class TradingBot:
         self.symbol_base = self._extract_symbol_base(self.config.ticker)
         self.base_dir = Path(__file__).resolve().parent
         pivot_path_cfg = getattr(config, "zigzag_pivot_file", None)
+        hft_pivot_cfg = getattr(config, "hft_pivot_file", None)
         dir_path_cfg = getattr(config, "webhook_basic_direction_file", None)
-        self.zigzag_pivot_file = self._resolve_path(pivot_path_cfg or os.getenv('ZIGZAG_PIVOT_FILE', 'zigzag_pivots.json'))
+        default_pivot_env = "HFT_PIVOT_FILE" if self.hft_mode else "ZIGZAG_PIVOT_FILE"
+        default_pivot_name = "hft_pivots.json" if self.hft_mode else "zigzag_pivots.json"
+        pivot_override = hft_pivot_cfg if self.hft_mode else pivot_path_cfg
+        self.zigzag_pivot_file = self._resolve_path(pivot_override or os.getenv(default_pivot_env, default_pivot_name))
         self.basic_direction_file = self._resolve_path(dir_path_cfg or os.getenv('WEBHOOK_BASIC_DIRECTION_FILE', 'webhook_basic_direction.json'))
         self.recent_pivots: deque[PivotPoint] = deque(maxlen=12)
         self._processed_pivot_keys: Set[Tuple[str, str]] = set()
@@ -263,6 +272,8 @@ class TradingBot:
         self._last_pivot_poll: float = 0.0
         default_interval = float(self.zigzag_timeframe_sec or 60)
         self._pivot_poll_interval: float = float(os.getenv("PIVOT_POLL_INTERVAL_SEC", str(int(default_interval))))
+        self._last_pivot_change_ts: float = time.time()
+        self.pending_entry_state: Optional[Dict[str, Any]] = None
         self._webhook_poll_interval: float = float(os.getenv("WEBHOOK_POLL_INTERVAL_SEC", "5"))
         self._last_webhook_poll: float = 0.0
         # REST throttle lanes to comply with lighter_rate_limits_official.md
@@ -297,6 +308,23 @@ class TradingBot:
         # Risk control
 # Risk control
         self.risk_pct = Decimal(os.getenv("RISK_PCT", "0.5"))
+        cfg_use_risk = getattr(config, "use_risk_exposure", None)
+        env_use_risk = os.getenv("USE_RISK_EXPOSURE", None)
+        self.use_risk_exposure = bool(str(cfg_use_risk if cfg_use_risk is not None else (env_use_risk if env_use_risk is not None else "true")).lower() == "true")
+        try:
+            cfg_leverage = getattr(config, "leverage", None)
+            env_leverage = os.getenv("LEVERAGE_MULTIPLIER", os.getenv("LEVERAGE", "1"))
+            val = cfg_leverage if cfg_leverage not in (None, "") else env_leverage
+            self.leverage = Decimal(str(val)) if val not in (None, "") else Decimal("1")
+        except Exception:
+            self.leverage = Decimal("1")
+        try:
+            cfg_rr = getattr(config, "risk_reward", None)
+            env_rr = os.getenv("RISK_REWARD", None)
+            val = cfg_rr if cfg_rr not in (None, "") else env_rr
+            self.risk_reward = Decimal(str(val)) if val not in (None, "") else Decimal("2")
+        except Exception:
+            self.risk_reward = Decimal("2")
         self.release_timeout_minutes = int(os.getenv("RELEASE_TIMEOUT_MINUTES", "10"))
         self.basic_release_timeout_minutes = getattr(config, "basic_release_timeout_minutes", 0) or 0
         self.stop_new_orders_equity_threshold = Decimal(os.getenv("STOP_NEW_ORDERS_EQUITY_THRESHOLD", "50"))
@@ -317,6 +345,7 @@ class TradingBot:
         self.last_daily_pnl_date: Optional[str] = None
         self.daily_pnl_baseline: Optional[Decimal] = None
         self.last_daily_sent_date: Optional[str] = None
+        self.dynamic_stop_can_widen: bool = False
         cfg_adv_risk = getattr(config, "enable_advanced_risk", None)
         cfg_basic_risk = getattr(config, "enable_basic_risk", None)
         self.enable_advanced_risk = (str(cfg_adv_risk).lower() == "true") if cfg_adv_risk is not None else str(os.getenv("ENABLE_ADVANCED_RISK", "true")).lower() == "true"
@@ -905,23 +934,43 @@ class TradingBot:
             qty = max(qty, self.min_order_size)
         return self._round_quantity(qty)
 
-    def _calc_tp_price_rr2(self, entry_price: Decimal, stop_price: Decimal, direction: str) -> Optional[Decimal]:
-        """Calculate TP price at RR 1:2 from entry/stop."""
+    async def _calc_qty_by_leverage(self, entry_price: Decimal) -> Optional[Decimal]:
+        """Calculate target quantity using equity * leverage / entry_price (no stop-distance dependency)."""
+        try:
+            entry_price = Decimal(entry_price)
+        except Exception:
+            return None
+        if entry_price <= 0:
+            return None
+        equity = await self._get_equity_snapshot()
+        if equity is None or equity <= 0:
+            return None
+        notional = equity * self.leverage
+        qty = notional / entry_price
+        if self.min_order_size:
+            qty = max(qty, self.min_order_size)
+        return self._round_quantity(qty)
+
+    def _calc_tp_price_rr2(self, entry_price: Decimal, stop_price: Decimal, direction: str, rr: Optional[Decimal] = None) -> Optional[Decimal]:
+        """Calculate TP price at configurable RR from entry/stop (defaults to 2)."""
         try:
             entry_price = Decimal(entry_price)
             stop_price = Decimal(stop_price)
+            rr_val = Decimal(rr) if rr is not None else Decimal("2")
         except Exception:
+            return None
+        if rr_val <= 0:
             return None
         if direction == "buy":
             risk = entry_price - stop_price
             if risk <= 0:
                 return None
-            tp_price = entry_price + risk * 2
+            tp_price = entry_price + risk * rr_val
         else:
             risk = stop_price - entry_price
             if risk <= 0:
                 return None
-            tp_price = entry_price - risk * 2
+            tp_price = entry_price - risk * rr_val
         try:
             return self.exchange_client.round_to_tick(tp_price)
         except Exception:
@@ -981,7 +1030,10 @@ class TradingBot:
     async def _place_zigzag_tp(self, direction: str, filled_qty: Decimal, entry_price: Decimal, stop_price: Decimal):
         """Place fixed TP at RR 1:2 for 50% position, reduce-only post-only."""
         await self._cancel_zigzag_tp()
-        tp_price = self._calc_tp_price_rr2(entry_price, stop_price, direction)
+        if self.risk_reward <= 0:
+            self.logger.log(f"[ZIGZAG-TIMING] Skip TP: risk_reward {self.risk_reward} <= 0 (entry={entry_price}, stop={stop_price})", "INFO")
+            return
+        tp_price = self._calc_tp_price_rr2(entry_price, stop_price, direction, rr=self.risk_reward)
         if tp_price is None:
             self.logger.log(f"[ZIGZAG-TIMING] Skip TP: tp_price None (entry={entry_price}, stop={stop_price}, dir={direction})", "INFO")
             return
@@ -1133,6 +1185,7 @@ class TradingBot:
             await self._notify_zigzag_trade("exit", close_side, pos_abs, ref_price, note="stop-hit")
         self._set_direction_all(None, mode="zigzag_timing")
         self.pending_entry = None
+        self.pending_entry_state = None
         self.pending_break_price = None
         self.pending_break_trigger_ts = None
         self.pending_entry_static_mode = False
@@ -1140,6 +1193,7 @@ class TradingBot:
         self.zigzag_stop_price = None
         self.zigzag_entry_price = None
         self.dynamic_stop_price = None
+        self.dynamic_stop_can_widen = False
 
     async def _cancel_pending_entry_orders(self):
         """Cancel tracked pending entry orders."""
@@ -1150,12 +1204,22 @@ class TradingBot:
 
     async def _clear_pending_entry_state(self, clear_direction: bool = False):
         """Clear pending entry flags and optionally reset direction/stop state."""
+        # Cancel any tracked static open/close orders from the new breakout flow
+        if self.pending_entry_state:
+            close_ids = self.pending_entry_state.get("static_close_order_ids") or []
+            open_ids = self.pending_entry_state.get("static_open_order_ids") or []
+            to_cancel = [oid for oid in (close_ids + open_ids) if oid]
+            if to_cancel:
+                await self._cancel_order_ids(to_cancel)
+        self.pending_entry_state = None
         await self._cancel_pending_entry_orders()
         if clear_direction:
             self._set_direction_all(None, lock=True, mode="zigzag_timing")
             self.zigzag_stop_price = None
             self.zigzag_entry_price = None
             self.dynamic_stop_price = None
+            self.dynamic_stop_can_widen = False
+            self.dynamic_stop_can_widen = False
         self.pending_entry = None
         self.pending_break_price = None
         self.pending_break_trigger_ts = None
@@ -1197,12 +1261,13 @@ class TradingBot:
         self.zigzag_stop_price = stop_price
         self.zigzag_entry_price = entry_price
         self.dynamic_stop_price = stop_price
+        self.dynamic_stop_can_widen = True
         await self._place_zigzag_tp(direction, filled_qty, entry_price, stop_price)
         await self._notify_zigzag_trade("entry", direction, filled_qty, entry_price)
         self._last_entry_attempt_ts = 0.0
 
-    async def _process_pending_zigzag_entry(self, best_bid: Decimal, best_ask: Decimal):
-        """Process pending zigzag entry: flatten opposite, compute qty, place batch post-only."""
+    async def _process_pending_zigzag_entry_legacy(self, best_bid: Decimal, best_ask: Decimal):
+        """Legacy zigzag entry handler (kept for reference)."""
         if not self.pending_entry:
             return
         direction = self.pending_entry
@@ -1232,12 +1297,6 @@ class TradingBot:
                 self.logger.log("[ZIGZAG-TIMING] Pending entry buy blocked: missing pivots", "INFO")
                 return
             stop_price = self.last_confirmed_low - buffer
-            if last_pivot and last_pivot.label in ("HH", "LH") and last_pivot.close_time:
-                extremum = await self._get_extremum_since(last_pivot.close_time, "min", best_bid, best_ask)
-                fetch_ts_after = time.time()
-                self._log_pivot_price_delay(last_pivot, "low", fetch_ts_after)
-                if extremum is not None:
-                    stop_price = extremum - buffer
             break_price = self.pending_break_price or (self.last_confirmed_high + buffer)
             anchor_price = best_ask
             try:
@@ -1249,12 +1308,6 @@ class TradingBot:
             if self.last_confirmed_high is None or self.last_confirmed_low is None:
                 return
             stop_price = self.last_confirmed_high + buffer
-            if last_pivot and last_pivot.label in ("LL", "HL") and last_pivot.close_time:
-                extremum = await self._get_extremum_since(last_pivot.close_time, "max", best_bid, best_ask)
-                fetch_ts_after = time.time()
-                self._log_pivot_price_delay(last_pivot, "high", fetch_ts_after)
-                if extremum is not None:
-                    stop_price = extremum + buffer
             break_price = self.pending_break_price or (self.last_confirmed_low - buffer)
             anchor_price = best_bid
             try:
@@ -1335,6 +1388,214 @@ class TradingBot:
                     "INFO",
                 )
 
+    async def _process_pending_zigzag_entry(self, best_bid: Decimal, best_ask: Decimal):
+        """Process pending zigzag/hft entry with breakout-driven close+reverse flow."""
+        if not self.pending_entry:
+            return
+        direction = self.pending_entry
+        desired_sign = 1 if direction == "buy" else -1
+        buffer = self.break_buffer_ticks * self.config.tick_size
+        min_qty = self.min_order_size or Decimal("0")
+
+        if self.stop_new_orders:
+            ok = await self._flatten_opposite(direction, best_bid, best_ask)
+            if not ok:
+                try:
+                    pos_signed = await self._get_position_signed_cached(force=True)
+                except Exception:
+                    pos_signed = None
+                self.logger.log(
+                    f"[ZIGZAG-TIMING] Pending entry blocked: stop_new_orders active (reason={self.stop_new_orders_reason}) flatten failed pos={pos_signed}",
+                    "INFO",
+                )
+            else:
+                self.logger.log(
+                    f"[ZIGZAG-TIMING] Pending entry blocked: stop_new_orders active (reason={self.stop_new_orders_reason}) but opposite flattened",
+                    "INFO",
+                )
+            return
+
+        # Build state on first entry attempt
+        if not self.pending_entry_state:
+            if direction == "buy":
+                if self.last_confirmed_low is None or self.last_confirmed_high is None:
+                    self.logger.log("[ZIGZAG-TIMING] Pending entry buy blocked: missing pivots", "INFO")
+                    return
+                stop_price = self.last_confirmed_low - buffer
+                break_price = self.pending_break_price or (self.last_confirmed_high + buffer)
+                anchor_price = best_ask
+            else:
+                if self.last_confirmed_high is None or self.last_confirmed_low is None:
+                    self.logger.log("[ZIGZAG-TIMING] Pending entry sell blocked: missing pivots", "INFO")
+                    return
+                stop_price = self.last_confirmed_high + buffer
+                break_price = self.pending_break_price or (self.last_confirmed_low - buffer)
+                anchor_price = best_bid
+
+            if anchor_price is None or anchor_price <= 0:
+                self.logger.log("[ZIGZAG-TIMING] Pending entry blocked: invalid anchor price", "INFO")
+                return
+            if self.zigzag_tp_order_id:
+                await self._cancel_zigzag_tp()
+
+            target_entry_price = break_price
+            if self.use_risk_exposure:
+                target_qty = await self._calc_qty_by_risk_zigzag(target_entry_price, stop_price)
+            else:
+                target_qty = await self._calc_qty_by_leverage(target_entry_price)
+            if target_qty is None or target_qty <= 0:
+                self.logger.log(
+                    f"[ZIGZAG-TIMING] Pending entry blocked: target_qty invalid (target_qty={target_qty}, entry={target_entry_price}, stop={stop_price})",
+                    "INFO",
+                )
+                return
+
+            # Cancel opposite-side orders before active close
+            await self._cancel_orders_by_side("sell" if direction == "buy" else "buy")
+            self.pending_entry_state = {
+                "direction": direction,
+                "stop_price": stop_price,
+                "break_price": break_price,
+                "target_qty": target_qty,
+                "entry_ref_price": target_entry_price,
+                "pivot_marker": self._last_pivot_change_ts,
+                "last_close_attempt": 0.0,
+                "last_open_attempt": 0.0,
+                "static_close_order_ids": [],
+                "static_open_order_ids": [],
+                "force_close_only": False,
+                "skip_open": False,
+                "stage": "close",
+            }
+
+        state = self.pending_entry_state
+        pivot_updated = self._last_pivot_change_ts > state.get("pivot_marker", 0.0)
+        stop_price = state["stop_price"]
+        break_price = state["break_price"]
+        target_qty = state["target_qty"]
+
+        # Position snapshot
+        pos_signed = await self._get_position_signed_cached(force=True)
+        pos_abs = abs(pos_signed)
+        opposite = (pos_signed * desired_sign) < 0
+
+        # Determine chunk sizing
+        def _chunk_amount(qty: Decimal) -> Decimal:
+            max_per = self.max_fast_close_qty if self.max_fast_close_qty > 0 else qty
+            return min(qty, max_per)
+
+        # Close opposite side first
+        if state.get("stage") == "close":
+            if (not opposite) or pos_abs <= min_qty:
+                if state.get("static_close_order_ids"):
+                    await self._cancel_order_ids(state["static_close_order_ids"])
+                state["static_close_order_ids"] = []
+                state["stage"] = "open"
+            else:
+                close_side = "buy" if pos_signed < 0 else "sell"
+                book_price = best_ask if close_side == "buy" else best_bid
+                now_ts = time.time()
+                # Pivot update while static close pending -> force book price loop and skip open
+                if pivot_updated and state.get("static_close_order_ids"):
+                    await self._cancel_order_ids(state["static_close_order_ids"])
+                    state["static_close_order_ids"] = []
+                    state["force_close_only"] = True
+                    state["skip_open"] = True
+                    state["last_close_attempt"] = 0.0
+                favourable = False
+                if book_price is not None and book_price > 0:
+                    if close_side == "buy":
+                        favourable = book_price < break_price
+                    else:
+                        favourable = book_price > break_price
+                if state.get("force_close_only") or favourable:
+                    if book_price is not None and book_price > 0 and (now_ts - state.get("last_close_attempt", 0.0)) >= 3.0:
+                        qty = _chunk_amount(pos_abs)
+                        res = await self._place_post_only_limit(close_side, qty, book_price, reduce_only=True)
+                        state["last_close_attempt"] = now_ts
+                        if res and res.success:
+                            self._invalidate_position_cache()
+                    return
+                # Static close at break price
+                if not state.get("static_close_order_ids") and book_price is not None and book_price > 0:
+                    remaining_close = pos_abs
+                    placed_ids: List[str] = []
+                    while remaining_close > 0:
+                        qty = _chunk_amount(remaining_close)
+                        res = await self._place_post_only_limit(close_side, qty, break_price, reduce_only=True)
+                        if res and res.success:
+                            placed_ids.append(res.order_id)
+                            remaining_close -= qty
+                        else:
+                            break
+                    if placed_ids:
+                        state["static_close_order_ids"] = placed_ids
+                return
+
+        # If we get here, closing is done or not needed
+        if state.get("skip_open"):
+            await self._clear_pending_entry_state(clear_direction=True)
+            return
+
+        # Opening new direction
+        current_dir_qty = await self._get_directional_position(direction, force=True)
+        remaining = max(Decimal(0), target_qty - current_dir_qty)
+        if remaining <= min_qty:
+            entry_px = state.get("entry_ref_price", break_price)
+            await self._cancel_order_ids(state.get("static_open_order_ids", []))
+            await self._finalize_pending_entry(direction, current_dir_qty, entry_px, stop_price)
+            self.pending_entry_state = None
+            return
+
+        if pivot_updated and remaining > 0:
+            # abandon entry on new pivot if still not in position
+            await self._cancel_order_ids(state.get("static_open_order_ids", []))
+            await self._clear_pending_entry_state(clear_direction=True)
+            return
+
+        book_price = best_ask if direction == "buy" else best_bid
+        favourable_open = False
+        if book_price is not None and book_price > 0:
+            if direction == "buy":
+                favourable_open = book_price < break_price
+            else:
+                favourable_open = book_price > break_price
+
+        now_ts = time.time()
+        if favourable_open and (now_ts - state.get("last_open_attempt", 0.0)) >= 3.0:
+            qty = _chunk_amount(remaining)
+            res = await self._place_post_only_limit(direction, qty, book_price, reduce_only=False)
+            state["last_open_attempt"] = now_ts
+            if res and res.success:
+                state["entry_ref_price"] = book_price
+                self._invalidate_position_cache()
+        elif not favourable_open and not state.get("static_open_order_ids") and book_price is not None and book_price > 0:
+            remaining_open = remaining
+            placed_ids: List[str] = []
+            while remaining_open > 0:
+                qty = _chunk_amount(remaining_open)
+                res = await self._place_post_only_limit(direction, qty, break_price, reduce_only=False)
+                if res and res.success:
+                    placed_ids.append(res.order_id)
+                    remaining_open -= qty
+                else:
+                    break
+            if placed_ids:
+                state["static_open_order_ids"] = placed_ids
+
+        # Check fill progress
+        current_dir_qty = await self._get_directional_position(direction, force=True)
+        if current_dir_qty >= max(min_qty, target_qty - min_qty):
+            entry_px = state.get("entry_ref_price", break_price)
+            await self._cancel_order_ids(state.get("static_open_order_ids", []))
+            await self._finalize_pending_entry(direction, current_dir_qty, entry_px, stop_price)
+            self.pending_entry_state = None
+        else:
+            self.logger.log(
+                f"[ZIGZAG-TIMING] Entry pending ({direction}) filled {current_dir_qty}/{target_qty}",
+                "INFO",
+            )
+
     async def _sync_direction_lock(self, force: bool = False) -> Decimal:
         """Keep direction_lock in sync with actual position."""
         # Slow down REST hits when idle/stable; still allow callers to force refresh
@@ -1409,6 +1670,7 @@ class TradingBot:
             if self.pending_entry and self.pending_entry == actual_dir:
                 self.pending_entry = None
                 self.pending_break_trigger_ts = None
+                self.pending_entry_state = None
                 changed = True
             if changed:
                 self.logger.log(f"[ZIGZAG-TIMING] Direction realigned to {actual_dir.upper()} based on position {pos_signed}", "INFO")
@@ -1426,6 +1688,7 @@ class TradingBot:
         self._set_direction_all(None, mode="zigzag_timing")
         self.dynamic_stop_price = None
         self.dynamic_stop_direction = None
+        self.dynamic_stop_can_widen = False
         if self.zigzag_timing_enabled and not self.webhook_stop_mode:
             self._set_stop_new_orders(False, mode="zigzag_timing")
             self.redundancy_insufficient_since = None
@@ -1501,6 +1764,7 @@ class TradingBot:
             else:
                 if self.pending_entry != signal:
                     self.pending_entry = signal
+                    self.pending_entry_state = None
                     self.pending_break_trigger_ts = time.time()
                     self._last_entry_attempt_ts = 0.0
                     self._last_flatten_attempt_ts = 0.0
@@ -2159,11 +2423,12 @@ class TradingBot:
 
     def _update_confirmed_pivots(self, pivot: PivotPoint):
         """Update confirmed high/low based on external ZigZag pivot."""
-        if pivot.label in ("HH", "LH"):
+        if pivot.label in ("HH", "LH", "H"):
             self.last_confirmed_high = pivot.price
-        if pivot.label in ("LL", "HL"):
+        if pivot.label in ("LL", "HL", "L"):
             self.last_confirmed_low = pivot.price
         self.recent_pivots.append(pivot)
+        self._last_pivot_change_ts = time.time()
 
     def _compute_dynamic_stop(self, direction: str) -> Optional[Decimal]:
         """Compute dynamic stop based on confirmed pivots and configurable tick buffer."""
@@ -2326,67 +2591,6 @@ class TradingBot:
         pivots.sort(key=lambda x: x["close_time"])
         return pivots
 
-    async def _get_extremum_since(self, since: datetime, mode: str, best_bid: Optional[Decimal] = None, best_ask: Optional[Decimal] = None) -> Optional[Decimal]:
-        """Get min/max price from pivot close_time to now using recent candles plus live BBO."""
-        if since is None:
-            return None
-        try:
-            since_ms = int(since.replace(tzinfo=timezone.utc).timestamp() * 1000)
-        except Exception:
-            return None
-        extremum: Optional[Decimal] = None
-        tf = self.zigzag_timeframe
-        candles = None
-        if hasattr(self.exchange_client, "fetch_history_candles"):
-            try:
-                candles = await self.exchange_client.fetch_history_candles(limit=300, timeframe=tf)
-            except Exception as exc:
-                self.logger.log(f"[ZIGZAG] fetch_history_candles for extremum failed: {exc}", "WARNING")
-        if candles:
-            for c in candles:
-                ts_val = self._get_candle_close_ts(c)
-                if ts_val is None:
-                    continue
-                try:
-                    ts_ms = int(ts_val)
-                except Exception:
-                    continue
-                if ts_ms < 1_000_000_000_000:
-                    ts_ms *= 1000
-                if ts_ms < since_ms:
-                    continue
-                high_val = getattr(c, "high", None) if not isinstance(c, dict) else c.get("high")
-                low_val = getattr(c, "low", None) if not isinstance(c, dict) else c.get("low")
-                if high_val is None or low_val is None:
-                    continue
-                try:
-                    high_d = Decimal(str(high_val))
-                    low_d = Decimal(str(low_val))
-                except Exception:
-                    continue
-                val = low_d if mode == "min" else high_d
-                if extremum is None:
-                    extremum = val
-                else:
-                    if mode == "min" and val < extremum:
-                        extremum = val
-                    if mode == "max" and val > extremum:
-                        extremum = val
-        live_candidates: List[Decimal] = []
-        if best_bid is not None:
-            live_candidates.append(best_bid)
-        if best_ask is not None:
-            live_candidates.append(best_ask)
-        for val in live_candidates:
-            if extremum is None:
-                extremum = val
-            else:
-                if mode == "min" and val < extremum:
-                    extremum = val
-                if mode == "max" and val > extremum:
-                    extremum = val
-        return extremum
-
     def _log_pivot_price_delay(self, pivot: PivotPoint, price_type: str, fetch_ts: float):
         if not pivot or not pivot.close_time:
             return
@@ -2411,7 +2615,8 @@ class TradingBot:
                 self.logger.log(f"[ZIGZAG] Missing OHLC for pivot at {entry['close_time']}", "WARNING")
                 return None
             high, low = candle
-            price = high if entry["label"] in ("HH", "LH") else low
+            is_high_label = entry["label"] in ("HH", "LH", "H")
+            price = high if is_high_label else low
             self._persist_pivot_price(entry, price)
         return PivotPoint(
             label=entry["label"],
@@ -2524,6 +2729,38 @@ class TradingBot:
                     self._processed_pivot_keys.add(key)
                     if self.enable_dynamic_sl:
                         await self._refresh_stop_loss(force=True)
+        if self.hft_mode:
+            latest_high_entry = None
+            latest_low_entry = None
+            for entry in entries:
+                try:
+                    label = str(entry.get("label", "")).upper()
+                    close_time = entry.get("close_time")
+                except Exception:
+                    continue
+                if not close_time:
+                    continue
+                if label in ("H", "HH", "LH"):
+                    if (latest_high_entry is None) or (close_time > latest_high_entry.get("close_time")):
+                        latest_high_entry = entry
+                if label in ("L", "LL", "HL"):
+                    if (latest_low_entry is None) or (close_time > latest_low_entry.get("close_time")):
+                        latest_low_entry = entry
+            for candidate in (latest_high_entry, latest_low_entry):
+                if not candidate:
+                    continue
+                key = (candidate["close_time"].isoformat(), candidate["label"])
+                pivot_point = self._pivot_point_cache.get(key)
+                if not pivot_point:
+                    try:
+                        pivot_point = await self._build_pivot_point(candidate)
+                    except Exception as exc:
+                        self.logger.log(f"[INIT] Build HFT pivot failed: {exc}", "WARNING")
+                        pivot_point = None
+                if pivot_point:
+                    self._pivot_point_cache[key] = pivot_point
+                    self._processed_pivot_keys.add(key)
+                    self._update_confirmed_pivots(pivot_point)
 
     async def _notify_recent_pivots(self):
         """Send notification with recent pivots (latest first)."""
@@ -2571,6 +2808,7 @@ class TradingBot:
         if pos_abs == 0:
             self.dynamic_stop_price = None
             self.dynamic_stop_direction = None
+            self.dynamic_stop_can_widen = False
             return
 
         direction = "buy" if pos_signed > 0 else "sell"
@@ -2590,10 +2828,19 @@ class TradingBot:
 
         dyn_stop = struct_stop
         if self.dynamic_stop_price is not None:
-            if direction == "buy":
-                dyn_stop = max(struct_stop, self.dynamic_stop_price)
+            widen = False
+            if direction == "buy" and struct_stop < self.dynamic_stop_price:
+                widen = True
+            if direction == "sell" and struct_stop > self.dynamic_stop_price:
+                widen = True
+            if widen and self.dynamic_stop_can_widen:
+                self.dynamic_stop_can_widen = False
+                dyn_stop = struct_stop
             else:
-                dyn_stop = min(struct_stop, self.dynamic_stop_price)
+                if direction == "buy":
+                    dyn_stop = max(struct_stop, self.dynamic_stop_price)
+                else:
+                    dyn_stop = min(struct_stop, self.dynamic_stop_price)
 
         if (not force) and self.dynamic_stop_price is not None:
             if abs(dyn_stop - self.dynamic_stop_price) < self.config.tick_size:
@@ -2603,6 +2850,7 @@ class TradingBot:
         self.dynamic_stop_price = dyn_stop
         self.dynamic_stop_direction = direction
         self._last_stop_eval_price = dyn_stop
+        self.dynamic_stop_can_widen = False
         if self.enable_notifications and prev_stop != self.dynamic_stop_price:
             try:
                 await self.send_notification(f"[SL] Dynamic stop updated from {prev_stop} to {self.dynamic_stop_price} for {direction.upper()}")

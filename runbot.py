@@ -125,6 +125,12 @@ def merge_config(args, cfg: dict):
     basic = risk.get("basic", {})
     if adv.get("risk_pct") is not None:
         os.environ["RISK_PCT"] = str(adv["risk_pct"])
+    if adv.get("use_risk_exposure") is not None:
+        setattr(args, "use_risk_exposure", bool(adv["use_risk_exposure"]))
+    if adv.get("leverage") is not None:
+        setattr(args, "leverage", Decimal(str(adv["leverage"])))
+    if adv.get("risk_reward") is not None:
+        setattr(args, "risk_reward", Decimal(str(adv["risk_reward"])))
     if adv.get("release_timeout_minutes") is not None:
         os.environ["RELEASE_TIMEOUT_MINUTES"] = str(adv["release_timeout_minutes"])
     if adv.get("stop_new_orders_equity_threshold") is not None:
@@ -275,8 +281,12 @@ async def main():
         webhook_sl_fast=getattr(args, "webhook_sl_fast", False),
         webhook_reverse=getattr(args, "webhook_reverse", False),
         zigzag_pivot_file=os.getenv("ZIGZAG_PIVOT_FILE"),
+        hft_pivot_file=os.getenv("HFT_PIVOT_FILE"),
         webhook_basic_direction_file=os.getenv("WEBHOOK_BASIC_DIRECTION_FILE"),
-        break_buffer_ticks=getattr(args, "break_buffer_ticks", Decimal("10"))
+        break_buffer_ticks=getattr(args, "break_buffer_ticks", Decimal("10")),
+        use_risk_exposure=getattr(args, "use_risk_exposure", True),
+        leverage=getattr(args, "leverage", Decimal("1")),
+        risk_reward=getattr(args, "risk_reward", Decimal("2"))
     )
 
     # Create and run the bot

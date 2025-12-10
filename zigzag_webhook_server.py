@@ -285,6 +285,25 @@ def parse_pivot_from_text(text: str) -> Optional[Tuple[str, str, str, datetime]]
     return label, raw_ticker, timeframe, close_time
 
 
+def parse_hft_pivot_from_text(text: str) -> Optional[Tuple[str, str, str, datetime]]:
+    """Parse HFT pivot payload like 'HFT H | ETHUSDT | TF=1 | pivot bar close (UTC)=2025-12-10 18:10'."""
+    label_match = re.search(r"HFT\s+(H|L)", text, re.IGNORECASE)
+    tf_match = re.search(r"TF\s*=\s*([0-9]+)", text, re.IGNORECASE)
+    time_match = re.search(r"pivot\s+bar\s+close\s*\(UTC\)\s*=\s*([^|]+)", text, re.IGNORECASE)
+    parts = [p.strip() for p in text.split("|") if p.strip()]
+    raw_ticker = None
+    for part in parts:
+        if "." in part or part.isalpha():
+            raw_ticker = part
+            break
+    if not (label_match and tf_match and time_match and raw_ticker):
+        return None
+    label = label_match.group(1).upper()
+    timeframe = normalize_timeframe(tf_match.group(1))
+    close_time = parse_utc_time(time_match.group(1))
+    return label, raw_ticker, timeframe, close_time
+
+
 def parse_direction_from_text(text: str) -> Optional[Tuple[str, str]]:
     """Parse direction payload from plain text like 'buy | ETHUSDT.P'."""
     tokens = [t.strip() for t in text.split("|") if t.strip()]
@@ -301,8 +320,10 @@ async def handle_webhook(request: web.Request) -> web.Response:
     """Handle incoming webhook requests."""
     app = request.app
     pivot_store: PivotStore = app["pivot_store"]
+    hft_pivot_store: PivotStore = app["hft_pivot_store"]
     direction_store: DirectionStore = app["direction_store"]
     await pivot_store.reload_if_changed()
+    await hft_pivot_store.reload_if_changed()
 
     raw_text = ""
     payload: Dict[str, Any] = {}
@@ -316,6 +337,40 @@ async def handle_webhook(request: web.Request) -> web.Response:
 
     event_type = payload.get("type") if isinstance(payload, dict) else None
     logger = logging.getLogger(__name__)
+
+    # HFT pivot handling (json with explicit type/mode/strategy)
+    if isinstance(payload, dict) and payload.get("label") and str(payload.get("label")).upper() in ("H", "L"):
+        mode_val = str(payload.get("mode") or payload.get("strategy") or event_type or "").lower()
+        if mode_val in ("hft", "hft_pivot"):
+            try:
+                label = str(payload.get("label")).upper()
+                raw_ticker = payload.get("ticker") or payload.get("raw_ticker")
+                if not raw_ticker:
+                    raise ValueError("Missing ticker/raw_ticker")
+                timeframe = normalize_timeframe(
+                    payload.get("tf")
+                    or payload.get("timeframe")
+                    or payload.get("resolution")
+                    or payload.get("tf_minutes")
+                )
+                close_time_raw = payload.get("close_time_utc") or payload.get("pivot_bar_close") or payload.get("close_time")
+                if not close_time_raw:
+                    raise ValueError("Missing close_time_utc")
+                close_time = parse_utc_time(str(close_time_raw))
+                base = extract_base_symbol(raw_ticker)
+                await hft_pivot_store.add_pivot(base, timeframe, label, raw_ticker, close_time)
+                logger.info(
+                    "hft pivot stored | base=%s | tf=%s | label=%s | close=%s | raw=%s",
+                    base,
+                    timeframe,
+                    label,
+                    ensure_iso(close_time),
+                    raw_ticker,
+                )
+                return web.json_response({"status": "ok", "type": "hft", "base": base, "timeframe": timeframe})
+            except Exception as exc:
+                logger.error("hft pivot parse failed: %s", exc)
+                return web.json_response({"error": str(exc)}, status=400)
 
     # Pivot handling
     if (isinstance(payload, dict) and payload.get("label")) or (
@@ -354,6 +409,24 @@ async def handle_webhook(request: web.Request) -> web.Response:
         except Exception as exc:
             logger.error("pivot parse failed: %s", exc)
             return web.json_response({"error": str(exc)}, status=400)
+
+    if raw_text:
+        hft_pivot = parse_hft_pivot_from_text(raw_text)
+        if hft_pivot:
+            label, raw_ticker, timeframe, close_time = hft_pivot
+            base = extract_base_symbol(raw_ticker)
+            await hft_pivot_store.add_pivot(base, timeframe, label, raw_ticker, close_time)
+            logger.info(
+                "hft pivot stored | base=%s | tf=%s | label=%s | close=%s | raw=%s",
+                base,
+                timeframe,
+                label,
+                ensure_iso(close_time),
+                raw_ticker,
+            )
+            return web.json_response(
+                {"status": "ok", "type": "hft", "base": base, "timeframe": timeframe}
+            )
 
     if raw_text:
         pivot = parse_pivot_from_text(raw_text)
@@ -429,11 +502,13 @@ async def handle_health(request: web.Request) -> web.Response:
 def create_app() -> web.Application:
     setup_logging()
     pivot_path = resolve_path(os.getenv("ZIGZAG_PIVOT_FILE", "zigzag_pivots.json"))
+    hft_pivot_path = resolve_path(os.getenv("HFT_PIVOT_FILE", "hft_pivots.json"))
     direction_path = resolve_path(
         os.getenv("WEBHOOK_BASIC_DIRECTION_FILE", "webhook_basic_direction.json")
     )
     app = web.Application()
     app["pivot_store"] = PivotStore(pivot_path)
+    app["hft_pivot_store"] = PivotStore(hft_pivot_path)
     app["direction_store"] = DirectionStore(direction_path)
     app.router.add_post("/webhook", handle_webhook)
     app.router.add_get("/health", handle_health)
