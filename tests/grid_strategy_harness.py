@@ -9,6 +9,7 @@ import asyncio
 import itertools
 import os
 import sys
+import json
 from decimal import Decimal
 from pathlib import Path
 
@@ -42,14 +43,29 @@ class DummyExchange:
 
 def build_bot_from_config(config_path: str = "botA.json") -> TradingBot:
     cfg_path = Path(config_path)
-    cfg = cfg_path.read_text(encoding="utf-8")
-    data = dotenv.dotenv_values(".env")
-    # Load env file early if present (mirrors runbot behavior)
-    if Path(".env").exists():
-        dotenv.load_dotenv(".env")
-    import json
 
-    raw = json.loads(cfg)
+    def _load_json_with_comments(path: Path):
+        lines = path.read_text(encoding="utf-8").splitlines()
+        cleaned = []
+        for line in lines:
+            in_str = False
+            new_line = ""
+            for ch in line:
+                if ch == '"' and (not new_line or new_line[-1] != "\\"):
+                    in_str = not in_str
+                if ch == "#" and not in_str:
+                    break
+                new_line += ch
+            cleaned.append(new_line)
+        return json.loads("\n".join(cleaned))
+
+    raw = _load_json_with_comments(cfg_path)
+    # Apply env overrides from config and env_file (best-effort)
+    for k, v in raw.get("env", {}).items():
+        os.environ[str(k)] = str(v)
+    env_path = Path(raw.get("env_file", ".env"))
+    if env_path.exists():
+        dotenv.load_dotenv(env_path)
     trading = raw["trading"]
     risk = raw.get("risk", {})
     adv = risk.get("advanced", {})
