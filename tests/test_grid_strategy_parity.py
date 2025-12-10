@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import unittest
 from dataclasses import dataclass
 from decimal import Decimal
 from pathlib import Path
@@ -36,13 +37,14 @@ class DummyNotifications:
 
 class DummyDataFeeds:
     def __init__(self, bbo_pairs):
-        self._iter = iter(bbo_pairs)
+        self._pairs = list(bbo_pairs)
+        self._iter = iter(self._pairs)
 
     async def get_bbo_cached(self, force: bool = False):
         try:
             bid, ask = next(self._iter)
         except StopIteration:
-            bid, ask = bbo_pairs[-1]
+            bid, ask = self._pairs[-1]
         return Decimal(str(bid)), Decimal(str(ask))
 
 
@@ -167,13 +169,14 @@ async def run_fixture_once(fixture_path: Path):
     }
 
 
-def test_parity_simple_fixture():
-    fixture = Path(__file__).parent / "fixtures" / "grid_parity_simple.json"
-    result = asyncio.run(run_fixture_once(fixture))
-    assert result["opens"] >= result["expected"].get("opens", 1)
-    assert result["closes"] >= result["expected"].get("closes", 1)
-    assert not result["errors"], f"Unexpected errors: {result['errors']}"
+class GridParityTestCase(unittest.TestCase):
+	def test_parity_simple_fixture(self):
+		fixture = Path(__file__).parent / "fixtures" / "grid_parity_simple.json"
+		result = asyncio.run(run_fixture_once(fixture))
+		self.assertGreaterEqual(result["opens"], result["expected"].get("opens", 1))
+		self.assertGreaterEqual(result["closes"], result["expected"].get("closes", 1))
+		self.assertFalse(result["errors"], f"Unexpected errors: {result['errors']}")
 
 
 if __name__ == "__main__":
-    test_parity_simple_fixture()
+    unittest.main()
