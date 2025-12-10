@@ -1332,15 +1332,11 @@ class TradingBot:
             if target_qty is None or target_qty <= 0:
                 reason = self._last_qty_reason
                 if reason and "min_order_size" in reason:
-                    self.logger.log(
-                        f"[ZIGZAG-TIMING] Pending entry blocked: {reason} (entry={target_entry_price}, stop={stop_price})",
-                        "INFO",
-                    )
-                else:
-                    self.logger.log(
-                        f"[ZIGZAG-TIMING] Pending entry blocked: target_qty invalid (target_qty={target_qty}, entry={target_entry_price}, stop={stop_price})",
-                        "INFO",
-                    )
+                    return  # 已在 _notify_min_qty_block 记录/通知，避免重复日志
+                self.logger.log(
+                    f"[ZIGZAG-TIMING] Pending entry blocked: target_qty invalid (target_qty={target_qty}, entry={target_entry_price}, stop={stop_price})",
+                    "INFO",
+                )
                 return
 
             # Cancel opposite-side orders before active close
@@ -1395,6 +1391,10 @@ class TradingBot:
                     state["force_close_only"] = True
                     state["skip_open"] = True
                     state["last_close_attempt"] = 0.0
+                    self.logger.log(
+                        f"[ZIGZAG-TIMING] Pivot updated during static close; force close-only and skip open for this signal",
+                        "INFO",
+                    )
                 favourable = False
                 if book_price is not None and book_price > 0:
                     if close_side == "buy":
@@ -1427,6 +1427,7 @@ class TradingBot:
 
         # If we get here, closing is done or not needed
         if state.get("skip_open"):
+            self.logger.log("[ZIGZAG-TIMING] Skip open due to prior pivot update during close", "INFO")
             await self._clear_pending_entry_state(clear_direction=True)
             return
 
@@ -1443,6 +1444,7 @@ class TradingBot:
         if pivot_updated and remaining > 0:
             # abandon entry on new pivot if still not in position
             await self._cancel_order_ids(state.get("static_open_order_ids", []))
+            self.logger.log("[ZIGZAG-TIMING] Abandon open: pivot updated before entry filled", "INFO")
             await self._clear_pending_entry_state(clear_direction=True)
             return
 
@@ -1462,6 +1464,11 @@ class TradingBot:
             if res and res.success:
                 state["entry_ref_price"] = book_price
                 self._invalidate_position_cache()
+            else:
+                self.logger.log(
+                    f"[ZIGZAG-TIMING] Open attempt failed post-only {direction} qty={qty} @ {book_price}, will retry in 3s",
+                    "INFO",
+                )
         elif not favourable_open and not state.get("static_open_order_ids") and book_price is not None and book_price > 0:
             remaining_open = remaining
             placed_ids: List[str] = []
