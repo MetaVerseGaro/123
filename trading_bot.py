@@ -269,6 +269,9 @@ class TradingBot:
         # Cache built pivot points to avoid repeated OHLC fetches for the same pivot
         self._pivot_point_cache: Dict[Tuple[str, str], PivotPoint] = {}
         self._last_pivot_poll: float = 0.0
+        self._min_qty_block_last_ts: float = 0.0
+        # Track last quantity calc reason to improve logging on invalid qty
+        self._last_qty_reason: Optional[str] = None
         default_interval = float(self.zigzag_timeframe_sec or 60)
         self._pivot_poll_interval: float = float(os.getenv("PIVOT_POLL_INTERVAL_SEC", str(int(default_interval))))
         self._last_pivot_change_ts: float = time.time()
@@ -905,42 +908,55 @@ class TradingBot:
 
     async def _calc_qty_by_risk_zigzag(self, entry_price: Decimal, stop_price: Decimal) -> Optional[Decimal]:
         """Calculate target quantity based on risk_pct and stop distance."""
+        self._last_qty_reason = None
         try:
             entry_price = Decimal(entry_price)
             stop_price = Decimal(stop_price)
         except Exception:
+            self._last_qty_reason = "invalid entry/stop price"
             return None
         unit_risk = abs(entry_price - stop_price)
         if unit_risk <= 0:
+            self._last_qty_reason = "unit_risk <= 0"
             return None
         equity = await self._get_equity_snapshot()
         if equity is None or equity <= 0:
+            self._last_qty_reason = "equity unavailable"
             return None
         allowed_risk = equity * (self.risk_pct / Decimal(100))
         if allowed_risk <= 0:
+            self._last_qty_reason = "allowed_risk <= 0"
             return None
         qty = allowed_risk / unit_risk
         if self.min_order_size:
-            if self.zigzag_timing_enabled and qty < self.min_order_size:
-                return None  # timing 模式下不足最小单直接放弃本次入场
-            qty = max(qty, self.min_order_size)
+            if qty < self.min_order_size:
+                self._last_qty_reason = f"calc qty {qty} < min_order_size {self.min_order_size}"
+                await self._notify_min_qty_block(qty, entry_price=entry_price, stop_price=stop_price)
+                return None
         return self._round_quantity(qty)
 
     async def _calc_qty_by_leverage(self, entry_price: Decimal) -> Optional[Decimal]:
         """Calculate target quantity using equity * leverage / entry_price (no stop-distance dependency)."""
+        self._last_qty_reason = None
         try:
             entry_price = Decimal(entry_price)
         except Exception:
+            self._last_qty_reason = "invalid entry price"
             return None
         if entry_price <= 0:
+            self._last_qty_reason = "entry_price <= 0"
             return None
         equity = await self._get_equity_snapshot()
         if equity is None or equity <= 0:
+            self._last_qty_reason = "equity unavailable"
             return None
         notional = equity * self.leverage
         qty = notional / entry_price
         if self.min_order_size:
-            qty = max(qty, self.min_order_size)
+            if qty < self.min_order_size:
+                self._last_qty_reason = f"calc qty {qty} < min_order_size {self.min_order_size}"
+                await self._notify_min_qty_block(qty, entry_price=entry_price, stop_price=None)
+                return None
         return self._round_quantity(qty)
 
     def _calc_tp_price_rr2(self, entry_price: Decimal, stop_price: Decimal, direction: str, rr: Optional[Decimal] = None) -> Optional[Decimal]:
@@ -1314,10 +1330,17 @@ class TradingBot:
             else:
                 target_qty = await self._calc_qty_by_leverage(target_entry_price)
             if target_qty is None or target_qty <= 0:
-                self.logger.log(
-                    f"[ZIGZAG-TIMING] Pending entry blocked: target_qty invalid (target_qty={target_qty}, entry={target_entry_price}, stop={stop_price})",
-                    "INFO",
-                )
+                reason = self._last_qty_reason
+                if reason and "min_order_size" in reason:
+                    self.logger.log(
+                        f"[ZIGZAG-TIMING] Pending entry blocked: {reason} (entry={target_entry_price}, stop={stop_price})",
+                        "INFO",
+                    )
+                else:
+                    self.logger.log(
+                        f"[ZIGZAG-TIMING] Pending entry blocked: target_qty invalid (target_qty={target_qty}, entry={target_entry_price}, stop={stop_price})",
+                        "INFO",
+                    )
                 return
 
             # Cancel opposite-side orders before active close
@@ -2475,6 +2498,22 @@ class TradingBot:
             f"[ZIGZAG] Received {pivot.label} at {pivot_dt}, {price_type} price fetched at {fetch_dt}, Δ+{delay_sec}s",
             "INFO",
         )
+
+    async def _notify_min_qty_block(self, qty: Decimal, entry_price: Optional[Decimal] = None, stop_price: Optional[Decimal] = None):
+        """Log + (throttled) notify when calculated qty is below min_order_size."""
+        msg_parts = [
+            f"{self.mode_prefix} calc qty {qty} < min_order_size {self.min_order_size}; skip entry"
+        ]
+        if entry_price is not None:
+            msg_parts.append(f"entry={entry_price}")
+        if stop_price is not None:
+            msg_parts.append(f"stop={stop_price}")
+        msg = " ".join(str(x) for x in msg_parts)
+        self.logger.log(msg, "INFO")
+        now_ts = time.time()
+        if self.enable_notifications and (now_ts - self._min_qty_block_last_ts > 5):
+            await self.send_notification(msg)
+        self._min_qty_block_last_ts = now_ts
 
     async def _build_pivot_point(self, entry: Dict[str, Any]) -> Optional[PivotPoint]:
         """Build PivotPoint with price derived from exchange OHLC data."""
