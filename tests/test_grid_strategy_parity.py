@@ -119,7 +119,7 @@ class DummyConfig:
     close_order_side: str = "sell"
     mode_tag: str = "grid"
     min_order_size: Decimal = Decimal("0")
-    max_position_limit: Decimal = Decimal("0")
+    max_position_limit: Decimal | None = None
     basic_release_timeout_minutes: int = 0
     ticker: str = "TEST"
 
