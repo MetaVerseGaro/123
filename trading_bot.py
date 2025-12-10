@@ -275,6 +275,8 @@ class TradingBot:
         self._last_qty_reason: Optional[str] = None
         # Throttled log tracker to avoid repeated identical logs
         self._log_throttle: Dict[str, Tuple[str, float]] = {}
+        self._pending_log_cache: Dict[str, str] = {}
+        self._blocked_direction: Optional[str] = None
         # Throttled log tracker to avoid repeated identical logs
         self._log_throttle: Dict[str, Tuple[str, float]] = {}
         default_interval = float(self.zigzag_timeframe_sec or 60)
@@ -1426,9 +1428,9 @@ class TradingBot:
                         favourable = book_price < break_price  # closing short at better price
                     else:
                         favourable = book_price > break_price  # closing long at better price
-                # 被强制 close-only：优先追价平仓
+                # 被强制 close-only：若已有挂单则等待，否则按盘口价挂一次
                 if state.get("force_close_only"):
-                    if book_price is not None and book_price > 0 and (now_ts - state.get("last_close_attempt", 0.0)) >= 3.0:
+                    if not state.get("static_close_order_ids") and book_price is not None and book_price > 0:
                         qty = _chunk_amount(pos_abs)
                         res = await self._place_post_only_limit(close_side, qty, book_price, reduce_only=True)
                         state["last_close_attempt"] = now_ts
@@ -1436,6 +1438,10 @@ class TradingBot:
                             self._invalidate_position_cache()
                     return
                 if favourable:
+                    # 价格更有利：按 3s 节奏追价，取消静态挂单
+                    if state.get("static_close_order_ids"):
+                        await self._cancel_order_ids(state["static_close_order_ids"])
+                        state["static_close_order_ids"] = []
                     if book_price is not None and book_price > 0 and (now_ts - state.get("last_close_attempt", 0.0)) >= 3.0:
                         qty = _chunk_amount(pos_abs)
                         res = await self._place_post_only_limit(close_side, qty, book_price, reduce_only=True)
@@ -1443,20 +1449,25 @@ class TradingBot:
                         if res and res.success:
                             self._invalidate_position_cache()
                     return
-                # 不利时挂破位价静态单
-                if not state.get("static_close_order_ids") and book_price is not None and book_price > 0:
-                    remaining_close = pos_abs
-                    placed_ids: List[str] = []
-                    while remaining_close > 0:
-                        qty = _chunk_amount(remaining_close)
-                        res = await self._place_post_only_limit(close_side, qty, break_price, reduce_only=True)
-                        if res and res.success:
-                            placed_ids.append(res.order_id)
-                            remaining_close -= qty
-                        else:
-                            break
-                    if placed_ids:
-                        state["static_close_order_ids"] = placed_ids
+                # 不利时挂破位价静态单，取消追价
+                if state.get("static_close_order_ids") is None:
+                    state["static_close_order_ids"] = []
+                if book_price is not None and book_price > 0:
+                    if state.get("static_close_order_ids"):
+                        pass
+                    else:
+                        remaining_close = pos_abs
+                        placed_ids: List[str] = []
+                        while remaining_close > 0:
+                            qty = _chunk_amount(remaining_close)
+                            res = await self._place_post_only_limit(close_side, qty, break_price, reduce_only=True)
+                            if res and res.success:
+                                placed_ids.append(res.order_id)
+                                remaining_close -= qty
+                            else:
+                                break
+                        if placed_ids:
+                            state["static_close_order_ids"] = placed_ids
                 return
 
         # If we get here, closing is done or not needed
@@ -1478,9 +1489,10 @@ class TradingBot:
             return
 
         if open_adverse and remaining > 0:
-            # abandon entry only when adverse pivot appears before entry filled
+            # abandon entry only when adverse pivot appears before entry filled, and block this direction until opposite breakout
             await self._cancel_order_ids(state.get("static_open_order_ids", []))
-            self.logger.log(f"{self.timing_prefix} Abandon open: adverse pivot arrived before entry filled", "INFO")
+            self._blocked_direction = direction
+            self.logger.log(f"{self.timing_prefix} Abandon open: adverse pivot arrived before entry filled; block {direction} until opposite breakout", "INFO")
             await self._clear_pending_entry_state(clear_direction=True)
             return
 
@@ -1527,12 +1539,7 @@ class TradingBot:
             await self._finalize_pending_entry(direction, current_dir_qty, entry_px, stop_price)
             self.pending_entry_state = None
         else:
-            self._log_once(
-                f"entry_pending:{direction}",
-                f"{self.timing_prefix} Entry pending ({direction}) filled {current_dir_qty}/{target_qty}",
-                "INFO",
-                interval=5.0,
-            )
+            self._log_pending_entry_progress(direction, current_dir_qty, target_qty)
 
     async def _sync_direction_lock(self, force: bool = False) -> Decimal:
         """Keep direction_lock in sync with actual position."""
@@ -1700,21 +1707,28 @@ class TradingBot:
             if self.direction_lock and self.direction_lock == signal:
                 signal = None
             else:
-                if self.pending_entry != signal:
-                    self.pending_entry = signal
-                    self.pending_entry_state = None
-                    self.pending_break_trigger_ts = time.time()
-                    self._last_entry_attempt_ts = 0.0
-                    self._last_flatten_attempt_ts = 0.0
-                    self.pending_entry_static_mode = False
-                    await self._cancel_pending_entry_orders()
-                    try:
-                        if signal == "buy" and self.last_confirmed_high is not None:
-                            self.pending_break_price = self.last_confirmed_high + buffer
-                        elif signal == "sell" and self.last_confirmed_low is not None:
-                            self.pending_break_price = self.last_confirmed_low - buffer
-                    except Exception:
-                        self.pending_break_price = None
+                # unblock if opposite breakout
+                if self._blocked_direction and signal != self._blocked_direction:
+                    self._blocked_direction = None
+                # block same-direction signal when flagged
+                if self._blocked_direction and signal == self._blocked_direction:
+                    self._log_once("blocked_direction", f"{self.timing_prefix} Pending entry blocked for {signal} until opposite breakout", "INFO", interval=10.0)
+                    signal = None
+            if signal and self.pending_entry != signal:
+                self.pending_entry = signal
+                self.pending_entry_state = None
+                self.pending_break_trigger_ts = time.time()
+                self._last_entry_attempt_ts = 0.0
+                self._last_flatten_attempt_ts = 0.0
+                self.pending_entry_static_mode = False
+                await self._cancel_pending_entry_orders()
+                try:
+                    if signal == "buy" and self.last_confirmed_high is not None:
+                        self.pending_break_price = self.last_confirmed_high + buffer
+                    elif signal == "sell" and self.last_confirmed_low is not None:
+                        self.pending_break_price = self.last_confirmed_low - buffer
+                except Exception:
+                    self.pending_break_price = None
 
         if self.pending_entry:
             await self._process_pending_zigzag_entry(best_bid, best_ask)
@@ -2571,6 +2585,15 @@ class TradingBot:
             return
         self._log_throttle[key] = (msg, now_ts)
         self.logger.log(msg, level)
+
+        def _log_pending_entry_progress(self, direction: str, filled: Decimal, target: Decimal):
+            key = f"pending_entry:{direction}"
+            msg = f"{self.timing_prefix} Entry pending ({direction}) filled {filled}/{target}"
+            last = self._pending_log_cache.get(key)
+            if last == msg:
+                return
+            self._pending_log_cache[key] = msg
+            self.logger.log(msg, "INFO")
 
     async def _build_pivot_point(self, entry: Dict[str, Any]) -> Optional[PivotPoint]:
         """Build PivotPoint with price derived from exchange OHLC data."""
