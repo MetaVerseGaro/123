@@ -144,7 +144,7 @@ async def run_harness_ticks(ticks: int = 2):
 
 class GridStrategyHarnessTest(unittest.TestCase):
     def test_grid_strategy_smoke(self):
-        exchange, notifications = asyncio.get_event_loop().run_until_complete(run_harness_ticks())
+        exchange, notifications = asyncio.run(run_harness_ticks())
         self.assertTrue(exchange.close_orders, "GridStrategy should place at least one close order")
         self.assertFalse(notifications.errors, "No errors should be emitted in smoke harness")
 
