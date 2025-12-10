@@ -273,6 +273,10 @@ class TradingBot:
         self._min_qty_block_last_ts: float = 0.0
         # Track last quantity calc reason to improve logging on invalid qty
         self._last_qty_reason: Optional[str] = None
+        # Throttled log tracker to avoid repeated identical logs
+        self._log_throttle: Dict[str, Tuple[str, float]] = {}
+        # Throttled log tracker to avoid repeated identical logs
+        self._log_throttle: Dict[str, Tuple[str, float]] = {}
         default_interval = float(self.zigzag_timeframe_sec or 60)
         self._pivot_poll_interval: float = float(os.getenv("PIVOT_POLL_INTERVAL_SEC", str(int(default_interval))))
         self._last_pivot_change_ts: float = time.time()
@@ -1457,7 +1461,7 @@ class TradingBot:
 
         # If we get here, closing is done or not needed
         if state.get("skip_open"):
-            self.logger.log(f"{self.timing_prefix} Skip open due to prior pivot update during close", "INFO")
+            self._log_once("skip_open", f"{self.timing_prefix} Skip open due to prior pivot update during close", "INFO", interval=10.0)
             await self._clear_pending_entry_state(clear_direction=True)
             return
 
@@ -1523,9 +1527,11 @@ class TradingBot:
             await self._finalize_pending_entry(direction, current_dir_qty, entry_px, stop_price)
             self.pending_entry_state = None
         else:
-            self.logger.log(
+            self._log_once(
+                f"entry_pending:{direction}",
                 f"{self.timing_prefix} Entry pending ({direction}) filled {current_dir_qty}/{target_qty}",
                 "INFO",
+                interval=5.0,
             )
 
     async def _sync_direction_lock(self, force: bool = False) -> Decimal:
@@ -2541,7 +2547,7 @@ class TradingBot:
     async def _notify_min_qty_block(self, qty: Decimal, entry_price: Optional[Decimal] = None, stop_price: Optional[Decimal] = None):
         """Log + (throttled) notify when calculated qty is below min_order_size."""
         msg_parts = [
-            f"{self.mode_prefix} calc qty {qty} < min_order_size {self.min_order_size}; skip entry"
+            f"{self.timing_prefix} calc qty {qty} < min_order_size {self.min_order_size}; skip entry"
         ]
         if entry_price is not None:
             msg_parts.append(f"entry={entry_price}")
@@ -2553,6 +2559,18 @@ class TradingBot:
         if self.enable_notifications and (now_ts - self._min_qty_block_last_ts > 5):
             await self.send_notification(msg)
         self._min_qty_block_last_ts = now_ts
+
+    def _log_once(self, key: str, msg: str, level: str = "INFO", interval: float = 3.0):
+        """
+        Log only when message changes or interval elapses to reduce noisy repeats.
+        key: logical bucket (include direction/signal as needed)
+        """
+        now_ts = time.time()
+        last_msg, last_ts = self._log_throttle.get(key, ("", 0.0))
+        if msg == last_msg and (now_ts - last_ts) < interval:
+            return
+        self._log_throttle[key] = (msg, now_ts)
+        self.logger.log(msg, level)
 
     async def _build_pivot_point(self, entry: Dict[str, Any]) -> Optional[PivotPoint]:
         """Build PivotPoint with price derived from exchange OHLC data."""
