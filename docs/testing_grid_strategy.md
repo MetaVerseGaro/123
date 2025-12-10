@@ -25,3 +25,9 @@ python tests/grid_strategy_harness.py
   - 删掉 `ExchangeFactory.create_exchange` 的 monkeypatch，即可回落到真实交易所客户端。
   - 移除 `_place_and_monitor_open_order` 的 mock，改为实际下单时请先在测试账户/只读模式验证。
 - 如果需要记录日志到文件，可在 `TradingLogger` 配置中添加文件输出，或在脚本里简单重定向 `bot.logger.log`。 
+
+(env) lighter@LAPTOP-300BN8JQ:~/123$ python tests/grid_strategy_harness.py
+Traceback (most recent call last):
+  File "/home/lighter/123/tests/grid_strategy_harness.py", line 16, in <module>
+    from exchanges import ExchangeFactory
+ModuleNotFoundError: No module named 'exchanges'
