@@ -27,9 +27,18 @@
 ## 若需查看详细日志
 - 将 `DummyLogger` 的输出重定向到文件，或在真实实例里替换为 `helpers.logger.TradingLogger`，以便对拍 legacy 日志。
 
-(env) lighter@LAPTOP-300BN8JQ:~/123$ python -m unittest tests.test_grid_strategy_parity
-.
-----------------------------------------------------------------------
-Ran 1 test in 0.001s
-
-OK
+==================================================== ERRORS ====================================================
+_____________________________ ERROR collecting tests/test_zigzag_timing_parity.py ______________________________
+ImportError while importing test module '/home/lighter/123/tests/test_zigzag_timing_parity.py'.
+Hint: make sure your test modules/packages have valid Python names.
+Traceback:
+/usr/lib/python3.12/importlib/__init__.py:90: in import_module
+    return _bootstrap._gcd_import(name[level:], package, level)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+tests/test_zigzag_timing_parity.py:12: in <module>
+    from core import AsyncCache
+E   ModuleNotFoundError: No module named 'core'
+=========================================== short test summary info ============================================
+ERROR tests/test_zigzag_timing_parity.py
+!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!! Interrupted: 1 error during collection !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+=============================================== 1 error in 0.11s ===============================================
