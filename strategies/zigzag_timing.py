@@ -494,7 +494,7 @@ class ZigZagTimingStrategy(BaseStrategy):
                 new_dir = "sell"
             if new_dir and new_dir != getattr(self.config, "direction", None):
                 self._set_direction_all(new_dir, lock=False)
-                self.logger.log(f"[ZIGZAG-TIMING] Flat breakout sets direction to {new_dir.upper()}", "INFO")
+                self.logger.log(f"[ZIGZAG-TIMING] Flat breakout sets direction intent to {new_dir.upper()}", "INFO")
 
     async def _close_residual_position_market(self, pos_signed: Decimal) -> bool:
         pos_abs = abs(pos_signed)
@@ -528,9 +528,10 @@ class ZigZagTimingStrategy(BaseStrategy):
             self.dynamic_stop_direction = self.direction_lock
 
     def _set_direction_all(self, direction: Optional[str], lock: bool = True):
-        self.direction_lock = direction if lock else direction
-        if direction is not None:
-            setattr(self.config, "direction", direction)
+        if lock:
+            self.direction_lock = direction
+        # when not locking, leave direction_lock untouched (used for intent without holding position)
+        setattr(self.config, "direction", direction)
         return True
 
     def _set_stop_new_orders(self, enable: bool, reason: Optional[str]):
