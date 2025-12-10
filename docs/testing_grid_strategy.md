@@ -27,13 +27,13 @@ python tests/grid_strategy_harness.py
 - 如果需要记录日志到文件，可在 `TradingLogger` 配置中添加文件输出，或在脚本里简单重定向 `bot.logger.log`。 
 
 (env) lighter@LAPTOP-300BN8JQ:~/123$ python tests/grid_strategy_harness.py
-2025-12-10 22:15:10 | INFO | [LIGHTER][ETH] [INIT] Shared BBO file not set; using local WS/REST only
-2025-12-10 22:15:10 | INFO | [LIGHTER][ETH] [GRID] Starting offline grid strategy harness (3 ticks)
-2025-12-10 22:15:10 | INFO | [LIGHTER][ETH] [GRID] Tick 1
-2025-12-10 22:15:10 | ERROR | [LIGHTER][ETH] Critical error in main loop: 'DummyExchange' object has no attribute 'get_account_positions'
-2025-12-10 22:15:10 | INFO | [LIGHTER][ETH] [NOTIFY] 出现报错：'DummyExchange' object has no attribute 'get_account_positions'
-2025-12-10 22:15:15 | INFO | [LIGHTER][ETH] [GRID] Tick 2
-2025-12-10 22:15:15 | ERROR | [LIGHTER][ETH] Critical error in main loop: 'DummyExchange' object has no attribute 'get_account_positions'
-2025-12-10 22:15:20 | INFO | [LIGHTER][ETH] [GRID] Tick 3
-2025-12-10 22:15:20 | ERROR | [LIGHTER][ETH] Critical error in main loop: 'DummyExchange' object has no attribute 'get_account_positions'
-2025-12-10 22:15:25 | INFO | [LIGHTER][ETH] [GRID] Harness completed
+2025-12-10 22:20:52 | INFO | [LIGHTER][ETH] [INIT] Shared BBO file not set; using local WS/REST only
+2025-12-10 22:20:52 | INFO | [LIGHTER][ETH] [GRID] Starting offline grid strategy harness (3 ticks)
+2025-12-10 22:20:52 | INFO | [LIGHTER][ETH] [GRID] Tick 1
+2025-12-10 22:20:52 | ERROR | [LIGHTER][ETH] Critical error in main loop: object decimal.Decimal can't be used in 'await' expression
+2025-12-10 22:20:52 | INFO | [LIGHTER][ETH] [NOTIFY] 出现报错：object decimal.Decimal can't be used in 'await' expression
+2025-12-10 22:20:57 | INFO | [LIGHTER][ETH] [GRID] Tick 2
+2025-12-10 22:20:57 | ERROR | [LIGHTER][ETH] Critical error in main loop: object decimal.Decimal can't be used in 'await' expression
+2025-12-10 22:21:02 | INFO | [LIGHTER][ETH] [GRID] Tick 3
+2025-12-10 22:21:02 | ERROR | [LIGHTER][ETH] Critical error in main loop: object decimal.Decimal can't be used in 'await' expression
+2025-12-10 22:21:07 | INFO | [LIGHTER][ETH] [GRID] Harness completed
