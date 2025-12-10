@@ -255,6 +255,7 @@ class TradingBot:
         self.zigzag_timeframe_sec = self._parse_timeframe_to_seconds(self.zigzag_timeframe)
         self.zigzag_timeframe_key = self._normalize_timeframe_key(self.zigzag_timeframe)
         self.symbol_base = self._extract_symbol_base(self.config.ticker)
+        self.timing_prefix = "[HFT]" if self.hft_mode else "[ZIGZAG-TIMING]"
         self.base_dir = Path(__file__).resolve().parent
         pivot_path_cfg = getattr(config, "zigzag_pivot_file", None)
         hft_pivot_cfg = getattr(config, "hft_pivot_file", None)
@@ -466,7 +467,7 @@ class TradingBot:
             try:
                 await self.exchange_client.cancel_order(str(oid))
             except Exception as exc:
-                self.logger.log(f"[ZIGZAG-TIMING] Cancel order {oid} failed: {exc}", "WARNING")
+                self.logger.log(f"{self.timing_prefix} Cancel order {oid} failed: {exc}", "WARNING")
 
     def _shared_bbo_key(self) -> str:
         """Build the shared BBO key for the current contract."""
@@ -851,11 +852,11 @@ class TradingBot:
                 try:
                     await self.exchange_client.cancel_order(order.order_id)
                 except Exception as exc:
-                    self.logger.log(f"[ZIGZAG-TIMING] Cancel {side} order {order.order_id} failed: {exc}", "WARNING")
+                    self.logger.log(f"{self.timing_prefix} Cancel {side} order {order.order_id} failed: {exc}", "WARNING")
             if targets:
                 self._invalidate_order_cache()
         except Exception as exc:
-            self.logger.log(f"[ZIGZAG-TIMING] Cancel by side failed: {exc}", "WARNING")
+            self.logger.log(f"{self.timing_prefix} Cancel by side failed: {exc}", "WARNING")
 
     async def _place_post_only_limit(self, side: str, quantity: Decimal, price: Decimal, reduce_only: bool = False) -> OrderResult:
         """Place a post-only limit order with best-effort fallbacks."""
@@ -878,9 +879,9 @@ class TradingBot:
                 try:
                     return await client.place_post_only_order(self.config.contract_id, quantity, price, side)
                 except Exception as exc:
-                    self.logger.log(f"[ZIGZAG-TIMING] place_post_only_order fallback err: {exc}", "WARNING")
+                    self.logger.log(f"{self.timing_prefix} place_post_only_order fallback err: {exc}", "WARNING")
             except Exception as exc:
-                self.logger.log(f"[ZIGZAG-TIMING] place_post_only_order err: {exc}", "WARNING")
+                self.logger.log(f"{self.timing_prefix} place_post_only_order err: {exc}", "WARNING")
 
         if hasattr(client, "place_limit_order"):
             try:
@@ -889,9 +890,9 @@ class TradingBot:
                 try:
                     return await client.place_limit_order(self.config.contract_id, quantity, price, side)
                 except Exception as exc:
-                    self.logger.log(f"[ZIGZAG-TIMING] place_limit_order fallback err: {exc}", "WARNING")
+                    self.logger.log(f"{self.timing_prefix} place_limit_order fallback err: {exc}", "WARNING")
             except Exception as exc:
-                self.logger.log(f"[ZIGZAG-TIMING] place_limit_order err: {exc}", "WARNING")
+                self.logger.log(f"{self.timing_prefix} place_limit_order err: {exc}", "WARNING")
 
         # Fallback: use open/close API (may not be post-only)
         try:
@@ -1010,7 +1011,7 @@ class TradingBot:
             price_val = price
             exposure = None
         msg_parts = [
-            "[ZIGZAG-TIMING]",
+            self.timing_prefix,
             action.upper(),
             direction.upper(),
             f"qty={qty_val}",
@@ -1030,7 +1031,7 @@ class TradingBot:
             await self.exchange_client.cancel_order(self.zigzag_tp_order_id)
             self._invalidate_order_cache()
         except Exception as exc:
-            self.logger.log(f"[ZIGZAG-TIMING] Cancel TP failed: {exc}", "WARNING")
+            self.logger.log(f"{self.timing_prefix} Cancel TP failed: {exc}", "WARNING")
         finally:
             self.zigzag_tp_order_id = None
             self.zigzag_tp_qty = None
@@ -1039,16 +1040,16 @@ class TradingBot:
         """Place fixed TP at RR 1:2 for 50% position, reduce-only post-only."""
         await self._cancel_zigzag_tp()
         if self.risk_reward <= 0:
-            self.logger.log(f"[ZIGZAG-TIMING] Skip TP: risk_reward {self.risk_reward} <= 0 (entry={entry_price}, stop={stop_price})", "INFO")
+            self.logger.log(f"{self.timing_prefix} Skip TP: risk_reward {self.risk_reward} <= 0 (entry={entry_price}, stop={stop_price})", "INFO")
             return
         tp_price = self._calc_tp_price_rr2(entry_price, stop_price, direction, rr=self.risk_reward)
         if tp_price is None:
-            self.logger.log(f"[ZIGZAG-TIMING] Skip TP: tp_price None (entry={entry_price}, stop={stop_price}, dir={direction})", "INFO")
+            self.logger.log(f"{self.timing_prefix} Skip TP: tp_price None (entry={entry_price}, stop={stop_price}, dir={direction})", "INFO")
             return
         qty = self._round_quantity(filled_qty / Decimal(2))
         if self.min_order_size and qty < self.min_order_size:
             self.logger.log(
-                f"[ZIGZAG-TIMING] Skip TP: qty {qty} < min_order_size {self.min_order_size} (filled={filled_qty})",
+                f"{self.timing_prefix} Skip TP: qty {qty} < min_order_size {self.min_order_size} (filled={filled_qty})",
                 "INFO",
             )
             return
@@ -1058,9 +1059,9 @@ class TradingBot:
             self.zigzag_tp_order_id = res.order_id
             self.zigzag_tp_qty = qty
             self._invalidate_order_cache()
-            self.logger.log(f"[ZIGZAG-TIMING] TP placed {side.upper()} qty={qty} @ {tp_price} reduce-only", "INFO")
+            self.logger.log(f"{self.timing_prefix} TP placed {side.upper()} qty={qty} @ {tp_price} reduce-only", "INFO")
         else:
-            self.logger.log(f"[ZIGZAG-TIMING] Place TP failed: {getattr(res, 'error_message', '')}", "WARNING")
+            self.logger.log(f"{self.timing_prefix} Place TP failed: {getattr(res, 'error_message', '')}", "WARNING")
 
     def _build_price_ladder(self, side: str, base_price: Decimal, max_orders: int) -> List[Decimal]:
         """Build a simple 1-tick spaced price ladder."""
@@ -1168,7 +1169,7 @@ class TradingBot:
         if (now_ts - self._last_flatten_attempt_ts) < 5:
             wait_left = 5 - (now_ts - self._last_flatten_attempt_ts)
             self.logger.log(
-                f"[ZIGZAG-TIMING] Flatten blocked: cooldown {wait_left:.2f}s remaining (pos={pos_signed}, side={close_side})",
+                f"{self.timing_prefix} Flatten blocked: cooldown {wait_left:.2f}s remaining (pos={pos_signed}, side={close_side})",
                 "INFO",
             )
             return False
@@ -1178,7 +1179,7 @@ class TradingBot:
             self._last_flatten_attempt_ts = 0.0
             return True
         self.logger.log(
-            f"[ZIGZAG-TIMING] Flatten incomplete: remaining {remaining} {close_side} after post-only exit batch",
+            f"{self.timing_prefix} Flatten incomplete: remaining {remaining} {close_side} after post-only exit batch",
             "INFO",
         )
         return False
@@ -1291,12 +1292,12 @@ class TradingBot:
                 except Exception:
                     pos_signed = None
                 self.logger.log(
-                    f"[ZIGZAG-TIMING] Pending entry blocked: stop_new_orders active (reason={self.stop_new_orders_reason}) flatten failed pos={pos_signed}",
+                    f"{self.timing_prefix} Pending entry blocked: stop_new_orders active (reason={self.stop_new_orders_reason}) flatten failed pos={pos_signed}",
                     "INFO",
                 )
             else:
                 self.logger.log(
-                    f"[ZIGZAG-TIMING] Pending entry blocked: stop_new_orders active (reason={self.stop_new_orders_reason}) but opposite flattened",
+                    f"{self.timing_prefix} Pending entry blocked: stop_new_orders active (reason={self.stop_new_orders_reason}) but opposite flattened",
                     "INFO",
                 )
             return
@@ -1305,21 +1306,21 @@ class TradingBot:
         if not self.pending_entry_state:
             if direction == "buy":
                 if self.last_confirmed_low is None or self.last_confirmed_high is None:
-                    self.logger.log("[ZIGZAG-TIMING] Pending entry buy blocked: missing pivots", "INFO")
+                    self.logger.log(f"{self.timing_prefix} Pending entry buy blocked: missing pivots", "INFO")
                     return
                 stop_price = self.last_confirmed_low - buffer
                 break_price = self.pending_break_price or (self.last_confirmed_high + buffer)
                 anchor_price = best_ask
             else:
                 if self.last_confirmed_high is None or self.last_confirmed_low is None:
-                    self.logger.log("[ZIGZAG-TIMING] Pending entry sell blocked: missing pivots", "INFO")
+                    self.logger.log(f"{self.timing_prefix} Pending entry sell blocked: missing pivots", "INFO")
                     return
                 stop_price = self.last_confirmed_high + buffer
                 break_price = self.pending_break_price or (self.last_confirmed_low - buffer)
                 anchor_price = best_bid
 
             if anchor_price is None or anchor_price <= 0:
-                self.logger.log("[ZIGZAG-TIMING] Pending entry blocked: invalid anchor price", "INFO")
+                self.logger.log(f"{self.timing_prefix} Pending entry blocked: invalid anchor price", "INFO")
                 return
             if self.zigzag_tp_order_id:
                 await self._cancel_zigzag_tp()
@@ -1334,7 +1335,7 @@ class TradingBot:
                 if reason and "min_order_size" in reason:
                     return  # 已在 _notify_min_qty_block 记录/通知，避免重复日志
                 self.logger.log(
-                    f"[ZIGZAG-TIMING] Pending entry blocked: target_qty invalid (target_qty={target_qty}, entry={target_entry_price}, stop={stop_price})",
+                    f"{self.timing_prefix} Pending entry blocked: target_qty invalid (target_qty={target_qty}, entry={target_entry_price}, stop={stop_price})",
                     "INFO",
                 )
                 return
@@ -1373,6 +1374,25 @@ class TradingBot:
             max_per = self.max_fast_close_qty if self.max_fast_close_qty > 0 else qty
             return min(qty, max_per)
 
+        def _latest_pivot_label() -> Optional[str]:
+            if self.recent_pivots:
+                try:
+                    return self.recent_pivots[-1].label
+                except Exception:
+                    return None
+            return None
+
+        def _pivot_adverse_for_direction(dir_val: str) -> bool:
+            """Only treat new pivots as adverse if they oppose the intended direction."""
+            if not pivot_updated:
+                return False
+            label = _latest_pivot_label()
+            if not label:
+                return False
+            if dir_val == "buy":
+                return label in ("LL", "HL", "L")
+            return label in ("HH", "LH", "H")
+
         # Close opposite side first
         if state.get("stage") == "close":
             if (not opposite) or pos_abs <= min_qty:
@@ -1384,24 +1404,26 @@ class TradingBot:
                 close_side = "buy" if pos_signed < 0 else "sell"
                 book_price = best_ask if close_side == "buy" else best_bid
                 now_ts = time.time()
-                # Pivot update while static close pending -> force book price loop and skip open
-                if pivot_updated and state.get("static_close_order_ids"):
+                adverse_pivot = _pivot_adverse_for_direction(direction)
+                # Pivot update while static close pending -> force close-only if adverse
+                if adverse_pivot and state.get("static_close_order_ids"):
                     await self._cancel_order_ids(state["static_close_order_ids"])
                     state["static_close_order_ids"] = []
                     state["force_close_only"] = True
                     state["skip_open"] = True
                     state["last_close_attempt"] = 0.0
                     self.logger.log(
-                        f"[ZIGZAG-TIMING] Pivot updated during static close; force close-only and skip open for this signal",
+                        f"{self.timing_prefix} Adverse pivot during static close; force close-only and skip open for this signal",
                         "INFO",
                     )
                 favourable = False
                 if book_price is not None and book_price > 0:
                     if close_side == "buy":
-                        favourable = book_price < break_price
+                        favourable = book_price < break_price  # closing short at better price
                     else:
-                        favourable = book_price > break_price
-                if state.get("force_close_only") or favourable:
+                        favourable = book_price > break_price  # closing long at better price
+                # 被强制 close-only：优先追价平仓
+                if state.get("force_close_only"):
                     if book_price is not None and book_price > 0 and (now_ts - state.get("last_close_attempt", 0.0)) >= 3.0:
                         qty = _chunk_amount(pos_abs)
                         res = await self._place_post_only_limit(close_side, qty, book_price, reduce_only=True)
@@ -1409,7 +1431,15 @@ class TradingBot:
                         if res and res.success:
                             self._invalidate_position_cache()
                     return
-                # Static close at break price
+                if favourable:
+                    if book_price is not None and book_price > 0 and (now_ts - state.get("last_close_attempt", 0.0)) >= 3.0:
+                        qty = _chunk_amount(pos_abs)
+                        res = await self._place_post_only_limit(close_side, qty, book_price, reduce_only=True)
+                        state["last_close_attempt"] = now_ts
+                        if res and res.success:
+                            self._invalidate_position_cache()
+                    return
+                # 不利时挂破位价静态单
                 if not state.get("static_close_order_ids") and book_price is not None and book_price > 0:
                     remaining_close = pos_abs
                     placed_ids: List[str] = []
@@ -1427,9 +1457,11 @@ class TradingBot:
 
         # If we get here, closing is done or not needed
         if state.get("skip_open"):
-            self.logger.log("[ZIGZAG-TIMING] Skip open due to prior pivot update during close", "INFO")
+            self.logger.log(f"{self.timing_prefix} Skip open due to prior pivot update during close", "INFO")
             await self._clear_pending_entry_state(clear_direction=True)
             return
+
+        open_adverse = _pivot_adverse_for_direction(direction)
 
         # Opening new direction
         current_dir_qty = await self._get_directional_position(direction, force=True)
@@ -1441,10 +1473,10 @@ class TradingBot:
             self.pending_entry_state = None
             return
 
-        if pivot_updated and remaining > 0:
-            # abandon entry on new pivot if still not in position
+        if open_adverse and remaining > 0:
+            # abandon entry only when adverse pivot appears before entry filled
             await self._cancel_order_ids(state.get("static_open_order_ids", []))
-            self.logger.log("[ZIGZAG-TIMING] Abandon open: pivot updated before entry filled", "INFO")
+            self.logger.log(f"{self.timing_prefix} Abandon open: adverse pivot arrived before entry filled", "INFO")
             await self._clear_pending_entry_state(clear_direction=True)
             return
 
@@ -1466,7 +1498,7 @@ class TradingBot:
                 self._invalidate_position_cache()
             else:
                 self.logger.log(
-                    f"[ZIGZAG-TIMING] Open attempt failed post-only {direction} qty={qty} @ {book_price}, will retry in 3s",
+                    f"{self.timing_prefix} Open attempt failed post-only {direction} qty={qty} @ {book_price}, will retry in 3s",
                     "INFO",
                 )
         elif not favourable_open and not state.get("static_open_order_ids") and book_price is not None and book_price > 0:
@@ -1492,7 +1524,7 @@ class TradingBot:
             self.pending_entry_state = None
         else:
             self.logger.log(
-                f"[ZIGZAG-TIMING] Entry pending ({direction}) filled {current_dir_qty}/{target_qty}",
+                f"{self.timing_prefix} Entry pending ({direction}) filled {current_dir_qty}/{target_qty}",
                 "INFO",
             )
 
@@ -1544,19 +1576,19 @@ class TradingBot:
             )
             if same_residual:
                 self.logger.log(
-                    f"[ZIGZAG-TIMING] Residual pos {pos_abs} {dir_hint} < min {tolerance}; skip repeat close attempt (cooldown)",
+                    f"{self.timing_prefix} Residual pos {pos_abs} {dir_hint} < min {tolerance}; skip repeat close attempt (cooldown)",
                     "DEBUG",
                 )
                 return
             self.logger.log(
-                f"[ZIGZAG-TIMING] Residual pos {pos_abs} {dir_hint} < min {tolerance}; sending reduce-only market close",
+                f"{self.timing_prefix} Residual pos {pos_abs} {dir_hint} < min {tolerance}; sending reduce-only market close",
                 "INFO",
             )
             try:
                 success = await self._close_residual_position_market(pos_signed)
             except Exception as exc:
                 self._residual_last_fail = True
-                self.logger.log(f"[ZIGZAG-TIMING] Residual close failed: {exc}", "WARNING")
+                self.logger.log(f"{self.timing_prefix} Residual close failed: {exc}", "WARNING")
             else:
                 self._residual_last_fail = not success
             self._residual_last_dir = dir_hint
@@ -1573,7 +1605,7 @@ class TradingBot:
                 self.pending_entry_state = None
                 changed = True
             if changed:
-                self.logger.log(f"[ZIGZAG-TIMING] Direction realigned to {actual_dir.upper()} based on position {pos_signed}", "INFO")
+                self.logger.log(f"{self.timing_prefix} Direction realigned to {actual_dir.upper()} based on position {pos_signed}", "INFO")
             needs_stop_refresh = changed or (self.dynamic_stop_price is None)
             if self.dynamic_stop_direction and self.dynamic_stop_direction != actual_dir:
                 self.dynamic_stop_price = None
@@ -1600,7 +1632,7 @@ class TradingBot:
                 new_dir = "sell"
             if new_dir and new_dir != self.config.direction:
                 self._set_direction_all(new_dir, lock=False, mode="zigzag_timing")
-                self.logger.log(f"[ZIGZAG-TIMING] Flat breakout sets direction to {new_dir.upper()}", "INFO")
+                self.logger.log(f"{self.timing_prefix} Flat breakout sets direction to {new_dir.upper()}", "INFO")
 
     async def _close_residual_position_market(self, pos_signed: Decimal) -> bool:
         """Close tiny residual position with reduce-only market path."""
@@ -1643,11 +1675,11 @@ class TradingBot:
         buffer = self.break_buffer_ticks * self.config.tick_size
         if self.direction_lock:
             if self.direction_lock == "buy" and self.last_confirmed_low is not None and best_bid <= (self.last_confirmed_low - buffer):
-                self.logger.log("[ZIGZAG-TIMING] Structural close: long breaks last confirmed low", "INFO")
+                self.logger.log(f"{self.timing_prefix} Structural close: long breaks last confirmed low", "INFO")
                 await self._execute_zigzag_stop("sell", best_bid, best_ask)
                 return
             if self.direction_lock == "sell" and self.last_confirmed_high is not None and best_ask >= (self.last_confirmed_high + buffer):
-                self.logger.log("[ZIGZAG-TIMING] Structural close: short breaks last confirmed high", "INFO")
+                self.logger.log(f"{self.timing_prefix} Structural close: short breaks last confirmed high", "INFO")
                 await self._execute_zigzag_stop("buy", best_bid, best_ask)
                 return
 
