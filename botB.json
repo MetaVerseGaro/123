@@ -5,7 +5,7 @@
   "trading": {
     "ticker": "ETH",
     "direction": "buy",            # 初始方向（仅 grid 或未启用 ZigZag 时使用）
-    "quantity": 0.005,
+    "quantity": 0.005,             # 基础下单数量（手数/币数），用于网格或基础风控计算
     "min_order_size": 0.005,       # 最小下单量（按交易所/交易对填写）
     "max_fast_close_qty": 0.5,     # 单笔最大下单量；zigzag_timing 拆单、快反/快止损均用此上限
     "take_profit": 0.02,           # 止盈百分比，0.01 表示 0.01%
@@ -15,7 +15,7 @@
     "stop_price": -1,              # 停止交易价格；-1 关闭
     "pause_price": -1,             # 暂停价格；-1 关闭
     "boost": false,                # 是否开启 boost 模式（仅 aster/backpack）
-    "trading_mode": "zigzag_timing" # 交易模式：grid（默认）/ zigzag_timing（破位择时，post-only 拆单）
+    "trading_mode": "hft"          # 交易模式：grid / zigzag_timing / hft
   },
 
   "risk": {
@@ -23,8 +23,11 @@
       "enable": true,                      # zigzag_timing 必开：冗余/动态SL/ZigZag
       "enable_stop_loss": true,            # zigzag_timing 必开：动态SL
       "risk_pct": 1.0,                     # 风险敞口百分比（按止损距离算仓位）
+      "use_risk_exposure": false,           # true=按风险敞口算仓；false=按杠杆算仓
+      "leverage": 1,                       # use_risk_exposure=false 时使用的杠杆倍数，equity*leverage/entry_price 得出目标仓位
+      "risk_reward": -1,                    # 盈亏比，>0 按 RR 设置 TP，<0 关闭主动止盈
       "release_timeout_minutes": 0,        # grid/冗余释放用；zigzag_timing 不执行释放，可置 0
-      "stop_new_orders_equity_threshold": 50, # 低于该 equity 停新并缓步平仓退出
+      "stop_new_orders_equity_threshold": 10, # 低于该 equity 停新并缓步平仓退出
       "zigzag": {
         "enable_zigzag": true,             # zigzag_timing 必开
         "enable_auto_reverse": false,      # zigzag_timing 内部已有破位逻辑，关闭原网格反手
@@ -34,8 +37,7 @@
         "zigzag_backstep": 2,              # ZigZag backstep
         "zigzag_timeframe": "1m",          # ZigZag 聚合周期
         "zigzag_warmup_candles": 200,      # ZigZag 预热根数
-        "break_buffer_ticks": 10,          # 突破确认高/低的缓冲（ticks）
-        "breakout_static_pct": 0.1,        # 静态挂单阈值
+        "break_buffer_ticks": 1,          # 突破确认高/低的缓冲（ticks）
         "pivot_file": "zigzag_pivots.json" # TradingView ZigZag pivot 持久化路径
       }
     },
@@ -61,7 +63,8 @@
     "LIGHTER_BACKOFF_START": "0.5",         # 退避起点
     "LIGHTER_BACKOFF_MAX": "8",             # 退避最大
     "ZIGZAG_PIVOT_FILE": "zigzag_pivots.json",
-    "WEBHOOK_BASIC_DIRECTION_FILE": "webhook_basic_direction.json"
+    "WEBHOOK_BASIC_DIRECTION_FILE": "webhook_basic_direction.json",
+    "HFT_PIVOT_FILE": "hft_pivots.json"     # HFT 枢轴文件路径
   },
 
   "sidecar": {
