@@ -28,6 +28,30 @@ python tests/grid_strategy_harness.py
 
 (env) lighter@LAPTOP-300BN8JQ:~/123$ python tests/grid_strategy_harness.py
 Traceback (most recent call last):
-  File "/home/lighter/123/tests/grid_strategy_harness.py", line 16, in <module>
-    from exchanges import ExchangeFactory
-ModuleNotFoundError: No module named 'exchanges'
+  File "/home/lighter/123/tests/grid_strategy_harness.py", line 178, in <module>
+    asyncio.run(main())
+  File "/usr/lib/python3.12/asyncio/runners.py", line 194, in run
+    return runner.run(main)
+           ^^^^^^^^^^^^^^^^
+  File "/usr/lib/python3.12/asyncio/runners.py", line 118, in run
+    return self._loop.run_until_complete(task)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/lib/python3.12/asyncio/base_events.py", line 687, in run_until_complete
+    return future.result()
+           ^^^^^^^^^^^^^^^
+  File "/home/lighter/123/tests/grid_strategy_harness.py", line 159, in main
+    bot = build_bot_from_config("botA.json")
+          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/lighter/123/tests/grid_strategy_harness.py", line 52, in build_bot_from_config
+    raw = json.loads(cfg)
+          ^^^^^^^^^^^^^^^
+  File "/usr/lib/python3.12/json/__init__.py", line 346, in loads
+    return _default_decoder.decode(s)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/lib/python3.12/json/decoder.py", line 337, in decode
+    obj, end = self.raw_decode(s, idx=_w(s, 0).end())
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/lib/python3.12/json/decoder.py", line 353, in raw_decode
+    obj, end = self.scan_once(s, idx)
+               ^^^^^^^^^^^^^^^^^^^^^^
+json.decoder.JSONDecodeError: Expecting property name enclosed in double quotes: line 2 column 36 (char 37)
