@@ -122,4 +122,3 @@ def test_advanced_risk_no_stop_when_headroom_ok():
     assert decision.redundancy_insufficient_since is None
     assert decision.trim_excess_qty == Decimal("0")
     assert decision.release_qty == Decimal("0")
-
