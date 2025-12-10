@@ -1087,7 +1087,7 @@ class TradingBot:
             prices.append(px)
         return prices
 
-    async def _post_only_entry_batch(self, direction: str, target_qty: Decimal, best_bid: Decimal, best_ask: Decimal, wait_sec: float = 20.0) -> Tuple[Decimal, Decimal]:
+    async def _post_only_entry_batch(self, direction: str, target_qty: Decimal, best_bid: Decimal, best_ask: Decimal, wait_sec: float = 3.0) -> Tuple[Decimal, Decimal]:
         """Post-only batch entry; returns filled_qty, final_dir_qty."""
         if target_qty <= 0:
             return Decimal(0), await self._get_directional_position(direction, force=True)
@@ -1119,7 +1119,7 @@ class TradingBot:
         filled = max(Decimal(0), end_qty - start_qty)
         return filled, end_qty
 
-    async def _post_only_exit_batch(self, close_side: str, close_qty: Decimal, best_bid: Decimal, best_ask: Decimal, wait_sec: float = 5.0) -> Tuple[Decimal, Decimal]:
+    async def _post_only_exit_batch(self, close_side: str, close_qty: Decimal, best_bid: Decimal, best_ask: Decimal, wait_sec: float = 3.0) -> Tuple[Decimal, Decimal]:
         """Post-only batch exit; returns closed_qty, remaining_abs."""
         if close_qty <= 0:
             pos_abs = abs(await self._get_position_signed_cached(force=True))
@@ -2586,14 +2586,14 @@ class TradingBot:
         self._log_throttle[key] = (msg, now_ts)
         self.logger.log(msg, level)
 
-        def _log_pending_entry_progress(self, direction: str, filled: Decimal, target: Decimal):
-            key = f"pending_entry:{direction}"
-            msg = f"{self.timing_prefix} Entry pending ({direction}) filled {filled}/{target}"
-            last = self._pending_log_cache.get(key)
-            if last == msg:
-                return
-            self._pending_log_cache[key] = msg
-            self.logger.log(msg, "INFO")
+    def _log_pending_entry_progress(self, direction: str, filled: Decimal, target: Decimal):
+        key = f"pending_entry:{direction}"
+        msg = f"{self.timing_prefix} Entry pending ({direction}) filled {filled}/{target}"
+        last = self._pending_log_cache.get(key)
+        if last == msg:
+            return
+        self._pending_log_cache[key] = msg
+        self.logger.log(msg, "INFO")
 
     async def _build_pivot_point(self, entry: Dict[str, Any]) -> Optional[PivotPoint]:
         """Build PivotPoint with price derived from exchange OHLC data."""
