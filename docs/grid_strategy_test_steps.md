@@ -28,8 +28,6 @@
 - 将 `DummyLogger` 的输出重定向到文件，或在真实实例里替换为 `helpers.logger.TradingLogger`，以便对拍 legacy 日志。
 
 (env) lighter@LAPTOP-300BN8JQ:~/123$ python -m unittest tests.grid_strategy_harness
-/home/lighter/123/tests/grid_strategy_harness.py:147: DeprecationWarning: There is no current event loop
-  exchange, notifications = asyncio.get_event_loop().run_until_complete(run_harness_ticks())
 [INFO] Current Position: 0E-8 | Active closing amount: 0E-8 | Order quantity: 0
 .
 ----------------------------------------------------------------------
