@@ -27,8 +27,9 @@ python tests/grid_strategy_harness.py
 - 如果需要记录日志到文件，可在 `TradingLogger` 配置中添加文件输出，或在脚本里简单重定向 `bot.logger.log`。 
 
 (env) lighter@LAPTOP-300BN8JQ:~/123$ python tests/grid_strategy_harness.py
+2025-12-10 22:10:35 | INFO | [LIGHTER][ETH] [INIT] Shared BBO file not set; using local WS/REST only
 Traceback (most recent call last):
-  File "/home/lighter/123/tests/grid_strategy_harness.py", line 178, in <module>
+  File "/home/lighter/123/tests/grid_strategy_harness.py", line 194, in <module>
     asyncio.run(main())
   File "/usr/lib/python3.12/asyncio/runners.py", line 194, in run
     return runner.run(main)
@@ -39,19 +40,15 @@ Traceback (most recent call last):
   File "/usr/lib/python3.12/asyncio/base_events.py", line 687, in run_until_complete
     return future.result()
            ^^^^^^^^^^^^^^^
-  File "/home/lighter/123/tests/grid_strategy_harness.py", line 159, in main
+  File "/home/lighter/123/tests/grid_strategy_harness.py", line 175, in main
     bot = build_bot_from_config("botA.json")
           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "/home/lighter/123/tests/grid_strategy_harness.py", line 52, in build_bot_from_config
-    raw = json.loads(cfg)
-          ^^^^^^^^^^^^^^^
-  File "/usr/lib/python3.12/json/__init__.py", line 346, in loads
-    return _default_decoder.decode(s)
-           ^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "/usr/lib/python3.12/json/decoder.py", line 337, in decode
-    obj, end = self.raw_decode(s, idx=_w(s, 0).end())
-               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "/usr/lib/python3.12/json/decoder.py", line 353, in raw_decode
-    obj, end = self.scan_once(s, idx)
-               ^^^^^^^^^^^^^^^^^^^^^^
-json.decoder.JSONDecodeError: Expecting property name enclosed in double quotes: line 2 column 36 (char 37)
+  File "/home/lighter/123/tests/grid_strategy_harness.py", line 105, in build_bot_from_config
+    return TradingBot(tc)
+           ^^^^^^^^^^^^^^
+  File "/home/lighter/123/trading_bot.py", line 368, in __init__
+    self._setup_websocket_handlers()
+  File "/home/lighter/123/trading_bot.py", line 1912, in _setup_websocket_handlers
+    self.exchange_client.setup_order_update_handler(order_update_handler)
+    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AttributeError: 'DummyExchange' object has no attribute 'setup_order_update_handler'
