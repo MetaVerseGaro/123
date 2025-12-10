@@ -244,8 +244,14 @@ def patch_bot_for_offline(bot: TradingBot):
     bot._place_and_monitor_open_order = fake_place_and_monitor_open_order
     bot._execute_stop_loss = fake_execute_stop_loss
     bot.send_notification = fake_send_notification
-    bot._get_position_signed_cached = lambda force=False: Decimal(0)
-    bot._get_position_detail_prefer_ws = lambda: None
+    async def fake_get_position_signed_cached(force: bool = False):
+        return Decimal(0)
+
+    async def fake_get_position_detail_prefer_ws():
+        return None
+
+    bot._get_position_signed_cached = fake_get_position_signed_cached
+    bot._get_position_detail_prefer_ws = fake_get_position_detail_prefer_ws
 
 
 async def main():
