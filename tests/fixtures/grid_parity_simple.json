@@ -1,0 +1,20 @@
+{
+  "config": {
+    "direction": "buy",
+    "take_profit": "0.2",
+    "grid_step": "0.5",
+    "wait_time": 0,
+    "max_orders": 5,
+    "close_order_side": "sell",
+    "min_order_size": "0",
+    "ticker": "TEST",
+    "exchange": "mock"
+  },
+  "bbo": [
+    ["100", "100.5"]
+  ],
+  "expected": {
+    "opens": 1,
+    "closes": 1
+  }
+}
