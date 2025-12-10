@@ -28,30 +28,16 @@
 - 将 `DummyLogger` 的输出重定向到文件，或在真实实例里替换为 `helpers.logger.TradingLogger`，以便对拍 legacy 日志。
 
 (env) lighter@LAPTOP-300BN8JQ:~/123$ python -m unittest tests.test_grid_strategy_parity
-E
+F
 ======================================================================
-ERROR: test_parity_simple_fixture (tests.test_grid_strategy_parity.GridParityTestCase.test_parity_simple_fixture)
+FAIL: test_parity_simple_fixture (tests.test_grid_strategy_parity.GridParityTestCase.test_parity_simple_fixture)
 ----------------------------------------------------------------------
 Traceback (most recent call last):
-  File "/home/lighter/123/tests/test_grid_strategy_parity.py", line 175, in test_parity_simple_fixture
-    result = asyncio.run(run_fixture_once(fixture))
-             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "/usr/lib/python3.12/asyncio/runners.py", line 194, in run
-    return runner.run(main)
-           ^^^^^^^^^^^^^^^^
-  File "/usr/lib/python3.12/asyncio/runners.py", line 118, in run
-    return self._loop.run_until_complete(task)
-           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "/usr/lib/python3.12/asyncio/base_events.py", line 687, in run_until_complete
-    return future.result()
-           ^^^^^^^^^^^^^^^
-  File "/home/lighter/123/tests/test_grid_strategy_parity.py", line 139, in run_fixture_once
-    cfg = DummyConfig(
-          ^^^^^^^^^^^^
-TypeError: DummyConfig.__init__() got an unexpected keyword argument 'ticker'
+  File "/home/lighter/123/tests/test_grid_strategy_parity.py", line 177, in test_parity_simple_fixture
+    self.assertGreaterEqual(result["opens"], result["expected"].get("opens", 1))
+AssertionError: 0 not greater than or equal to 1
 
 ----------------------------------------------------------------------
-Ran 1 test in 0.005s
+Ran 1 test in 0.001s
 
-FAILED (errors=1)
-
+FAILED (failures=1)
