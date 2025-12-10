@@ -40,6 +40,10 @@ class DummyExchange:
     async def disconnect(self):
         return None
 
+    # WebSocket handler hooks (no-op for offline)
+    def setup_order_update_handler(self, handler):
+        return None
+
 
 def build_bot_from_config(config_path: str = "botA.json") -> TradingBot:
     cfg_path = Path(config_path)
