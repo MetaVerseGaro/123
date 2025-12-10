@@ -38,7 +38,6 @@
         "zigzag_timeframe": "1m",          # ZigZag 聚合周期
         "zigzag_warmup_candles": 200,      # ZigZag 预热根数
         "break_buffer_ticks": 10,          # 突破确认高/低的缓冲（ticks）
-        "breakout_static_pct": 0.1,        # 静态挂单阈值
         "pivot_file": "zigzag_pivots.json" # TradingView ZigZag pivot 持久化路径
       }
     },
@@ -64,7 +63,8 @@
     "LIGHTER_BACKOFF_START": "0.5",         # 退避起点
     "LIGHTER_BACKOFF_MAX": "8",             # 退避最大
     "ZIGZAG_PIVOT_FILE": "zigzag_pivots.json",
-    "WEBHOOK_BASIC_DIRECTION_FILE": "webhook_basic_direction.json"
+    "WEBHOOK_BASIC_DIRECTION_FILE": "webhook_basic_direction.json",
+    "HFT_PIVOT_FILE": "hft_pivots.json"     # HFT 枢轴文件路径
   },
 
   "sidecar": {
