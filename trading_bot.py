@@ -1,4 +1,4 @@
-"""
+﻿"""
 Modular Trading Bot - Supports multiple exchanges
 """
 
@@ -94,7 +94,6 @@ class TradingConfig:
     webhook_basic_direction_file: Optional[str] = None
     max_fast_close_qty: Optional[Decimal] = None
     break_buffer_ticks: Decimal = Decimal("10")
-    breakout_static_pct: Decimal = Decimal("0.1")
     use_risk_exposure: bool = True
     leverage: Decimal = Decimal("1")
     risk_reward: Decimal = Decimal("2")
@@ -298,13 +297,6 @@ class TradingBot:
             self.max_fast_close_qty = Decimal(str(val)) if val not in (None, "") else Decimal("0.5")
         except Exception:
             self.max_fast_close_qty = Decimal("0.5")
-        try:
-            cfg_break_pct = getattr(config, "breakout_static_pct", None)
-            env_break_pct = os.getenv("BREAKOUT_STATIC_PCT", None)
-            val = cfg_break_pct if cfg_break_pct not in (None, "") else env_break_pct
-            self.breakout_static_pct = Decimal(str(val)) if val not in (None, "") else Decimal("0.1")
-        except Exception:
-            self.breakout_static_pct = Decimal("0.1")
         # Risk control
 # Risk control
         self.risk_pct = Decimal(os.getenv("RISK_PCT", "0.5"))
@@ -1265,128 +1257,6 @@ class TradingBot:
         await self._place_zigzag_tp(direction, filled_qty, entry_price, stop_price)
         await self._notify_zigzag_trade("entry", direction, filled_qty, entry_price)
         self._last_entry_attempt_ts = 0.0
-
-    async def _process_pending_zigzag_entry_legacy(self, best_bid: Decimal, best_ask: Decimal):
-        """Legacy zigzag entry handler (kept for reference)."""
-        if not self.pending_entry:
-            return
-        direction = self.pending_entry
-        last_pivot = self.recent_pivots[-1] if getattr(self, "recent_pivots", None) else None
-        buffer = self.break_buffer_ticks * self.config.tick_size
-        min_qty = self.min_order_size or Decimal("0")
-        if self.stop_new_orders:
-            # 允许平掉反向仓位，但不新开仓
-            ok = await self._flatten_opposite(direction, best_bid, best_ask)
-            if not ok:
-                try:
-                    pos_signed = await self._get_position_signed_cached(force=True)
-                except Exception:
-                    pos_signed = None
-                self.logger.log(
-                    f"[ZIGZAG-TIMING] Pending entry blocked: stop_new_orders active (reason={self.stop_new_orders_reason}) flatten failed pos={pos_signed}",
-                    "INFO",
-                )
-            else:
-                self.logger.log(
-                    f"[ZIGZAG-TIMING] Pending entry blocked: stop_new_orders active (reason={self.stop_new_orders_reason}) but opposite flattened",
-                    "INFO",
-                )
-            return
-        if direction == "buy":
-            if self.last_confirmed_low is None or self.last_confirmed_high is None:
-                self.logger.log("[ZIGZAG-TIMING] Pending entry buy blocked: missing pivots", "INFO")
-                return
-            stop_price = self.last_confirmed_low - buffer
-            break_price = self.pending_break_price or (self.last_confirmed_high + buffer)
-            anchor_price = best_ask
-            try:
-                pct = (self.breakout_static_pct or Decimal("0")) / Decimal("100")
-            except Exception:
-                pct = Decimal("0.001")
-            threshold_price = break_price * (Decimal("1") + pct)
-        else:
-            if self.last_confirmed_high is None or self.last_confirmed_low is None:
-                return
-            stop_price = self.last_confirmed_high + buffer
-            break_price = self.pending_break_price or (self.last_confirmed_low - buffer)
-            anchor_price = best_bid
-            try:
-                pct = (self.breakout_static_pct or Decimal("0")) / Decimal("100")
-            except Exception:
-                pct = Decimal("0.001")
-            threshold_price = break_price * (Decimal("1") - pct)
-        if anchor_price is None or anchor_price <= 0:
-            self.logger.log("[ZIGZAG-TIMING] Pending entry blocked: invalid anchor price", "INFO")
-            return
-        if self.zigzag_tp_order_id:
-            await self._cancel_zigzag_tp()
-        overshoot = (direction == "buy" and anchor_price > threshold_price) or (direction == "sell" and anchor_price < threshold_price)
-        # 如果已经进入静态破位挂单模式且仍有挂单，保持 overshoot 状态，避免改为追价再挂一组入场单
-        if self.pending_entry_static_mode and self._pending_entry_order_ids:
-            overshoot = True
-
-        ok = await self._flatten_opposite(direction, best_bid, best_ask)
-        if not ok:
-            try:
-                pos_signed = await self._get_position_signed_cached(force=True)
-            except Exception:
-                pos_signed = None
-            self.logger.log(f"[ZIGZAG-TIMING] Pending entry blocked: flatten failed pos={pos_signed}", "INFO")
-            return
-
-        current_dir_qty = await self._get_directional_position(direction, force=True)
-        target_entry_price = break_price if overshoot else anchor_price
-        target_qty = await self._calc_qty_by_risk_zigzag(target_entry_price, stop_price)
-        if target_qty is None or target_qty <= 0:
-            self.logger.log(
-                f"[ZIGZAG-TIMING] Pending entry blocked: target_qty invalid (target_qty={target_qty}, entry={target_entry_price}, stop={stop_price})",
-                "INFO",
-            )
-            return
-        remaining = max(Decimal(0), target_qty - current_dir_qty)
-
-        if not overshoot:
-            self.pending_entry_static_mode = False
-            if remaining >= min_qty:
-                now_ts = time.time()
-                if (now_ts - self._last_entry_attempt_ts) < 20:
-                    wait_left = 20 - (now_ts - self._last_entry_attempt_ts)
-                    self.logger.log(
-                        f"[ZIGZAG-TIMING] Pending entry blocked: cooldown {wait_left:.2f}s remaining (remaining={remaining}, target={target_qty})",
-                        "INFO",
-                    )
-                    return
-                self._last_entry_attempt_ts = now_ts
-                filled, current_dir_qty = await self._post_only_entry_batch(direction, remaining, best_bid, best_ask, wait_sec=20.0)
-                if filled > 0:
-                    self._invalidate_position_cache()
-            if current_dir_qty >= max(min_qty, target_qty - min_qty):
-                await self._finalize_pending_entry(direction, current_dir_qty, anchor_price, stop_price)
-            else:
-                self.logger.log(
-                    f"[ZIGZAG-TIMING] Entry pending ({direction}) filled {current_dir_qty}/{target_qty}",
-                    "INFO",
-                )
-            return
-
-        # Overshoot后采用原破位价静态挂单，不追价
-        self.pending_entry_static_mode = True
-        if current_dir_qty >= min_qty and remaining <= min_qty:
-            await self._finalize_pending_entry(direction, current_dir_qty, break_price, stop_price)
-            return
-        if remaining < min_qty:
-            self.logger.log(
-                f"[ZIGZAG-TIMING] Pending entry blocked: remaining {remaining} < min_qty {min_qty} (overshoot/static)",
-                "INFO",
-            )
-            return
-        if not self._pending_entry_order_ids:
-            placed = await self._place_static_entry_orders(direction, break_price, remaining)
-            if placed:
-                self.logger.log(
-                    f"[ZIGZAG-TIMING] Static entry at break price {break_price} ({len(placed)} orders) remaining {remaining}",
-                    "INFO",
-                )
 
     async def _process_pending_zigzag_entry(self, best_bid: Decimal, best_ask: Decimal):
         """Process pending zigzag/hft entry with breakout-driven close+reverse flow."""
@@ -2869,6 +2739,11 @@ class TradingBot:
         # Timing 模式不依赖冗余检查来阻止新单，改由方向锁 + min_order_size 控制
         if self.zigzag_timing_enabled:
             return
+        # 风险敞口关闭时不计算冗余，也不因冗余停新单
+        if not self.use_risk_exposure:
+            self._set_stop_new_orders(False, mode=self.mode_tag)
+            self.redundancy_insufficient_since = None
+            return
         if not (self.stop_loss_enabled and self.enable_advanced_risk):
             return
         try:
@@ -3488,7 +3363,14 @@ class TradingBot:
                             avg_price = avg_price_detail
 
                 stop_price = self.dynamic_stop_price if (self.enable_dynamic_sl and self.dynamic_stop_price) else None
-                if (not self.zigzag_timing_enabled) and self.enable_advanced_risk and self.stop_loss_enabled and stop_price and position_amt > 0:
+                if (
+                    (not self.zigzag_timing_enabled)
+                    and self.enable_advanced_risk
+                    and self.stop_loss_enabled
+                    and self.use_risk_exposure
+                    and stop_price
+                    and position_amt > 0
+                ):
                     if position_signed > 0:
                         potential_loss = (avg_price - stop_price) * position_amt
                         per_base_loss = (avg_price - stop_price)
