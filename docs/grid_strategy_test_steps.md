@@ -27,18 +27,28 @@
 ## 若需查看详细日志
 - 将 `DummyLogger` 的输出重定向到文件，或在真实实例里替换为 `helpers.logger.TradingLogger`，以便对拍 legacy 日志。
 
-==================================================== ERRORS ====================================================
-_____________________________ ERROR collecting tests/test_zigzag_timing_parity.py ______________________________
-ImportError while importing test module '/home/lighter/123/tests/test_zigzag_timing_parity.py'.
-Hint: make sure your test modules/packages have valid Python names.
-Traceback:
-/usr/lib/python3.12/importlib/__init__.py:90: in import_module
-    return _bootstrap._gcd_import(name[level:], package, level)
-           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-tests/test_zigzag_timing_parity.py:12: in <module>
-    from core import AsyncCache
-E   ModuleNotFoundError: No module named 'core'
+(env) lighter@LAPTOP-300BN8JQ:~/123$ pytest tests/test_zigzag_timing_parity.py
+============================================= test session starts ==============================================
+platform linux -- Python 3.12.3, pytest-9.0.2, pluggy-1.6.0
+rootdir: /home/lighter/123
+plugins: anyio-4.12.0
+collected 1 item
+
+tests/test_zigzag_timing_parity.py F                                                                     [100%]
+
+=================================================== FAILURES ===================================================
+_______________________________ ZigZagParityTestCase.test_parity_simple_fixture ________________________________
+
+self = <test_zigzag_timing_parity.ZigZagParityTestCase testMethod=test_parity_simple_fixture>
+
+    def test_parity_simple_fixture(self):
+        fixture = Path(__file__).parent / "fixtures" / "zigzag_timing_parity_simple.json"
+        result = asyncio.run(run_fixture_once(fixture))
+        self.assertEqual(result["direction_lock"], "buy")
+>       self.assertIsNotNone(result["stop_price"])
+E       AssertionError: unexpectedly None
+
+tests/test_zigzag_timing_parity.py:200: AssertionError
 =========================================== short test summary info ============================================
-ERROR tests/test_zigzag_timing_parity.py
-!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!! Interrupted: 1 error during collection !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
-=============================================== 1 error in 0.11s ===============================================
+FAILED tests/test_zigzag_timing_parity.py::ZigZagParityTestCase::test_parity_simple_fixture - AssertionError: unexpectedly None
+============================================== 1 failed in 0.22s ===============================================
