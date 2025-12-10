@@ -2,12 +2,18 @@
 
 import asyncio
 import json
+import sys
 import unittest
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from decimal import Decimal
 from pathlib import Path
 from typing import List
+
+# Ensure project root on sys.path so imports like `core` resolve when running pytest from anywhere
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 
 from core import AsyncCache
 from core.data_feeds import PivotEntry
