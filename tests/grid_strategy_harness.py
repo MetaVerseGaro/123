@@ -30,6 +30,7 @@ class DummyExchange:
 
     def __init__(self):
         self.current_order = None
+        self.order_ws_enabled = False
 
     async def get_contract_attributes(self):
         return "MOCK_CONTRACT", Decimal("0.01")
@@ -50,6 +51,69 @@ class DummyExchange:
 
     async def get_account_balance(self):
         return Decimal("0")
+
+    # Order / price helpers (return safe defaults)
+    async def get_active_orders(self, contract_id=None):
+        return []
+
+    async def get_last_trade_price(self, contract_id=None):
+        return Decimal("0")
+
+    async def cancel_order(self, order_id):
+        return None
+
+    async def cancel_all_orders(self):
+        return None
+
+    async def place_close_order(self, contract_id, quantity, price, side):
+        return DummyOrder(success=True, order_id="mock_close")
+
+    async def place_open_order(self, contract_id, quantity, side):
+        return DummyOrder(success=True, order_id="mock_open")
+
+    async def place_market_order(self, contract_id, quantity, side):
+        return DummyOrder(success=True, order_id="mock_market")
+
+    async def place_tp_order(self, contract_id, quantity, price, side):
+        return DummyOrder(success=True, order_id="mock_tp")
+
+    async def place_stop_loss_order(self, quantity, trigger_price, side):
+        return DummyOrder(success=True, order_id="mock_sl")
+
+    async def reduce_only_close_with_retry(self, quantity, side):
+        return DummyOrder(success=True, order_id="mock_reduce")
+
+    async def get_order_price(self, direction):
+        return Decimal("0")
+
+    async def get_order_info(self, order_id):
+        return DummyOrder(success=True, order_id=order_id)
+
+    async def fetch_candle_by_close_time(self, *args, **kwargs):
+        return None
+
+    async def fetch_history_candles(self, *args, **kwargs):
+        return []
+
+    async def get_account_equity(self):
+        return Decimal("0")
+
+    async def get_available_balance(self):
+        return Decimal("0")
+
+    async def get_account_pnl(self):
+        return None
+
+    def round_to_tick(self, price):
+        return Decimal(price)
+
+
+class DummyOrder:
+    def __init__(self, success: bool = True, order_id: str = "mock"):
+        self.success = success
+        self.order_id = order_id
+        self.status = "FILLED" if success else "ERROR"
+        self.filled_size = Decimal("0")
 
 
 def build_bot_from_config(config_path: str = "botA.json") -> TradingBot:
