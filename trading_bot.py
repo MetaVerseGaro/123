@@ -1436,6 +1436,8 @@ class TradingBot:
                     state["static_close_order_ids"] = []
                     state["force_close_only"] = True
                     state["skip_open"] = True
+                    # Block same-direction re-entry until opposite breakout to avoid immediate reopen after adverse pivot
+                    self._blocked_direction = direction
                     state["last_close_attempt"] = 0.0
                     self.logger.log(
                         f"{self.timing_prefix} Adverse pivot during static close; force close-only and skip open for this signal",
@@ -1526,6 +1528,9 @@ class TradingBot:
         # If we get here, closing is done or not needed
         if state.get("skip_open"):
             self._log_once("skip_open", f"{self.timing_prefix} Skip open due to prior pivot update during close", "INFO", interval=10.0)
+            # Block same-direction re-entry until opposite breakout
+            if self._blocked_direction != direction:
+                self._blocked_direction = direction
             await self._clear_pending_entry_state(clear_direction=True)
             return
 
