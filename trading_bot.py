@@ -1384,10 +1384,16 @@ class TradingBot:
         pos_abs = abs(pos_signed)
         opposite = (pos_signed * desired_sign) < 0
 
-        self.logger.log(
-            f"{self.timing_prefix} Pending entry state stage={state.get('stage')} dir={direction} desired_sign={desired_sign} pos={pos_signed} break={break_price} stop={stop_price} opposite={opposite}",
-            "INFO",
-        )
+        # Log state only when stage/opposite changes to avoid spam
+        stage_sig = f"{state.get('stage')}|opp={opposite}"
+        if state.get("_last_stage_log") != stage_sig:
+            self._log_once(
+                f"pending_stage:{direction}",
+                f"{self.timing_prefix} Pending entry stage={state.get('stage')} dir={direction} opposite={opposite}",
+                "INFO",
+                interval=5.0,
+            )
+            state["_last_stage_log"] = stage_sig
 
         # Determine chunk sizing
         def _chunk_amount(qty: Decimal) -> Decimal:
@@ -1460,9 +1466,11 @@ class TradingBot:
                     else:
                         favourable = ref_price >= (break_price + tolerance)
                 # Unthrottled log to diagnose unfavourable chasing
-                self.logger.log(
-                    f"{self.timing_prefix} Close eval side={close_side} bid={best_bid} ask={best_ask} ref={ref_price} break={break_price} fav={favourable} pos={pos_signed}",
+                self._log_once(
+                    f"close_eval:{direction}",
+                    f"{self.timing_prefix} Close eval side={close_side} ref={ref_price} break={break_price} fav={favourable}",
                     "INFO",
+                    interval=10.0,
                 )
                 # 被强制 close-only：若已有挂单则等待，否则按盘口价挂一次
                 if state.get("force_close_only"):
@@ -1594,7 +1602,7 @@ class TradingBot:
             f"open_eval:{direction}",
             f"{self.timing_prefix} Open eval dir={direction} ref={ref_price} break={break_price} favourable={favourable_open} remaining={remaining}",
             "INFO",
-            interval=2.0,
+            interval=10.0,
         )
 
         now_ts = time.time()
@@ -1795,10 +1803,10 @@ class TradingBot:
 
         if self.direction_lock:
             if self.direction_lock == "buy" and self.last_confirmed_low is not None and best_bid <= (self.last_confirmed_low - buffer):
-                self.logger.log(f"{self.timing_prefix} Structural close (converted to signal): long breaks last confirmed low", "INFO")
+                self._log_once("struct_close_buy", f"{self.timing_prefix} Structural close (converted to signal): long breaks last confirmed low", "INFO", interval=5.0)
                 signal = "sell"
             if self.direction_lock == "sell" and self.last_confirmed_high is not None and best_ask >= (self.last_confirmed_high + buffer):
-                self.logger.log(f"{self.timing_prefix} Structural close (converted to signal): short breaks last confirmed high", "INFO")
+                self._log_once("struct_close_sell", f"{self.timing_prefix} Structural close (converted to signal): short breaks last confirmed high", "INFO", interval=5.0)
                 signal = "buy"
 
         # Detect breakout signals
@@ -3047,10 +3055,24 @@ class TradingBot:
         """Handle new HL/LH during pending entry: cancel or finalize partial fills."""
         if not self.pending_entry:
             return
-        need_cancel = (
-            (self.pending_entry == "buy" and pivot.label == "HL")
-            or (self.pending_entry == "sell" and pivot.label == "LH")
-        )
+        need_cancel = False
+        try:
+            pivot_price = Decimal(pivot.price)
+        except Exception:
+            pivot_price = None
+
+        # Rule: evaluate relative to last confirmed extreme
+        if self.pending_entry == "buy":
+            # new low pivot higher than last confirmed low => abandon; lower or equal => continue
+            if pivot.label in ("HL", "L", "LL") and self.last_confirmed_low is not None and pivot_price is not None:
+                if pivot_price > self.last_confirmed_low:
+                    need_cancel = True
+        elif self.pending_entry == "sell":
+            # new high pivot lower than last confirmed high => abandon; higher or equal => continue
+            if pivot.label in ("LH", "H", "HH") and self.last_confirmed_high is not None and pivot_price is not None:
+                if pivot_price < self.last_confirmed_high:
+                    need_cancel = True
+
         if need_cancel and pivot.close_time and self.pending_break_trigger_ts:
             try:
                 pivot_ts = pivot.close_time.replace(tzinfo=timezone.utc).timestamp()
@@ -3064,6 +3086,15 @@ class TradingBot:
         await self._cancel_pending_entry_orders()
         # 如果已持有该方向仓位（无论是否打满），视为入场；否则放弃本次信号
         if current_dir_qty <= Decimal("0"):
+            # Block same-direction until opposite breakout after adverse pivot
+            if self._blocked_direction != self.pending_entry:
+                self._blocked_direction = self.pending_entry
+            self._log_once(
+                f"pivot_cancel:{self.pending_entry}",
+                f"{self.timing_prefix} Pending entry {self.pending_entry} canceled by pivot {pivot.label} price={pivot_price} vs last extreme",
+                "INFO",
+                interval=10.0,
+            )
             await self._clear_pending_entry_state(clear_direction=True)
             return
         stop_price = self._compute_dynamic_stop(self.pending_entry) or self.dynamic_stop_price or pivot.price
