@@ -1431,11 +1431,20 @@ class TradingBot:
                         "INFO",
                     )
                 favourable = False
-                if book_price is not None and book_price > 0:
+                # 判定用中间价，避免仅看买一/卖一因点差误判
+                mid_price = None
+                try:
+                    mid_price = (best_bid + best_ask) / 2
+                except Exception:
+                    pass
+                ref_price = mid_price if mid_price is not None else book_price
+                if ref_price is not None and ref_price > 0:
+                    # 回到破位价内为有利侧：
+                    # 平空开多（close_side=buy）有利：价格 < 破位价；平多开空（close_side=sell）有利：价格 > 破位价
                     if close_side == "buy":
-                        favourable = book_price < break_price  # closing short at better price
+                        favourable = ref_price < break_price
                     else:
-                        favourable = book_price > break_price  # closing long at better price
+                        favourable = ref_price > break_price
                 # 被强制 close-only：若已有挂单则等待，否则按盘口价挂一次
                 if state.get("force_close_only"):
                     if not state.get("static_close_order_ids") and book_price is not None and book_price > 0:
@@ -1536,11 +1545,19 @@ class TradingBot:
         # Maker pricing: buy using bid, sell using ask to keep orders resting when price re-enters breakout band
         book_price = best_bid if direction == "buy" else best_ask
         favourable_open = False
-        if book_price is not None and book_price > 0:
+        mid_price = None
+        try:
+            mid_price = (best_bid + best_ask) / 2
+        except Exception:
+            pass
+        ref_price = mid_price if mid_price is not None else book_price
+        if ref_price is not None and ref_price > 0:
+            # 开仓与平仓同判定：
+            # 开多（平空开多）有利：价格 < 破位价；开空（平多开空）有利：价格 > 破位价
             if direction == "buy":
-                favourable_open = book_price < break_price
+                favourable_open = ref_price < break_price
             else:
-                favourable_open = book_price > break_price
+                favourable_open = ref_price > break_price
 
         now_ts = time.time()
         if favourable_open and (now_ts - state.get("last_open_attempt", 0.0)) >= 3.0:
