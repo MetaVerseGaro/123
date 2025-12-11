@@ -1364,6 +1364,9 @@ class TradingBot:
                 "target_qty": target_qty,
                 "entry_ref_price": target_entry_price,
                 "pivot_marker": self._last_pivot_change_ts,
+                # Snapshot current extremes to compare future pivots against
+                "ref_high": self.last_confirmed_high,
+                "ref_low": self.last_confirmed_low,
                 "last_close_attempt": 0.0,
                 "last_open_attempt": 0.0,
                 "static_close_order_ids": [],
@@ -1409,23 +1412,36 @@ class TradingBot:
                     return None
             return None
 
+        def _latest_pivot_price() -> Optional[Decimal]:
+            if self.recent_pivots:
+                try:
+                    return Decimal(self.recent_pivots[-1].price)
+                except Exception:
+                    return None
+            return None
+
         def _pivot_adverse_for_direction(dir_val: str) -> bool:
             """Only treat new pivots as adverse if they oppose the intended direction."""
             if not pivot_updated:
                 return False
             label = _latest_pivot_label()
+            pivot_price = _latest_pivot_price()
             if not label:
                 return False
             if dir_val == "buy":
-                return label in ("LL", "HL", "L")
-            return label in ("HH", "LH", "H")
+                ref_low = state.get("ref_low")
+                if pivot_price is None or ref_low is None:
+                    return False
+                # For long entry (close short, open long): only adverse when new low is higher than previous confirmed low
+                return label in ("LL", "HL", "L") and pivot_price > ref_low
+            ref_high = state.get("ref_high")
+            if pivot_price is None or ref_high is None:
+                return False
+            # For short entry (close long, open short): only adverse when new high is lower than previous confirmed high
+            return label in ("HH", "LH", "H") and pivot_price < ref_high
 
         # Close opposite side first
         if state.get("stage") == "close":
-            self.logger.log(
-                f"{self.timing_prefix} Close stage pos={pos_signed} abs={pos_abs} desired={direction} break={break_price} stop={stop_price}",
-                "INFO",
-            )
             if (not opposite) or pos_abs <= min_qty:
                 if state.get("static_close_order_ids"):
                     await self._cancel_order_ids(state["static_close_order_ids"])
@@ -1786,21 +1802,24 @@ class TradingBot:
 
         # Stop/structural checks: in timing/HFT, convert to breakout signal so close/open flow stays unified
         signal = None
+        signal_reason = None
         buffer = self.break_buffer_ticks * self.config.tick_size
         active_stop = self.dynamic_stop_price if (self.enable_dynamic_sl and self.dynamic_stop_price is not None) else self.zigzag_stop_price
         if self.direction_lock and active_stop is not None:
             if self.direction_lock == "buy" and best_bid <= active_stop:
                 signal = "sell"
+                signal_reason = "stop"
             if self.direction_lock == "sell" and best_ask >= active_stop:
                 signal = "buy"
+                signal_reason = "stop"
 
         if self.direction_lock:
             if self.direction_lock == "buy" and self.last_confirmed_low is not None and best_bid <= (self.last_confirmed_low - buffer):
-                self._log_once("struct_close_buy", f"{self.timing_prefix} Structural close (converted to signal): long breaks last confirmed low", "INFO", interval=5.0)
                 signal = "sell"
+                signal_reason = "struct_close_buy"
             if self.direction_lock == "sell" and self.last_confirmed_high is not None and best_ask >= (self.last_confirmed_high + buffer):
-                self._log_once("struct_close_sell", f"{self.timing_prefix} Structural close (converted to signal): short breaks last confirmed high", "INFO", interval=5.0)
                 signal = "buy"
+                signal_reason = "struct_close_sell"
 
         # Detect breakout signals
         if trade_price is not None:
@@ -1837,6 +1856,27 @@ class TradingBot:
                         self.pending_break_price = self.last_confirmed_low - buffer
                 except Exception:
                     self.pending_break_price = None
+                if signal_reason == "struct_close_buy":
+                    self._log_once(
+                        "struct_close_buy_once",
+                        f"{self.timing_prefix} Structural close: long breaks last confirmed low -> pending SELL",
+                        "INFO",
+                        interval=300.0,
+                    )
+                elif signal_reason == "struct_close_sell":
+                    self._log_once(
+                        "struct_close_sell_once",
+                        f"{self.timing_prefix} Structural close: short breaks last confirmed high -> pending BUY",
+                        "INFO",
+                        interval=300.0,
+                    )
+                elif signal_reason == "stop":
+                    self._log_once(
+                        f"stop_break:{signal}",
+                        f"{self.timing_prefix} Stop trigger converts to pending {signal.upper()}",
+                        "INFO",
+                        interval=120.0,
+                    )
 
         if self.pending_entry:
             await self._process_pending_zigzag_entry(best_bid, best_ask)
@@ -3092,6 +3132,14 @@ class TradingBot:
             if pivot.label in ("LH", "H", "HH") and last_high is not None and pivot_price is not None:
                 if pivot_price < last_high:
                     need_cancel = True
+
+        if need_cancel:
+            self._log_once(
+                f"adverse_pivot:{self.pending_entry}",
+                f"{self.timing_prefix} Adverse pivot {pivot.label} price={pivot_price} vs last extreme -> evaluate cancel",
+                "INFO",
+                interval=60.0,
+            )
 
         if need_cancel and pivot.close_time and self.pending_break_trigger_ts:
             try:
