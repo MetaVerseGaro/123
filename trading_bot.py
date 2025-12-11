@@ -277,6 +277,7 @@ class TradingBot:
         self._log_throttle: Dict[str, Tuple[str, float]] = {}
         self._pending_log_cache: Dict[str, str] = {}
         self._blocked_direction: Optional[str] = None
+        self._blocked_direction_last_log: Optional[str] = None
         self._hft_block_dir: Optional[str] = None
         self._hft_block_until: float = 0.0
         # Throttled log tracker to avoid repeated identical logs
@@ -1443,7 +1444,7 @@ class TradingBot:
                     state["force_close_only"] = True
                     state["skip_open"] = True
                     # Block same-direction re-entry until opposite breakout to avoid immediate reopen after adverse pivot
-                    self._blocked_direction = direction
+                    self._update_blocked_direction(direction)
                     state["last_close_attempt"] = 0.0
                     self.logger.log(
                         f"{self.timing_prefix} Adverse pivot during static close; force close-only and skip open for this signal",
@@ -1466,12 +1467,6 @@ class TradingBot:
                     else:
                         favourable = ref_price >= (break_price + tolerance)
                 # Unthrottled log to diagnose unfavourable chasing
-                self._log_once(
-                    f"close_eval:{direction}",
-                    f"{self.timing_prefix} Close eval side={close_side} ref={ref_price} break={break_price} fav={favourable}",
-                    "INFO",
-                    interval=10.0,
-                )
                 # 被强制 close-only：若已有挂单则等待，否则按盘口价挂一次
                 if state.get("force_close_only"):
                     if not state.get("static_close_order_ids") and book_price is not None and book_price > 0:
@@ -1483,12 +1478,6 @@ class TradingBot:
                     return
                 if favourable:
                     # 价格更有利：按 3s 节奏追价，取消静态挂单
-                    self._log_once(
-                        f"close_mode:{direction}",
-                        f"{self.timing_prefix} Close favourable: book={book_price} break={break_price} -> chase 3s",
-                        "INFO",
-                        interval=5.0,
-                    )
                     if state.get("static_close_order_ids"):
                         await self._cancel_order_ids(state["static_close_order_ids"])
                         state["static_close_order_ids"] = []
@@ -1497,15 +1486,13 @@ class TradingBot:
                         res = await self._place_post_only_limit(close_side, qty, book_price, reduce_only=True)
                         state["last_close_attempt"] = now_ts
                         if res and res.success:
+                            self.logger.log(
+                                f"{self.timing_prefix} Close chase placed side={close_side} qty={qty} @ {book_price} (break={break_price})",
+                                "INFO",
+                            )
                             self._invalidate_position_cache()
                     return
                 # 不利时挂破位价静态单，取消追价
-                self._log_once(
-                    f"close_mode_static:{direction}",
-                    f"{self.timing_prefix} Close static at break {break_price} (book={book_price})",
-                    "INFO",
-                    interval=5.0,
-                )
                 if book_price is not None and book_price > 0:
                     if state.get("static_close_order_ids"):
                         pass
@@ -1538,7 +1525,7 @@ class TradingBot:
             self._log_once("skip_open", f"{self.timing_prefix} Skip open due to prior pivot update during close", "INFO", interval=10.0)
             # Block same-direction re-entry until opposite breakout
             if self._blocked_direction != direction:
-                self._blocked_direction = direction
+                self._update_blocked_direction(direction)
             await self._clear_pending_entry_state(clear_direction=True)
             return
 
@@ -1557,7 +1544,7 @@ class TradingBot:
         if open_adverse and remaining > 0:
             # abandon entry only when adverse pivot appears before entry filled, and block this direction until opposite breakout
             await self._cancel_order_ids(state.get("static_open_order_ids", []))
-            self._blocked_direction = direction
+            self._update_blocked_direction(direction)
             self.logger.log(f"{self.timing_prefix} Abandon open: adverse pivot arrived before entry filled; block {direction} until opposite breakout", "INFO")
             # 如果仍有反向持仓，重新转为 close-only 追价
             try:
@@ -1598,13 +1585,6 @@ class TradingBot:
             else:
                 favourable_open = ref_price > break_price
 
-        self._log_once(
-            f"open_eval:{direction}",
-            f"{self.timing_prefix} Open eval dir={direction} ref={ref_price} break={break_price} favourable={favourable_open} remaining={remaining}",
-            "INFO",
-            interval=10.0,
-        )
-
         now_ts = time.time()
         if favourable_open and (now_ts - state.get("last_open_attempt", 0.0)) >= 3.0:
             # Cancel previous chase orders to avoid piling up
@@ -1620,6 +1600,10 @@ class TradingBot:
             if res and res.success:
                 state["entry_ref_price"] = book_price
                 state["chase_open_order_ids"] = [res.order_id]
+                self.logger.log(
+                    f"{self.timing_prefix} Open chase placed dir={direction} qty={qty} @ {book_price} (break={break_price})",
+                    "INFO",
+                )
                 self._invalidate_position_cache()
             else:
                 self.logger.log(
@@ -1646,6 +1630,10 @@ class TradingBot:
                         break
                 if placed_ids:
                     state["static_open_order_ids"] = placed_ids
+                    self.logger.log(
+                        f"{self.timing_prefix} Open static placed @ {break_price} ids={placed_ids} qty={remaining}",
+                        "INFO",
+                    )
 
         # Check fill progress
         current_dir_qty = await self._get_directional_position(direction, force=True)
@@ -1762,7 +1750,12 @@ class TradingBot:
                 new_dir = "sell"
             if new_dir and new_dir != self.config.direction:
                 self._set_direction_all(new_dir, lock=False, mode="zigzag_timing")
-                self.logger.log(f"{self.timing_prefix} Flat breakout sets direction to {new_dir.upper()}", "INFO")
+                self._log_once(
+                    f"flat_breakout:{new_dir}",
+                    f"{self.timing_prefix} Flat breakout sets direction to {new_dir.upper()}",
+                    "INFO",
+                    interval=60.0,
+                )
 
     async def _close_residual_position_market(self, pos_signed: Decimal) -> bool:
         """Close tiny residual position with reduce-only market path."""
@@ -1821,14 +1814,13 @@ class TradingBot:
             else:
                 # unblock if opposite breakout
                 if self._blocked_direction and signal != self._blocked_direction:
-                    self._blocked_direction = None
+                    self._update_blocked_direction(None)
                 # HFT 同向冷却 2 分钟
                 if self.hft_mode and self._hft_block_dir == signal and time.time() < self._hft_block_until:
                     self._log_once("hft_block_dir", f"{self.timing_prefix} Block {signal} until {int(self._hft_block_until - time.time())}s later (cooldown)", "INFO", interval=5.0)
                     signal = None
                 # block same-direction signal when flagged
                 if self._blocked_direction and signal == self._blocked_direction:
-                    self._log_once("blocked_direction", f"{self.timing_prefix} Pending entry blocked for {signal} until opposite breakout", "INFO", interval=10.0)
                     signal = None
             if signal and self.pending_entry != signal:
                 self.pending_entry = signal
@@ -1940,6 +1932,26 @@ class TradingBot:
             self.stop_new_orders_reason = None
             self.last_stop_new_notify = False
             self.redundancy_insufficient_since = None
+
+    def _update_blocked_direction(self, direction: Optional[str] = None):
+        prev = self._blocked_direction
+        if direction == prev:
+            return
+        self._blocked_direction = direction
+        if direction:
+            self._log_once(
+                f"blocked_direction_{direction}",
+                f"{self.timing_prefix} Pending entry blocked for {direction} until opposite breakout",
+                "INFO",
+                interval=60.0,
+            )
+            self._blocked_direction_last_log = direction
+        elif prev:
+            self.logger.log(
+                f"{self.timing_prefix} Pending entry block cleared (was {prev})",
+                "INFO",
+            )
+            self._blocked_direction_last_log = None
 
     def _parse_timeframe_to_seconds(self, tf: str) -> int:
         """Convert timeframe string like '1m','5m','1h' to seconds."""
@@ -3051,7 +3063,12 @@ class TradingBot:
         except Exception as e:
             self.logger.log(f"[RISK] redundancy check after SL update failed: {e}", "WARNING")
 
-    async def _handle_pending_entry_pivot(self, pivot: PivotPoint):
+    async def _handle_pending_entry_pivot(
+        self,
+        pivot: PivotPoint,
+        prev_high: Optional[Decimal] = None,
+        prev_low: Optional[Decimal] = None,
+    ):
         """Handle new HL/LH during pending entry: cancel or finalize partial fills."""
         if not self.pending_entry:
             return
@@ -3061,16 +3078,19 @@ class TradingBot:
         except Exception:
             pivot_price = None
 
+        last_high = self.last_confirmed_high if prev_high is None else prev_high
+        last_low = self.last_confirmed_low if prev_low is None else prev_low
+
         # Rule: evaluate relative to last confirmed extreme
         if self.pending_entry == "buy":
             # new low pivot higher than last confirmed low => abandon; lower or equal => continue
-            if pivot.label in ("HL", "L", "LL") and self.last_confirmed_low is not None and pivot_price is not None:
-                if pivot_price > self.last_confirmed_low:
+            if pivot.label in ("HL", "L", "LL") and last_low is not None and pivot_price is not None:
+                if pivot_price > last_low:
                     need_cancel = True
         elif self.pending_entry == "sell":
             # new high pivot lower than last confirmed high => abandon; higher or equal => continue
-            if pivot.label in ("LH", "H", "HH") and self.last_confirmed_high is not None and pivot_price is not None:
-                if pivot_price < self.last_confirmed_high:
+            if pivot.label in ("LH", "H", "HH") and last_high is not None and pivot_price is not None:
+                if pivot_price < last_high:
                     need_cancel = True
 
         if need_cancel and pivot.close_time and self.pending_break_trigger_ts:
@@ -3088,7 +3108,7 @@ class TradingBot:
         if current_dir_qty <= Decimal("0"):
             # Block same-direction until opposite breakout after adverse pivot
             if self._blocked_direction != self.pending_entry:
-                self._blocked_direction = self.pending_entry
+                self._update_blocked_direction(self.pending_entry)
             self._log_once(
                 f"pivot_cancel:{self.pending_entry}",
                 f"{self.timing_prefix} Pending entry {self.pending_entry} canceled by pivot {pivot.label} price={pivot_price} vs last extreme",
@@ -3105,8 +3125,10 @@ class TradingBot:
 
     async def _handle_pivot_event(self, pivot: PivotPoint, notify: bool = True):
         """Handle external ZigZag pivot: update pivots, dynamic SL, and slow reverse follow-up."""
+        prev_high = self.last_confirmed_high
+        prev_low = self.last_confirmed_low
+        await self._handle_pending_entry_pivot(pivot, prev_high=prev_high, prev_low=prev_low)
         self._update_confirmed_pivots(pivot)
-        await self._handle_pending_entry_pivot(pivot)
 
         if self.pending_reverse_state:
             handled = await self._process_slow_reverse_followup(pivot)
