@@ -1384,6 +1384,11 @@ class TradingBot:
         pos_abs = abs(pos_signed)
         opposite = (pos_signed * desired_sign) < 0
 
+        self.logger.log(
+            f"{self.timing_prefix} Pending entry state stage={state.get('stage')} dir={direction} desired_sign={desired_sign} pos={pos_signed} break={break_price} stop={stop_price} opposite={opposite}",
+            "INFO",
+        )
+
         # Determine chunk sizing
         def _chunk_amount(qty: Decimal) -> Decimal:
             max_per = self.max_fast_close_qty if self.max_fast_close_qty > 0 else qty
@@ -1410,6 +1415,10 @@ class TradingBot:
 
         # Close opposite side first
         if state.get("stage") == "close":
+            self.logger.log(
+                f"{self.timing_prefix} Close stage pos={pos_signed} abs={pos_abs} desired={direction} break={break_price} stop={stop_price}",
+                "INFO",
+            )
             if (not opposite) or pos_abs <= min_qty:
                 if state.get("static_close_order_ids"):
                     await self._cancel_order_ids(state["static_close_order_ids"])
@@ -1506,6 +1515,11 @@ class TradingBot:
                             self.logger.log(
                                 f"{self.timing_prefix} Close static placed @ {break_price} ids={placed_ids} qty={pos_abs}",
                                 "INFO",
+                            )
+                        else:
+                            self.logger.log(
+                                f"{self.timing_prefix} Close static placement failed side={close_side} qty={pos_abs} break={break_price}",
+                                "WARNING",
                             )
                 return
 
