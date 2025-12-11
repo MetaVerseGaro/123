@@ -1226,11 +1226,12 @@ class TradingBot:
 
     async def _clear_pending_entry_state(self, clear_direction: bool = False):
         """Clear pending entry flags and optionally reset direction/stop state."""
-        # Cancel any tracked static open/close orders from the new breakout flow
+        # Cancel any tracked static/chase open/close orders from the new breakout flow
         if self.pending_entry_state:
             close_ids = self.pending_entry_state.get("static_close_order_ids") or []
             open_ids = self.pending_entry_state.get("static_open_order_ids") or []
-            to_cancel = [oid for oid in (close_ids + open_ids) if oid]
+            chase_open_ids = self.pending_entry_state.get("chase_open_order_ids") or []
+            to_cancel = [oid for oid in (close_ids + open_ids + chase_open_ids) if oid]
             if to_cancel:
                 await self._cancel_order_ids(to_cancel)
         self.pending_entry_state = None
@@ -1366,6 +1367,7 @@ class TradingBot:
                 "last_open_attempt": 0.0,
                 "static_close_order_ids": [],
                 "static_open_order_ids": [],
+                "chase_open_order_ids": [],
                 "force_close_only": False,
                 "skip_open": False,
                 "stage": "close",
@@ -1448,7 +1450,7 @@ class TradingBot:
                 self._log_once(
                     f"close_eval:{direction}",
                     f"{self.timing_prefix} Close eval side={close_side} ref={ref_price} break={break_price} favourable={favourable} pos={pos_signed}",
-                    "DEBUG",
+                    "INFO",
                     interval=2.0,
                 )
                 # 被强制 close-only：若已有挂单则等待，否则按盘口价挂一次
@@ -1569,37 +1571,60 @@ class TradingBot:
             else:
                 favourable_open = ref_price > break_price
 
+        self._log_once(
+            f"open_eval:{direction}",
+            f"{self.timing_prefix} Open eval dir={direction} ref={ref_price} break={break_price} favourable={favourable_open} remaining={remaining}",
+            "INFO",
+            interval=2.0,
+        )
+
         now_ts = time.time()
         if favourable_open and (now_ts - state.get("last_open_attempt", 0.0)) >= 3.0:
+            # Cancel previous chase orders to avoid piling up
+            if state.get("chase_open_order_ids"):
+                await self._cancel_order_ids(state["chase_open_order_ids"])
+                state["chase_open_order_ids"] = []
+            if state.get("static_open_order_ids"):
+                await self._cancel_order_ids(state["static_open_order_ids"])
+                state["static_open_order_ids"] = []
             qty = _chunk_amount(remaining)
             res = await self._place_post_only_limit(direction, qty, book_price, reduce_only=False)
             state["last_open_attempt"] = now_ts
             if res and res.success:
                 state["entry_ref_price"] = book_price
+                state["chase_open_order_ids"] = [res.order_id]
                 self._invalidate_position_cache()
             else:
                 self.logger.log(
                     f"{self.timing_prefix} Open attempt failed post-only {direction} qty={qty} @ {book_price}, will retry in 3s",
                     "INFO",
                 )
-        elif not favourable_open and not state.get("static_open_order_ids") and book_price is not None and book_price > 0:
-            remaining_open = remaining
-            placed_ids: List[str] = []
-            while remaining_open > 0:
-                qty = _chunk_amount(remaining_open)
-                res = await self._place_post_only_limit(direction, qty, break_price, reduce_only=False)
-                if res and res.success:
-                    placed_ids.append(res.order_id)
-                    remaining_open -= qty
-                else:
-                    break
-            if placed_ids:
-                state["static_open_order_ids"] = placed_ids
+        elif not favourable_open and book_price is not None and book_price > 0:
+            # Cancel any chase orders before parking static entries
+            if state.get("chase_open_order_ids"):
+                await self._cancel_order_ids(state["chase_open_order_ids"])
+                state["chase_open_order_ids"] = []
+            if state.get("static_open_order_ids"):
+                pass
+            else:
+                remaining_open = remaining
+                placed_ids: List[str] = []
+                while remaining_open > 0:
+                    qty = _chunk_amount(remaining_open)
+                    res = await self._place_post_only_limit(direction, qty, break_price, reduce_only=False)
+                    if res and res.success:
+                        placed_ids.append(res.order_id)
+                        remaining_open -= qty
+                    else:
+                        break
+                if placed_ids:
+                    state["static_open_order_ids"] = placed_ids
 
         # Check fill progress
         current_dir_qty = await self._get_directional_position(direction, force=True)
         if current_dir_qty >= max(min_qty, target_qty - min_qty):
             entry_px = state.get("entry_ref_price", break_price)
+            await self._cancel_order_ids(state.get("chase_open_order_ids", []))
             await self._cancel_order_ids(state.get("static_open_order_ids", []))
             await self._finalize_pending_entry(direction, current_dir_qty, entry_px, stop_price)
             self.pending_entry_state = None
