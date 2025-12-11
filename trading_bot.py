@@ -1443,15 +1443,15 @@ class TradingBot:
                 if ref_price is not None and ref_price > 0:
                     # 回到破位价内为有利侧：
                     # 平空开多（close_side=buy）有利：价格 < 破位价；平多开空（close_side=sell）有利：价格 > 破位价
+                    tolerance = self.config.tick_size / Decimal(2)
                     if close_side == "buy":
-                        favourable = ref_price < break_price
+                        favourable = ref_price <= (break_price - tolerance)
                     else:
-                        favourable = ref_price > break_price
-                self._log_once(
-                    f"close_eval:{direction}",
-                    f"{self.timing_prefix} Close eval side={close_side} ref={ref_price} break={break_price} favourable={favourable} pos={pos_signed}",
+                        favourable = ref_price >= (break_price + tolerance)
+                # Unthrottled log to diagnose unfavourable chasing
+                self.logger.log(
+                    f"{self.timing_prefix} Close eval side={close_side} bid={best_bid} ask={best_ask} ref={ref_price} break={break_price} fav={favourable} pos={pos_signed}",
                     "INFO",
-                    interval=2.0,
                 )
                 # 被强制 close-only：若已有挂单则等待，否则按盘口价挂一次
                 if state.get("force_close_only"):
