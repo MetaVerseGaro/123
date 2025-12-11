@@ -1415,7 +1415,8 @@ class TradingBot:
                 state["stage"] = "open"
             else:
                 close_side = "buy" if pos_signed < 0 else "sell"
-                book_price = best_ask if close_side == "buy" else best_bid
+                # Maker pricing: buy against bid, sell against ask to avoid post-only rejection when inside breakout range
+                book_price = best_bid if close_side == "buy" else best_ask
                 now_ts = time.time()
                 adverse_pivot = _pivot_adverse_for_direction(direction)
                 # Pivot update while static close pending -> force close-only if adverse
@@ -1532,7 +1533,8 @@ class TradingBot:
                 await self._clear_pending_entry_state(clear_direction=True)
             return
 
-        book_price = best_ask if direction == "buy" else best_bid
+        # Maker pricing: buy using bid, sell using ask to keep orders resting when price re-enters breakout band
+        book_price = best_bid if direction == "buy" else best_ask
         favourable_open = False
         if book_price is not None and book_price > 0:
             if direction == "buy":
