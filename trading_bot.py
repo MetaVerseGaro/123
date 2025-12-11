@@ -1778,30 +1778,25 @@ class TradingBot:
         pos_signed = await self._sync_direction_lock()
         await self._realign_direction_state(trade_price, pos_signed, reason="loop")
 
-        # Stop check (use best bid/ask)
+        # Stop/structural checks: in timing/HFT, convert to breakout signal so close/open flow stays unified
+        signal = None
+        buffer = self.break_buffer_ticks * self.config.tick_size
         active_stop = self.dynamic_stop_price if (self.enable_dynamic_sl and self.dynamic_stop_price is not None) else self.zigzag_stop_price
         if self.direction_lock and active_stop is not None:
             if self.direction_lock == "buy" and best_bid <= active_stop:
-                await self._execute_zigzag_stop("sell", best_bid, best_ask)
-                return
+                signal = "sell"
             if self.direction_lock == "sell" and best_ask >= active_stop:
-                await self._execute_zigzag_stop("buy", best_bid, best_ask)
-                return
+                signal = "buy"
 
-        # Structural close on confirmed pivot breaks (not gated by stop_new_orders/pending_entry)
-        buffer = self.break_buffer_ticks * self.config.tick_size
         if self.direction_lock:
             if self.direction_lock == "buy" and self.last_confirmed_low is not None and best_bid <= (self.last_confirmed_low - buffer):
-                self.logger.log(f"{self.timing_prefix} Structural close: long breaks last confirmed low", "INFO")
-                await self._execute_zigzag_stop("sell", best_bid, best_ask)
-                return
+                self.logger.log(f"{self.timing_prefix} Structural close (converted to signal): long breaks last confirmed low", "INFO")
+                signal = "sell"
             if self.direction_lock == "sell" and self.last_confirmed_high is not None and best_ask >= (self.last_confirmed_high + buffer):
-                self.logger.log(f"{self.timing_prefix} Structural close: short breaks last confirmed high", "INFO")
-                await self._execute_zigzag_stop("buy", best_bid, best_ask)
-                return
+                self.logger.log(f"{self.timing_prefix} Structural close (converted to signal): short breaks last confirmed high", "INFO")
+                signal = "buy"
 
         # Detect breakout signals
-        signal = None
         if trade_price is not None:
             if self.last_confirmed_high is not None and trade_price >= (self.last_confirmed_high + buffer):
                 signal = "buy"
