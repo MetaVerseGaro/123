@@ -1445,6 +1445,12 @@ class TradingBot:
                         favourable = ref_price < break_price
                     else:
                         favourable = ref_price > break_price
+                self._log_once(
+                    f"close_eval:{direction}",
+                    f"{self.timing_prefix} Close eval side={close_side} ref={ref_price} break={break_price} favourable={favourable} pos={pos_signed}",
+                    "DEBUG",
+                    interval=2.0,
+                )
                 # 被强制 close-only：若已有挂单则等待，否则按盘口价挂一次
                 if state.get("force_close_only"):
                     if not state.get("static_close_order_ids") and book_price is not None and book_price > 0:
@@ -1495,6 +1501,10 @@ class TradingBot:
                                 break
                         if placed_ids:
                             state["static_close_order_ids"] = placed_ids
+                            self.logger.log(
+                                f"{self.timing_prefix} Close static placed @ {break_price} ids={placed_ids} qty={pos_abs}",
+                                "INFO",
+                            )
                 return
 
         # If we get here, closing is done or not needed
