@@ -25,7 +25,7 @@
       "risk_pct": 1.0,                     # 风险敞口百分比（按止损距离算仓位）
       "use_risk_exposure": true,           # true=按风险敞口算仓；false=按杠杆算仓
       "leverage": 1,                       # use_risk_exposure=false 时使用的杠杆倍数，equity*leverage/entry_price 得出目标仓位
-      "risk_reward": -1,                    # 盈亏比，>0 按 RR 设置 TP，<0 关闭主动止盈
+      "risk_reward": -1,                   # 盈亏比，>0 按 RR 设置 TP，<0 关闭主动止盈
       "release_timeout_minutes": 0,        # grid/冗余释放用；zigzag_timing 不执行释放，可置 0
       "stop_new_orders_equity_threshold": 10, # 低于该 equity 停新并缓步平仓退出
       "zigzag": {
@@ -36,8 +36,8 @@
         "zigzag_deviation": 5,             # ZigZag 偏离率
         "zigzag_backstep": 2,              # ZigZag backstep
         "zigzag_timeframe": "1m",          # ZigZag 聚合周期
-        "zigzag_warmup_candles": 200,      # ZigZag 预热根数
-        "break_buffer_ticks": 1,          # 突破确认高/低的缓冲（ticks）
+        "pivot_poll_offset_sec": 5,        # 读取枢轴 JSON 的整点偏移秒数（0 表示整点，例：5 表示 00:05、15:05...）
+        "break_buffer_ticks": 1,           # 突破确认高/低的缓冲（ticks）
         "pivot_file": "zigzag_pivots.json" # TradingView ZigZag pivot 持久化路径
       }
     },
