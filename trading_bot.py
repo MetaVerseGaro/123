@@ -9,6 +9,7 @@ import asyncio
 import traceback
 import sys
 import random
+import math
 from pathlib import Path
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -98,6 +99,7 @@ class TradingConfig:
     leverage: Decimal = Decimal("1")
     risk_reward: Decimal = Decimal("2")
     hft_pivot_file: Optional[str] = None
+    pivot_poll_offset_sec: int = 0
 
     @property
     def close_order_side(self) -> str:
@@ -260,6 +262,11 @@ class TradingBot:
         self.symbol_base = self._extract_symbol_base(self.config.ticker)
         self.timing_prefix = "[HFT]" if self.hft_mode else "[ZIGZAG-TIMING]"
         self.base_dir = Path(__file__).resolve().parent
+        try:
+            cfg_offset = int(getattr(config, "pivot_poll_offset_sec", 0) or 0)
+        except Exception:
+            cfg_offset = 0
+        self.pivot_poll_offset_sec = max(0, int(os.getenv("PIVOT_POLL_OFFSET_SEC", cfg_offset)))
         pivot_path_cfg = getattr(config, "zigzag_pivot_file", None)
         hft_pivot_cfg = getattr(config, "hft_pivot_file", None)
         dir_path_cfg = getattr(config, "webhook_basic_direction_file", None)
@@ -287,6 +294,7 @@ class TradingBot:
         self._log_throttle: Dict[str, Tuple[str, float]] = {}
         default_interval = float(self.zigzag_timeframe_sec or 60)
         self._pivot_poll_interval: float = float(os.getenv("PIVOT_POLL_INTERVAL_SEC", str(int(default_interval))))
+        self._next_pivot_poll_ts: float = 0.0
         self._last_pivot_change_ts: float = time.time()
         self.pending_entry_state: Optional[Dict[str, Any]] = None
         self._webhook_poll_interval: float = float(os.getenv("WEBHOOK_POLL_INTERVAL_SEC", "5"))
@@ -2035,6 +2043,15 @@ class TradingBot:
         except Exception:
             return 60
 
+    def _compute_next_pivot_poll_ts(self, from_ts: Optional[float] = None) -> float:
+        """Align pivot轮询到 timeframe 边界 + offset（秒）。"""
+        now_ts = from_ts if from_ts is not None else time.time()
+        period = max(1, int(self.zigzag_timeframe_sec or 60))
+        offset = int(self.pivot_poll_offset_sec or 0)
+        offset = offset % period
+        base = math.floor((now_ts - offset) / period) * period + offset
+        return base + period if base <= now_ts else base
+
     def _resolve_path(self, path_str: str) -> Path:
         """Resolve a file path relative to the project root."""
         path = Path(str(path_str))
@@ -2847,17 +2864,18 @@ class TradingBot:
         if not self.enable_zigzag:
             return
         now = time.time()
+        if (not force) and self._next_pivot_poll_ts and now < self._next_pivot_poll_ts:
+            return
         current_mtime = 0.0
         try:
             if self.zigzag_pivot_file.exists():
                 current_mtime = self.zigzag_pivot_file.stat().st_mtime
         except Exception:
             current_mtime = 0.0
-        if (not force) and (now - self._last_pivot_poll < self._pivot_poll_interval) and (current_mtime == self._pivot_file_mtime):
-            return
         self._last_pivot_poll = now
         entries = self._load_pivots_for_config()
         if not entries:
+            self._next_pivot_poll_ts = self._compute_next_pivot_poll_ts(now)
             return
         # Debounce rapid successive file writes
         if current_mtime and current_mtime != self._pivot_file_mtime:
@@ -2872,6 +2890,7 @@ class TradingBot:
                 continue
             self._processed_pivot_keys.add(key)
             await self._handle_pivot_event(pivot, notify=notify)
+        self._next_pivot_poll_ts = self._compute_next_pivot_poll_ts(now)
 
     async def _set_initial_direction_from_pivots(self, pivots: List[PivotPoint]):
         """Set initial direction based on latest HH/LL pivot when advanced risk is on."""
