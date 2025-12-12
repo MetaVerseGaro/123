@@ -166,6 +166,7 @@ class TradingBot:
         self.ttl_bbo_cache = float(os.getenv("BBO_CACHE_TTL_S", "0.5"))
         self.bbo_force_timeout = float(os.getenv("BBO_FORCE_TIMEOUT_MS", "150")) / 1000.0
         self.ttl_last_price = float(os.getenv("TTL_LAST_PRICE_SEC", "0.5"))
+        self.last_price_wait_max = float(os.getenv("LAST_PRICE_WAIT_MAX_SEC", "2.0"))
         self.ttl_active_orders = float(os.getenv("TTL_ACTIVE_ORDERS_SEC", "2"))
         self.ttl_active_orders_idle = float(os.getenv("TTL_ACTIVE_ORDERS_IDLE_SEC", "6"))
         self.ttl_position = float(os.getenv("TTL_POSITION_SEC", "1.5"))
@@ -775,10 +776,10 @@ class TradingBot:
         key = self._cache_key("last_price")
 
         async def _fetch():
-            deadline = time.time() + max(self.ttl_last_price, 0.5)
-            last_px: Optional[Decimal] = None
-            while last_px is None and time.time() < deadline:
-                last_px = await self._get_ws_last_price()
+            start = time.time()
+            attempts = 0
+            while True:
+                last_px: Optional[Decimal] = await self._get_ws_last_price()
                 if last_px is None:
                     # REST fallback: try common last-price helpers without using mid/bbo
                     for name in ("get_last_traded_price", "fetch_last_traded_price", "get_last_price", "fetch_last_price", "get_ticker"):
@@ -802,11 +803,13 @@ class TradingBot:
                         if price is not None and price > 0:
                             last_px = price
                             break
-                if last_px is None:
-                    await asyncio.sleep(0.1)
-            if last_px is None:
-                self.logger.log("[PRICE] last trade price unavailable (WS/REST); keeping previous", "WARNING")
-            return last_px
+                if last_px is not None:
+                    return last_px
+                attempts += 1
+                if time.time() - start >= max(self.last_price_wait_max, 0.5):
+                    self.logger.log(f"[PRICE] last trade price unavailable after {attempts} attempts; waiting for WS/REST", "WARNING")
+                    start = time.time()
+                await asyncio.sleep(0.1)
 
         return await self.cache.get(key, self.ttl_last_price, _fetch, force=force)
 
