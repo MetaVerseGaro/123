@@ -747,21 +747,6 @@ class TradingBot:
         """
         candidates = ["get_ws_last_price", "get_cached_last_price", "get_ws_ticker"]
 
-        def _normalize_price(val: Any) -> Optional[Decimal]:
-            if val is None:
-                return None
-            if isinstance(val, dict):
-                for k in ("last", "last_price", "price", "mark_price", "index_price", "close"):
-                    if k in val:
-                        val = val[k]
-                        break
-            if isinstance(val, (list, tuple)) and val:
-                val = val[0]
-            try:
-                return Decimal(str(val))
-            except Exception:
-                return None
-
         for name in candidates:
             fn = getattr(self.exchange_client, name, None)
             if not callable(fn):
@@ -781,43 +766,47 @@ class TradingBot:
             except Exception as e:
                 self.logger.log(f"[WS] {name} call failed: {e}", "WARNING")
                 continue
-            price = _normalize_price(res)
+            price = self._normalize_price_value(res)
             if price is not None and price > 0:
                 return price
-        # Fallback: derive mid from ws_manager best bid/ask if available
-        ws_mgr = getattr(self.exchange_client, "ws_manager", None)
-        if ws_mgr:
-            try:
-                bid_val = getattr(ws_mgr, "best_bid", None)
-                ask_val = getattr(ws_mgr, "best_ask", None)
-                if bid_val is not None and ask_val is not None:
-                    bid_d = Decimal(str(bid_val))
-                    ask_d = Decimal(str(ask_val))
-                    if bid_d > 0 and ask_d > 0 and bid_d < ask_d:
-                        return (bid_d + ask_d) / 2
-            except Exception:
-                pass
         return None
 
     async def _get_last_trade_price_cached(self, best_bid: Optional[Decimal] = None, best_ask: Optional[Decimal] = None, force: bool = False) -> Optional[Decimal]:
         key = self._cache_key("last_price")
 
         async def _fetch():
-            ws_last = await self._get_ws_last_price()
-            if ws_last is not None:
-                return ws_last
-            # Prefer given bid/ask if provided
-            if best_bid is not None and best_ask is not None:
-                try:
-                    return (Decimal(best_bid) + Decimal(best_ask)) / 2
-                except Exception:
-                    pass
-            try:
-                bid, ask = await self._get_bbo_cached(force=force)
-                return (bid + ask) / 2
-            except Exception as exc:
-                self.logger.log(f"[PRICE] Fallback trade price failed: {exc}", "WARNING")
-                return None
+            deadline = time.time() + max(self.ttl_last_price, 0.5)
+            last_px: Optional[Decimal] = None
+            while last_px is None and time.time() < deadline:
+                last_px = await self._get_ws_last_price()
+                if last_px is None:
+                    # REST fallback: try common last-price helpers without using mid/bbo
+                    for name in ("get_last_traded_price", "fetch_last_traded_price", "get_last_price", "fetch_last_price", "get_ticker"):
+                        fn = getattr(self.exchange_client, name, None)
+                        if not callable(fn):
+                            continue
+                        try:
+                            res = fn(self.config.contract_id)
+                            if asyncio.iscoroutine(res):
+                                res = await res
+                        except TypeError:
+                            try:
+                                res = fn()
+                                if asyncio.iscoroutine(res):
+                                    res = await res
+                            except Exception:
+                                continue
+                        except Exception:
+                            continue
+                        price = self._normalize_price_value(res)
+                        if price is not None and price > 0:
+                            last_px = price
+                            break
+                if last_px is None:
+                    await asyncio.sleep(0.1)
+            if last_px is None:
+                self.logger.log("[PRICE] last trade price unavailable (WS/REST); keeping previous", "WARNING")
+            return last_px
 
         return await self.cache.get(key, self.ttl_last_price, _fetch, force=force)
 
@@ -2090,6 +2079,24 @@ class TradingBot:
             except Exception:
                 return tf
         return tf
+
+    def _normalize_price_value(self, val: Any) -> Optional[Decimal]:
+        """Normalize ticker payloads to Decimal last price; exclude mid/mark/index fallbacks."""
+        if val is None:
+            return None
+        candidate = val
+        if isinstance(val, dict):
+            for k in ("last", "last_price", "trade_price", "close", "price"):
+                if k in val:
+                    candidate = val[k]
+                    break
+        if isinstance(candidate, (list, tuple)) and candidate:
+            candidate = candidate[0]
+        try:
+            num = Decimal(str(candidate))
+            return num if num > 0 else None
+        except Exception:
+            return None
 
     def _parse_pivot_time(self, value: str) -> Optional[datetime]:
         """Parse pivot close time into UTC datetime."""
