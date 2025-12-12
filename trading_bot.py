@@ -1893,6 +1893,13 @@ class TradingBot:
                         self.pending_break_price = self.last_confirmed_low - buffer
                 except Exception:
                     self.pending_break_price = None
+                try:
+                    self.logger.log(
+                        f"{self.timing_prefix} Pending entry seed dir={signal} break={self.pending_break_price} ref_high={self.last_confirmed_high} ref_low={self.last_confirmed_low} ref_high_ts={self.last_confirmed_high_ts} ref_low_ts={self.last_confirmed_low_ts} break_close_ts={self.pending_break_close_ts} bbo=({best_bid},{best_ask}) trade={trade_price} pivot_mtime={self._pivot_file_mtime}",
+                        "INFO",
+                    )
+                except Exception:
+                    pass
                 if signal_reason == "struct_close_buy":
                     self._log_once(
                         "struct_close_buy_once",
@@ -2890,6 +2897,13 @@ class TradingBot:
             if key in self._processed_pivot_keys:
                 continue
             self._processed_pivot_keys.add(key)
+            try:
+                self.logger.log(
+                    f"{self.timing_prefix} Pivot sync new {pivot.label} price={pivot.price} close_time={pivot.close_time} mtime={current_mtime}",
+                    "INFO",
+                )
+            except Exception:
+                pass
             await self._handle_pivot_event(pivot, notify=notify)
         self._next_pivot_poll_ts = self._compute_next_pivot_poll_ts(now)
 
