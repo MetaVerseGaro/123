@@ -1428,18 +1428,29 @@ class TradingBot:
                     return None
             return None
 
+        def _latest_pivot_price() -> Optional[Decimal]:
+            if self.recent_pivots:
+                try:
+                    return Decimal(self.recent_pivots[-1].price)
+                except Exception:
+                    return None
+            return None
+
         def _pivot_adverse_for_direction(dir_val: str) -> bool:
             """Adverse only when new opposing pivot arrives after breakout candle close time."""
             if not pivot_updated:
                 return False
             label = _latest_pivot_label()
             pivot_ts = _latest_pivot_ts()
+            pivot_price = _latest_pivot_price()
             break_ts = state.get("break_candle_close_ts")
             if not label or pivot_ts is None or break_ts is None:
                 return False
             if dir_val == "buy":
-                return label in ("LL", "HL", "L") and pivot_ts > break_ts
-            return label in ("HH", "LH", "H") and pivot_ts > break_ts
+                ref_low = state.get("ref_low")
+                return label in ("LL", "HL", "L") and pivot_ts > break_ts and (pivot_price is not None and ref_low is not None and pivot_price > ref_low)
+            ref_high = state.get("ref_high")
+            return label in ("HH", "LH", "H") and pivot_ts > break_ts and (pivot_price is not None and ref_high is not None and pivot_price < ref_high)
 
         # Close opposite side first
         if state.get("stage") == "close":
@@ -3159,19 +3170,24 @@ class TradingBot:
         else:
             break_ts = self.pending_break_close_ts or prev_low_ts
 
+        ref_high = self.last_confirmed_high if prev_high is None else prev_high
+        ref_low = self.last_confirmed_low if prev_low is None else prev_low
+
         # Time-based rule: compare pivot close time with breakout pivot close time
-        if pivot_ts is not None and break_ts is not None:
-            if self.pending_entry == "buy" and pivot.label in ("HL", "L", "LL"):
-                if pivot_ts > break_ts:
+        if pivot_ts is not None and break_ts is not None and pivot_price is not None:
+            if self.pending_entry == "buy" and pivot.label in ("HL", "L", "LL") and ref_low is not None:
+                # Require both time later than breakout bar and price worse (higher low)
+                if pivot_ts > break_ts and pivot_price > ref_low:
                     need_cancel = True
-            if self.pending_entry == "sell" and pivot.label in ("LH", "H", "HH"):
-                if pivot_ts > break_ts:
+            if self.pending_entry == "sell" and pivot.label in ("LH", "H", "HH") and ref_high is not None:
+                # Require both time later than breakout bar and price worse (lower high)
+                if pivot_ts > break_ts and pivot_price < ref_high:
                     need_cancel = True
 
         if need_cancel:
             self._log_once(
                 f"adverse_pivot:{self.pending_entry}",
-                f"{self.timing_prefix} Adverse pivot {pivot.label} pivot_ts={pivot_ts} break_ts={break_ts} -> evaluate cancel",
+                f"{self.timing_prefix} Adverse pivot {pivot.label} pivot_ts={pivot_ts} break_ts={break_ts} pivot_price={pivot_price} ref_high={ref_high} ref_low={ref_low} -> evaluate cancel",
                 "INFO",
                 interval=60.0,
             )
