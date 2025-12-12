@@ -1370,8 +1370,9 @@ class TradingBot:
                 "last_close_attempt": 0.0,
                 "last_open_attempt": 0.0,
                 "static_close_order_ids": [],
-                "chase_close_order_ids": [],
+                "static_close_price": None,
                 "static_open_order_ids": [],
+                "static_open_price": None,
                 "chase_open_order_ids": [],
                 "force_close_only": False,
                 "skip_open": False,
@@ -1446,10 +1447,7 @@ class TradingBot:
             if (not opposite) or pos_abs <= min_qty:
                 if state.get("static_close_order_ids"):
                     await self._cancel_order_ids(state["static_close_order_ids"])
-                if state.get("chase_close_order_ids"):
-                    await self._cancel_order_ids(state["chase_close_order_ids"])
                 state["static_close_order_ids"] = []
-                state["chase_close_order_ids"] = []
                 state["stage"] = "open"
             else:
                 close_side = "buy" if pos_signed < 0 else "sell"
@@ -1460,10 +1458,7 @@ class TradingBot:
                 # Pivot update while static close pending -> force close-only if adverse
                 if adverse_pivot and state.get("static_close_order_ids"):
                     await self._cancel_order_ids(state["static_close_order_ids"])
-                    if state.get("chase_close_order_ids"):
-                        await self._cancel_order_ids(state["chase_close_order_ids"])
                     state["static_close_order_ids"] = []
-                    state["chase_close_order_ids"] = []
                     state["force_close_only"] = True
                     state["skip_open"] = True
                     # Block same-direction re-entry until opposite breakout to avoid immediate reopen after adverse pivot
@@ -1493,9 +1488,6 @@ class TradingBot:
                 # 被强制 close-only：若已有挂单则等待，否则按盘口价挂一次
                 if state.get("force_close_only"):
                     if not state.get("static_close_order_ids") and book_price is not None and book_price > 0:
-                        if state.get("chase_close_order_ids"):
-                            await self._cancel_order_ids(state["chase_close_order_ids"])
-                            state["chase_close_order_ids"] = []
                         qty = _chunk_amount(pos_abs)
                         res = await self._place_post_only_limit(close_side, qty, book_price, reduce_only=True)
                         state["last_close_attempt"] = now_ts
@@ -1507,9 +1499,6 @@ class TradingBot:
                     if state.get("static_close_order_ids"):
                         await self._cancel_order_ids(state["static_close_order_ids"])
                         state["static_close_order_ids"] = []
-                    if state.get("chase_close_order_ids"):
-                        await self._cancel_order_ids(state["chase_close_order_ids"])
-                        state["chase_close_order_ids"] = []
                     if book_price is not None and book_price > 0 and (now_ts - state.get("last_close_attempt", 0.0)) >= 3.0:
                         qty = _chunk_amount(pos_abs)
                         res = await self._place_post_only_limit(close_side, qty, book_price, reduce_only=True)
@@ -1520,39 +1509,22 @@ class TradingBot:
                                 "INFO",
                             )
                             self._invalidate_position_cache()
-                            state["chase_close_order_ids"].append(res.order_id)
                     return
-                # 不利时挂破位价静态单，取消追价
+                # 不利时挂破位价静态单，取消追价；确保静态单价格等于 break_price
                 if book_price is not None and book_price > 0:
-                    # If existing static orders are not at break_price, cancel and re-place
+                    static_price = break_price
+                    if state.get("static_close_order_ids") and state.get("static_close_price") != static_price:
+                        await self._cancel_order_ids(state["static_close_order_ids"])
+                        state["static_close_order_ids"] = []
+                        state["static_close_price"] = None
                     if state.get("static_close_order_ids"):
-                        stale_static = False
-                        for oid in list(state["static_close_order_ids"]):
-                            try:
-                                info = await self._get_order_info_cached(oid, force=True)
-                                px = None
-                                if info is not None:
-                                    px = getattr(info, "price", None)
-                                    if px is None and isinstance(info, dict):
-                                        px = info.get("price")
-                                if px is None or Decimal(px) != break_price:
-                                    stale_static = True
-                                    break
-                            except Exception:
-                                stale_static = True
-                                break
-                        if stale_static:
-                            await self._cancel_order_ids(state["static_close_order_ids"])
-                            state["static_close_order_ids"] = []
-                    if not state.get("static_close_order_ids"):
-                        if state.get("chase_close_order_ids"):
-                            await self._cancel_order_ids(state["chase_close_order_ids"])
-                            state["chase_close_order_ids"] = []
+                        pass
+                    else:
                         remaining_close = pos_abs
                         placed_ids: List[str] = []
                         while remaining_close > 0:
                             qty = _chunk_amount(remaining_close)
-                            res = await self._place_post_only_limit(close_side, qty, break_price, reduce_only=True)
+                            res = await self._place_post_only_limit(close_side, qty, static_price, reduce_only=True)
                             if res and res.success:
                                 placed_ids.append(res.order_id)
                                 remaining_close -= qty
@@ -1560,13 +1532,14 @@ class TradingBot:
                                 break
                         if placed_ids:
                             state["static_close_order_ids"] = placed_ids
+                            state["static_close_price"] = static_price
                             self.logger.log(
-                                f"{self.timing_prefix} Close static placed @ {break_price} ids={placed_ids} qty={pos_abs}",
+                                f"{self.timing_prefix} Close static placed @ {static_price} ids={placed_ids} qty={pos_abs}",
                                 "INFO",
                             )
                         else:
                             self.logger.log(
-                                f"{self.timing_prefix} Close static placement failed side={close_side} qty={pos_abs} break={break_price}",
+                                f"{self.timing_prefix} Close static placement failed side={close_side} qty={pos_abs} break={static_price}",
                                 "WARNING",
                             )
                 return
@@ -1662,10 +1635,15 @@ class TradingBot:
                     "INFO",
                 )
         elif not favourable_open and book_price is not None and book_price > 0:
-            # Cancel any chase orders before parking static entries
+            # Cancel any chase orders before parking static entries; ensure static price equals break_price
             if state.get("chase_open_order_ids"):
                 await self._cancel_order_ids(state["chase_open_order_ids"])
                 state["chase_open_order_ids"] = []
+            static_price = break_price
+            if state.get("static_open_order_ids") and state.get("static_open_price") != static_price:
+                await self._cancel_order_ids(state["static_open_order_ids"])
+                state["static_open_order_ids"] = []
+                state["static_open_price"] = None
             if state.get("static_open_order_ids"):
                 pass
             else:
@@ -1673,7 +1651,7 @@ class TradingBot:
                 placed_ids: List[str] = []
                 while remaining_open > 0:
                     qty = _chunk_amount(remaining_open)
-                    res = await self._place_post_only_limit(direction, qty, break_price, reduce_only=False)
+                    res = await self._place_post_only_limit(direction, qty, static_price, reduce_only=False)
                     if res and res.success:
                         placed_ids.append(res.order_id)
                         remaining_open -= qty
@@ -1681,8 +1659,9 @@ class TradingBot:
                         break
                 if placed_ids:
                     state["static_open_order_ids"] = placed_ids
+                    state["static_open_price"] = static_price
                     self.logger.log(
-                        f"{self.timing_prefix} Open static placed @ {break_price} ids={placed_ids} qty={remaining}",
+                        f"{self.timing_prefix} Open static placed @ {static_price} ids={placed_ids} qty={remaining}",
                         "INFO",
                     )
 
@@ -3186,15 +3165,57 @@ class TradingBot:
         if not need_cancel:
             return
         current_dir_qty = await self._get_directional_position(self.pending_entry, force=True)
-        # Cancel all tracked pending orders (open/close, chase/static)
+        pos_signed = await self._get_position_signed_cached(force=True)
         await self._cancel_pending_entry_orders()
-        if self.pending_entry_state:
-            await self._cancel_order_ids(self.pending_entry_state.get("static_close_order_ids", []))
-            await self._cancel_order_ids(self.pending_entry_state.get("chase_close_order_ids", []))
-            await self._cancel_order_ids(self.pending_entry_state.get("static_open_order_ids", []))
-            await self._cancel_order_ids(self.pending_entry_state.get("chase_open_order_ids", []))
         # 如果已持有该方向仓位（无论是否打满），视为入场；否则放弃本次信号
         if current_dir_qty <= Decimal("0"):
+            # 若仍有反向持仓，保留 close-only 追平，不要放弃平仓
+            pos_abs = abs(pos_signed)
+            min_qty = self.min_order_size or Decimal("0")
+            if pos_abs > min_qty:
+                # Force close-only: keep pending_entry to drive close stage, but skip open
+                if self.pending_entry_state is None:
+                    # seed minimal state to allow close-only loop
+                    state_dir = "sell" if pos_signed > 0 else "buy"
+                    buffer = self.break_buffer_ticks * self.config.tick_size
+                    stop_price = (self.last_confirmed_low - buffer) if state_dir == "buy" else (self.last_confirmed_high + buffer if self.last_confirmed_high is not None else None)
+                    break_price = self.pending_break_price or pivot_price
+                    self.pending_entry_state = {
+                        "direction": state_dir,
+                        "stop_price": stop_price,
+                        "break_price": break_price,
+                        "target_qty": pos_abs,
+                        "entry_ref_price": break_price,
+                        "pivot_marker": self._last_pivot_change_ts,
+                        "ref_high": self.last_confirmed_high,
+                        "ref_low": self.last_confirmed_low,
+                        "last_close_attempt": 0.0,
+                        "last_open_attempt": 0.0,
+                        "static_close_order_ids": [],
+                        "static_close_price": None,
+                        "static_open_order_ids": [],
+                        "static_open_price": None,
+                        "chase_open_order_ids": [],
+                        "force_close_only": True,
+                        "skip_open": True,
+                        "stage": "close",
+                    }
+                    self.pending_entry = state_dir
+                else:
+                    self.pending_entry_state["force_close_only"] = True
+                    self.pending_entry_state["skip_open"] = True
+                    self.pending_entry_state["stage"] = "close"
+                    self.pending_entry_state["static_open_order_ids"] = []
+                    self.pending_entry_state["static_close_order_ids"] = []
+                    self.pending_entry_state["chase_open_order_ids"] = []
+                    self.pending_entry_state["last_close_attempt"] = 0.0
+                self._log_once(
+                    f"pivot_cancel_close_only:{self.pending_entry}",
+                    f"{self.timing_prefix} Adverse pivot -> abandon open but keep close-only until flat pos={pos_abs}",
+                    "INFO",
+                    interval=10.0,
+                )
+                return
             # Block same-direction until opposite breakout after adverse pivot
             if self._blocked_direction != self.pending_entry:
                 self._update_blocked_direction(self.pending_entry)
@@ -3205,14 +3226,6 @@ class TradingBot:
                 interval=10.0,
             )
             await self._clear_pending_entry_state(clear_direction=True)
-            # If opposite position still exists, force-close it aggressively
-            try:
-                pos_signed = await self._get_position_signed_cached(force=True)
-            except Exception:
-                pos_signed = Decimal(0)
-            if pos_signed != 0:
-                close_side = "sell" if pos_signed > 0 else "buy"
-                await self._close_position_in_chunks(close_side)
             return
         stop_price = self._compute_dynamic_stop(self.pending_entry) or self.dynamic_stop_price or pivot.price
         entry_price = self.pending_break_price or pivot.price
@@ -3280,14 +3293,14 @@ class TradingBot:
                 await self.exchange_client.reduce_only_close_with_retry(chunk, close_side)
             except Exception as exc:
                 self.logger.log(f"[FAST-CLOSE] Chunk close failed: {exc}", "WARNING")
-            await asyncio.sleep(3.0)
+            await asyncio.sleep(0.5)
             new_remaining = abs(await self._get_position_signed_cached())
             if new_remaining < remaining:
                 remaining = new_remaining
             else:
                 loops += 1
                 if loops % 3 == 0:
-                    await asyncio.sleep(3.0)
+                    await asyncio.sleep(1)
         return remaining
 
     async def _reverse_position(self, new_direction: str, pivot_price: Decimal):
