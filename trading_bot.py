@@ -1,4 +1,4 @@
-﻿﻿"""
+﻿"""
 Modular Trading Bot - Supports multiple exchanges
 """
 
@@ -2090,6 +2090,7 @@ class TradingBot:
             except Exception:
                 return tf
         return tf
+
 
     def _parse_pivot_time(self, value: str) -> Optional[datetime]:
         """Parse pivot close time into UTC datetime."""
