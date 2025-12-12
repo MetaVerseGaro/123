@@ -208,6 +208,8 @@ class TradingBot:
         self.reversing = False
         self.last_confirmed_low: Optional[Decimal] = None
         self.last_confirmed_high: Optional[Decimal] = None
+        self.last_confirmed_low_ts: Optional[float] = None
+        self.last_confirmed_high_ts: Optional[float] = None
         self.account_name = os.getenv('ACCOUNT_NAME', '').strip()
         self.stop_loss_enabled = str(os.getenv('STOP_LOSS_ENABLED', 'true')).lower() == 'true'
         self.enable_auto_reverse = str(os.getenv('ENABLE_AUTO_REVERSE', 'true')).lower() == 'true'
@@ -241,6 +243,7 @@ class TradingBot:
         self.pending_entry: Optional[str] = None
         self.pending_break_price: Optional[Decimal] = None
         self.pending_break_trigger_ts: Optional[float] = None
+        self.pending_break_close_ts: Optional[float] = None
         self.pending_entry_static_mode: bool = False
         self._pending_entry_order_ids: List[str] = []
         self.zigzag_stop_price: Optional[Decimal] = None
@@ -1207,6 +1210,7 @@ class TradingBot:
         self.pending_entry_state = None
         self.pending_break_price = None
         self.pending_break_trigger_ts = None
+        self.pending_break_close_ts = None
         self.pending_entry_static_mode = False
         await self._cancel_pending_entry_orders()
         self.zigzag_stop_price = None
@@ -1247,6 +1251,7 @@ class TradingBot:
         self.pending_entry = None
         self.pending_break_price = None
         self.pending_break_trigger_ts = None
+        self.pending_break_close_ts = None
         self.pending_entry_static_mode = False
         self._set_stop_new_orders(False, mode="zigzag_timing")
         self._last_entry_attempt_ts = 0.0
@@ -1364,6 +1369,7 @@ class TradingBot:
                 "target_qty": target_qty,
                 "entry_ref_price": target_entry_price,
                 "pivot_marker": self._last_pivot_change_ts,
+                "break_candle_close_ts": self.pending_break_close_ts,
                 # Snapshot current extremes to compare future pivots against
                 "ref_high": self.last_confirmed_high,
                 "ref_low": self.last_confirmed_low,
@@ -1414,33 +1420,26 @@ class TradingBot:
                     return None
             return None
 
-        def _latest_pivot_price() -> Optional[Decimal]:
+        def _latest_pivot_ts() -> Optional[float]:
             if self.recent_pivots:
                 try:
-                    return Decimal(self.recent_pivots[-1].price)
+                    return self.recent_pivots[-1].close_time.replace(tzinfo=timezone.utc).timestamp()
                 except Exception:
                     return None
             return None
 
         def _pivot_adverse_for_direction(dir_val: str) -> bool:
-            """Only treat new pivots as adverse if they oppose the intended direction."""
+            """Adverse only when new opposing pivot arrives after breakout candle close time."""
             if not pivot_updated:
                 return False
             label = _latest_pivot_label()
-            pivot_price = _latest_pivot_price()
-            if not label:
+            pivot_ts = _latest_pivot_ts()
+            break_ts = state.get("break_candle_close_ts")
+            if not label or pivot_ts is None or break_ts is None:
                 return False
             if dir_val == "buy":
-                ref_low = state.get("ref_low")
-                if pivot_price is None or ref_low is None:
-                    return False
-                # For long entry (close short, open long): only adverse when new low is higher than previous confirmed low
-                return label in ("LL", "HL", "L") and pivot_price > ref_low
-            ref_high = state.get("ref_high")
-            if pivot_price is None or ref_high is None:
-                return False
-            # For short entry (close long, open short): only adverse when new high is lower than previous confirmed high
-            return label in ("HH", "LH", "H") and pivot_price < ref_high
+                return label in ("LL", "HL", "L") and pivot_ts > break_ts
+            return label in ("HH", "LH", "H") and pivot_ts > break_ts
 
         # Close opposite side first
         if state.get("stage") == "close":
@@ -1856,6 +1855,11 @@ class TradingBot:
                 if self._blocked_direction and signal == self._blocked_direction:
                     signal = None
             if signal and self.pending_entry != signal:
+                # Record breakout pivot close time for time-based adverse checks
+                if signal == "buy":
+                    self.pending_break_close_ts = self.last_confirmed_high_ts
+                else:
+                    self.pending_break_close_ts = self.last_confirmed_low_ts
                 self.pending_entry = signal
                 self.pending_entry_state = None
                 self.pending_break_trigger_ts = time.time()
@@ -2559,8 +2563,16 @@ class TradingBot:
         """Update confirmed high/low based on external ZigZag pivot."""
         if pivot.label in ("HH", "LH", "H"):
             self.last_confirmed_high = pivot.price
+            try:
+                self.last_confirmed_high_ts = pivot.close_time.replace(tzinfo=timezone.utc).timestamp()
+            except Exception:
+                self.last_confirmed_high_ts = None
         if pivot.label in ("LL", "HL", "L"):
             self.last_confirmed_low = pivot.price
+            try:
+                self.last_confirmed_low_ts = pivot.close_time.replace(tzinfo=timezone.utc).timestamp()
+            except Exception:
+                self.last_confirmed_low_ts = None
         self.recent_pivots.append(pivot)
         self._last_pivot_change_ts = time.time()
 
@@ -3122,44 +3134,49 @@ class TradingBot:
         pivot: PivotPoint,
         prev_high: Optional[Decimal] = None,
         prev_low: Optional[Decimal] = None,
+        prev_high_ts: Optional[float] = None,
+        prev_low_ts: Optional[float] = None,
     ):
         """Handle new HL/LH during pending entry: cancel or finalize partial fills."""
         if not self.pending_entry:
             return
         need_cancel = False
+        pivot_ts = None
+        pivot_price = None
+        try:
+            pivot_ts = pivot.close_time.replace(tzinfo=timezone.utc).timestamp()
+        except Exception:
+            pivot_ts = None
         try:
             pivot_price = Decimal(pivot.price)
         except Exception:
             pivot_price = None
+        break_ts = None
+        if self.pending_entry_state and self.pending_entry_state.get("break_candle_close_ts") is not None:
+            break_ts = self.pending_entry_state.get("break_candle_close_ts")
+        elif self.pending_entry == "buy":
+            break_ts = self.pending_break_close_ts or prev_high_ts
+        else:
+            break_ts = self.pending_break_close_ts or prev_low_ts
 
-        last_high = self.last_confirmed_high if prev_high is None else prev_high
-        last_low = self.last_confirmed_low if prev_low is None else prev_low
-
-        # Rule: evaluate relative to last confirmed extreme
-        if self.pending_entry == "buy":
-            # new low pivot higher than last confirmed low => abandon; lower or equal => continue
-            if pivot.label in ("HL", "L", "LL") and last_low is not None and pivot_price is not None:
-                if pivot_price > last_low:
+        # Time-based rule: compare pivot close time with breakout pivot close time
+        if pivot_ts is not None and break_ts is not None:
+            if self.pending_entry == "buy" and pivot.label in ("HL", "L", "LL"):
+                if pivot_ts > break_ts:
                     need_cancel = True
-        elif self.pending_entry == "sell":
-            # new high pivot lower than last confirmed high => abandon; higher or equal => continue
-            if pivot.label in ("LH", "H", "HH") and last_high is not None and pivot_price is not None:
-                if pivot_price < last_high:
+            if self.pending_entry == "sell" and pivot.label in ("LH", "H", "HH"):
+                if pivot_ts > break_ts:
                     need_cancel = True
 
         if need_cancel:
             self._log_once(
                 f"adverse_pivot:{self.pending_entry}",
-                f"{self.timing_prefix} Adverse pivot {pivot.label} price={pivot_price} vs last extreme -> evaluate cancel",
+                f"{self.timing_prefix} Adverse pivot {pivot.label} pivot_ts={pivot_ts} break_ts={break_ts} -> evaluate cancel",
                 "INFO",
                 interval=60.0,
             )
 
         if need_cancel and pivot.close_time and self.pending_break_trigger_ts:
-            try:
-                pivot_ts = pivot.close_time.replace(tzinfo=timezone.utc).timestamp()
-            except Exception:
-                pivot_ts = None
             if pivot_ts is not None and pivot_ts <= self.pending_break_trigger_ts:
                 need_cancel = False
         if not need_cancel:
@@ -3187,6 +3204,7 @@ class TradingBot:
                         "target_qty": pos_abs,
                         "entry_ref_price": break_price,
                         "pivot_marker": self._last_pivot_change_ts,
+                        "break_candle_close_ts": break_ts,
                         "ref_high": self.last_confirmed_high,
                         "ref_low": self.last_confirmed_low,
                         "last_close_attempt": 0.0,
@@ -3209,6 +3227,8 @@ class TradingBot:
                     self.pending_entry_state["static_close_order_ids"] = []
                     self.pending_entry_state["chase_open_order_ids"] = []
                     self.pending_entry_state["last_close_attempt"] = 0.0
+                    if self.pending_entry_state.get("break_candle_close_ts") is None:
+                        self.pending_entry_state["break_candle_close_ts"] = break_ts
                 self._log_once(
                     f"pivot_cancel_close_only:{self.pending_entry}",
                     f"{self.timing_prefix} Adverse pivot -> abandon open but keep close-only until flat pos={pos_abs}",
@@ -3221,7 +3241,7 @@ class TradingBot:
                 self._update_blocked_direction(self.pending_entry)
             self._log_once(
                 f"pivot_cancel:{self.pending_entry}",
-                f"{self.timing_prefix} Pending entry {self.pending_entry} canceled by pivot {pivot.label} price={pivot_price} vs last extreme",
+                f"{self.timing_prefix} Pending entry {self.pending_entry} canceled by pivot {pivot.label} pivot_ts={pivot_ts} break_ts={break_ts}",
                 "INFO",
                 interval=10.0,
             )
@@ -3237,7 +3257,9 @@ class TradingBot:
         """Handle external ZigZag pivot: update pivots, dynamic SL, and slow reverse follow-up."""
         prev_high = self.last_confirmed_high
         prev_low = self.last_confirmed_low
-        await self._handle_pending_entry_pivot(pivot, prev_high=prev_high, prev_low=prev_low)
+        prev_high_ts = self.last_confirmed_high_ts
+        prev_low_ts = self.last_confirmed_low_ts
+        await self._handle_pending_entry_pivot(pivot, prev_high=prev_high, prev_low=prev_low, prev_high_ts=prev_high_ts, prev_low_ts=prev_low_ts)
         self._update_confirmed_pivots(pivot)
 
         if self.pending_reverse_state:
