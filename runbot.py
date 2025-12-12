@@ -56,6 +56,8 @@ def parse_arguments():
                         'Sell: pause if price <= pause-price. (default: -1, no pause)')
     parser.add_argument('--boost', action='store_true',
                         help='Use the Boost mode for volume boosting')
+    parser.add_argument('--pivot-poll-offset-sec', dest='pivot_poll_offset_sec', type=int, default=0,
+                        help='Offset seconds added to timeframe-aligned pivot polling (default: 0)')
     # Optional min order size; typically set via config JSON
     parser.add_argument('--min-order-size', dest='min_order_size', type=Decimal, default=None,
                         help='Minimal order size for this market (override config if set)')
@@ -156,6 +158,7 @@ def merge_config(args, cfg: dict):
     zig = adv.get("zigzag", {}) if isinstance(adv, dict) else cfg.get("zigzag", {})
     flags = cfg.get("flags", {})
     set_from(zig, "break_buffer_ticks", Decimal, target="break_buffer_ticks")
+    set_from(zig, "pivot_poll_offset_sec", int, target="pivot_poll_offset_sec")
     for key in ("enable_auto_reverse", "enable_zigzag", "auto_reverse_fast"):
         val = zig.get(key, flat.get(key, flags.get(key)))
         if val is not None:
@@ -284,6 +287,7 @@ async def main():
         hft_pivot_file=os.getenv("HFT_PIVOT_FILE"),
         webhook_basic_direction_file=os.getenv("WEBHOOK_BASIC_DIRECTION_FILE"),
         break_buffer_ticks=getattr(args, "break_buffer_ticks", Decimal("10")),
+        pivot_poll_offset_sec=getattr(args, "pivot_poll_offset_sec", 0),
         use_risk_exposure=getattr(args, "use_risk_exposure", True),
         leverage=getattr(args, "leverage", Decimal("1")),
         risk_reward=getattr(args, "risk_reward", Decimal("2"))
