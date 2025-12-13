@@ -163,6 +163,9 @@ def merge_config(args, cfg: dict):
         val = zig.get(key, flat.get(key, flags.get(key)))
         if val is not None:
             os.environ[key.upper()] = str(val).lower()
+    close_exit = zig.get("use_break_candle_close_exit", flat.get("use_break_candle_close_exit", flags.get("use_break_candle_close_exit")))
+    if close_exit is not None:
+        setattr(args, "use_break_candle_close_exit", bool(close_exit))
     if adv.get("enable_stop_loss") is not None:
         os.environ["STOP_LOSS_ENABLED"] = str(adv["enable_stop_loss"]).lower()
     if zig.get("zigzag_depth") is not None:
@@ -290,7 +293,8 @@ async def main():
         pivot_poll_offset_sec=getattr(args, "pivot_poll_offset_sec", 0),
         use_risk_exposure=getattr(args, "use_risk_exposure", True),
         leverage=getattr(args, "leverage", Decimal("1")),
-        risk_reward=getattr(args, "risk_reward", Decimal("2"))
+        risk_reward=getattr(args, "risk_reward", Decimal("2")),
+        use_break_candle_close_exit=getattr(args, "use_break_candle_close_exit", False)
     )
 
     # Create and run the bot
