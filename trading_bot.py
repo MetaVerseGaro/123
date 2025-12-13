@@ -100,6 +100,7 @@ class TradingConfig:
     risk_reward: Decimal = Decimal("2")
     hft_pivot_file: Optional[str] = None
     pivot_poll_offset_sec: int = 0
+    use_break_candle_close_exit: bool = False
 
     @property
     def close_order_side(self) -> str:
@@ -259,6 +260,10 @@ class TradingBot:
         self.zigzag_timeframe = os.getenv('ZIGZAG_TIMEFRAME', '1m')
         self.zigzag_timeframe_sec = self._parse_timeframe_to_seconds(self.zigzag_timeframe)
         self.zigzag_timeframe_key = self._normalize_timeframe_key(self.zigzag_timeframe)
+        self.use_break_candle_close_exit = bool(
+            getattr(config, "use_break_candle_close_exit", False)
+            or str(os.getenv("USE_BREAK_CANDLE_CLOSE_EXIT", "false")).lower() == "true"
+        )
         self.symbol_base = self._extract_symbol_base(self.config.ticker)
         self.timing_prefix = "[HFT]" if self.hft_mode else "[ZIGZAG-TIMING]"
         self.base_dir = Path(__file__).resolve().parent
@@ -1299,6 +1304,16 @@ class TradingBot:
         self.zigzag_entry_price = entry_price
         self.dynamic_stop_price = stop_price
         self.dynamic_stop_can_widen = True
+        if self.hft_mode:
+            block_dir = "sell" if direction == "buy" else "buy"
+            self._hft_block_dir = block_dir
+            self._hft_block_until = time.time() + 120
+            self._log_once(
+                f"hft_block_after_entry:{block_dir}",
+                f"{self.timing_prefix} HFT cooldown: block {block_dir} for 120s after entry {direction.upper()}",
+                "INFO",
+                interval=10.0,
+            )
         await self._place_zigzag_tp(direction, filled_qty, entry_price, stop_price)
         await self._notify_zigzag_trade("entry", direction, filled_qty, entry_price)
         self._last_entry_attempt_ts = 0.0
@@ -1377,6 +1392,7 @@ class TradingBot:
                 "target_qty": target_qty,
                 "entry_ref_price": target_entry_price,
                 "pivot_marker": self._last_pivot_change_ts,
+                "break_trigger_ts": self.pending_break_trigger_ts,
                 "break_candle_close_ts": self.pending_break_close_ts,
                 # Snapshot current extremes to compare future pivots against
                 "ref_high": self.last_confirmed_high,
@@ -1445,13 +1461,13 @@ class TradingBot:
             return None
 
         def _pivot_adverse_for_direction(dir_val: str) -> bool:
-            """Adverse only when new opposing pivot arrives after breakout candle close time."""
+            """Adverse only when new opposing pivot arrives after breakout trigger time."""
             if not pivot_updated:
                 return False
             label = _latest_pivot_label()
             pivot_ts = _latest_pivot_ts()
             pivot_price = _latest_pivot_price()
-            break_ts = state.get("break_candle_close_ts")
+            break_ts = state.get("break_trigger_ts") or self.pending_break_trigger_ts
             if not label or pivot_ts is None or break_ts is None:
                 return False
             if dir_val == "buy":
@@ -1472,6 +1488,12 @@ class TradingBot:
                 # Maker pricing: buy against bid, sell against ask to avoid post-only rejection when inside breakout range
                 book_price = best_bid if close_side == "buy" else best_ask
                 now_ts = time.time()
+                break_close_ts = state.get("break_candle_close_ts") or self.pending_break_close_ts
+                if self.use_break_candle_close_exit and break_close_ts is None:
+                    bt = state.get("break_trigger_ts") or self.pending_break_trigger_ts
+                    break_close_ts = self._compute_candle_close_from_trigger(bt)
+                    if break_close_ts:
+                        state["break_candle_close_ts"] = break_close_ts
                 adverse_pivot = _pivot_adverse_for_direction(direction)
                 # Pivot update while static close pending -> force close-only if adverse
                 if adverse_pivot and state.get("static_close_order_ids"):
@@ -1494,6 +1516,26 @@ class TradingBot:
                 except Exception:
                     pass
                 ref_price = mid_price if mid_price is not None else book_price
+                # Pre-close window: always chase every 3s until breakout candle closes when enabled
+                before_close_window = False
+                if self.use_break_candle_close_exit and break_close_ts:
+                    before_close_window = now_ts < break_close_ts
+                if before_close_window:
+                    if state.get("static_close_order_ids"):
+                        await self._cancel_order_ids(state["static_close_order_ids"])
+                        state["static_close_order_ids"] = []
+                        state["static_close_price"] = None
+                    if book_price is not None and book_price > 0 and (now_ts - state.get("last_close_attempt", 0.0)) >= 3.0:
+                        qty = _chunk_amount(pos_abs)
+                        res = await self._place_post_only_limit(close_side, qty, book_price, reduce_only=True)
+                        state["last_close_attempt"] = now_ts
+                        if res and res.success:
+                            self.logger.log(
+                                f"{self.timing_prefix} Close pre-close-window chase side={close_side} qty={qty} @ {book_price} (candle_close_ts={break_close_ts})",
+                                "INFO",
+                            )
+                            self._invalidate_position_cache()
+                    return
                 if ref_price is not None and ref_price > 0:
                     # 回到破位价内为有利侧：
                     # 平空开多（close_side=buy）有利：价格 < 破位价；平多开空（close_side=sell）有利：价格 > 破位价
@@ -1881,12 +1923,18 @@ class TradingBot:
                     pass
                 # Record breakout pivot close time for time-based adverse checks
                 if signal == "buy":
-                    self.pending_break_close_ts = self.last_confirmed_high_ts
+                    pivot_close_ts = self.last_confirmed_high_ts
                 else:
-                    self.pending_break_close_ts = self.last_confirmed_low_ts
+                    pivot_close_ts = self.last_confirmed_low_ts
                 self.pending_entry = signal
                 self.pending_entry_state = None
-                self.pending_break_trigger_ts = time.time()
+                trigger_ts = time.time()
+                self.pending_break_trigger_ts = trigger_ts
+                if self.use_break_candle_close_exit:
+                    computed_close = self._compute_candle_close_from_trigger(trigger_ts)
+                    self.pending_break_close_ts = computed_close or pivot_close_ts
+                else:
+                    self.pending_break_close_ts = pivot_close_ts
                 self._last_entry_attempt_ts = 0.0
                 self._last_flatten_attempt_ts = 0.0
                 self.pending_entry_static_mode = False
@@ -2102,6 +2150,17 @@ class TradingBot:
             except Exception:
                 return tf
         return tf
+
+    def _compute_candle_close_from_trigger(self, trigger_ts: Optional[float]) -> Optional[float]:
+        """Ceil trigger timestamp to the end of current timeframe candle."""
+        if trigger_ts is None:
+            return None
+        try:
+            period = max(1, int(self.zigzag_timeframe_sec or 60))
+            base = math.floor(trigger_ts / period) * period
+            return float(base + period)
+        except Exception:
+            return None
 
 
     def _parse_pivot_time(self, value: str) -> Optional[datetime]:
@@ -3202,17 +3261,15 @@ class TradingBot:
         except Exception:
             pivot_price = None
         break_ts = None
-        if self.pending_entry_state and self.pending_entry_state.get("break_candle_close_ts") is not None:
-            break_ts = self.pending_entry_state.get("break_candle_close_ts")
-        elif self.pending_entry == "buy":
-            break_ts = self.pending_break_close_ts or prev_high_ts
-        else:
-            break_ts = self.pending_break_close_ts or prev_low_ts
+        if self.pending_entry_state and self.pending_entry_state.get("break_trigger_ts") is not None:
+            break_ts = self.pending_entry_state.get("break_trigger_ts")
+        elif self.pending_break_trigger_ts is not None:
+            break_ts = self.pending_break_trigger_ts
 
         ref_high = self.last_confirmed_high if prev_high is None else prev_high
         ref_low = self.last_confirmed_low if prev_low is None else prev_low
 
-        # Time-based rule: compare pivot close time with breakout pivot close time
+        # Time-based rule: compare pivot close time with breakout trigger time
         if pivot_ts is not None and break_ts is not None and pivot_price is not None:
             if self.pending_entry == "buy" and pivot.label in ("HL", "L", "LL") and ref_low is not None:
                 # Require both time later than breakout bar and price worse (higher low)
@@ -3259,7 +3316,8 @@ class TradingBot:
                         "target_qty": pos_abs,
                         "entry_ref_price": break_price,
                         "pivot_marker": self._last_pivot_change_ts,
-                        "break_candle_close_ts": break_ts,
+                        "break_trigger_ts": break_ts,
+                        "break_candle_close_ts": self._compute_candle_close_from_trigger(break_ts) if self.use_break_candle_close_exit else break_ts,
                         "ref_high": self.last_confirmed_high,
                         "ref_low": self.last_confirmed_low,
                         "last_close_attempt": 0.0,
@@ -3282,8 +3340,10 @@ class TradingBot:
                     self.pending_entry_state["static_close_order_ids"] = []
                     self.pending_entry_state["chase_open_order_ids"] = []
                     self.pending_entry_state["last_close_attempt"] = 0.0
-                    if self.pending_entry_state.get("break_candle_close_ts") is None:
-                        self.pending_entry_state["break_candle_close_ts"] = break_ts
+                    if self.pending_entry_state.get("break_trigger_ts") is None:
+                        self.pending_entry_state["break_trigger_ts"] = break_ts
+                    if self.use_break_candle_close_exit and self.pending_entry_state.get("break_candle_close_ts") is None:
+                        self.pending_entry_state["break_candle_close_ts"] = self._compute_candle_close_from_trigger(break_ts)
                 self._log_once(
                     f"pivot_cancel_close_only:{self.pending_entry}",
                     f"{self.timing_prefix} Adverse pivot -> abandon open but keep close-only until flat pos={pos_abs}",
