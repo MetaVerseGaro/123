@@ -1838,14 +1838,8 @@ class TradingBot:
         buffer = self.break_buffer_ticks * self.config.tick_size
         high_break = self.last_confirmed_high + buffer if self.last_confirmed_high is not None else None
         low_break = self.last_confirmed_low - buffer if self.last_confirmed_low is not None else None
-        active_stop = self.dynamic_stop_price if (self.enable_dynamic_sl and self.dynamic_stop_price is not None) else self.zigzag_stop_price
-        if self.direction_lock and active_stop is not None:
-            if self.direction_lock == "buy" and best_bid <= active_stop:
-                signal = "sell"
-                signal_reason = "stop"
-            if self.direction_lock == "sell" and best_ask >= active_stop:
-                signal = "buy"
-                signal_reason = "stop"
+        # timing/hft 模式不使用动态/静态止损触发信号
+        active_stop = None
 
         if self.direction_lock:
             if self.direction_lock == "buy" and self.last_confirmed_low is not None and best_bid <= (self.last_confirmed_low - buffer):
