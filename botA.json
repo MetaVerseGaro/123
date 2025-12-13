@@ -38,6 +38,7 @@
         "zigzag_timeframe": "1m",          # ZigZag 聚合周期
         "pivot_poll_offset_sec": 5,        # 读取枢轴 JSON 的整点偏移秒数（0 表示整点，例：5 表示 00:05、15:05...）
         "break_buffer_ticks": 1,           # 突破确认高/低的缓冲（ticks）
+        "use_break_candle_close_exit": true  # 开启后：平仓先追价到破位K线收盘，再按收盘价方向决定静态/追价
         "pivot_file": "zigzag_pivots.json" # TradingView ZigZag pivot 持久化路径
       }
     },
