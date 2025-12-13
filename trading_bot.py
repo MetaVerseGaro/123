@@ -1836,6 +1836,8 @@ class TradingBot:
         signal = None
         signal_reason = None
         buffer = self.break_buffer_ticks * self.config.tick_size
+        high_break = self.last_confirmed_high + buffer if self.last_confirmed_high is not None else None
+        low_break = self.last_confirmed_low - buffer if self.last_confirmed_low is not None else None
         active_stop = self.dynamic_stop_price if (self.enable_dynamic_sl and self.dynamic_stop_price is not None) else self.zigzag_stop_price
         if self.direction_lock and active_stop is not None:
             if self.direction_lock == "buy" and best_bid <= active_stop:
@@ -1855,9 +1857,9 @@ class TradingBot:
 
         # Detect breakout signals
         if trade_price is not None:
-            if self.last_confirmed_high is not None and trade_price >= (self.last_confirmed_high + buffer):
+            if high_break is not None and trade_price >= high_break:
                 signal = "buy"
-            if self.last_confirmed_low is not None and trade_price <= (self.last_confirmed_low - buffer):
+            if low_break is not None and trade_price <= low_break:
                 signal = "sell" if signal is None else signal
         if signal:
             if self.direction_lock and self.direction_lock == signal:
@@ -1874,6 +1876,15 @@ class TradingBot:
                 if self._blocked_direction and signal == self._blocked_direction:
                     signal = None
             if signal and self.pending_entry != signal:
+                try:
+                    self._log_once(
+                        f"signal_trigger:{signal}",
+                        f"{self.timing_prefix} Signal->{signal.upper()} reason={signal_reason or 'break'} dir_lock={self.direction_lock} high_break={high_break} low_break={low_break} bid/ask=({best_bid},{best_ask}) trade={trade_price} last_high={self.last_confirmed_high} last_low={self.last_confirmed_low}",
+                        "INFO",
+                        interval=15.0,
+                    )
+                except Exception:
+                    pass
                 # Record breakout pivot close time for time-based adverse checks
                 if signal == "buy":
                     self.pending_break_close_ts = self.last_confirmed_high_ts
